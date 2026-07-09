@@ -1,0 +1,19 @@
+# Local Python environments and test caches
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local agent/editor state
+.codex/
+.agents/
+.vscode/
+
+# Generated analysis outputs and local session files
+Batch Processing Tests/
+batch_out*/
+*.nvfit-session.json
+
+# OS metadata
+.DS_Store
+Thumbs.db

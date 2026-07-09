@@ -1,0 +1,176 @@
+SmartFitter User Guide
+======================
+
+What this tool does
+-------------------
+SmartFitter loads MATLAB `.mat` files from NV-center experiments, plots the data, fits supported experiment types, and exports figures and result files.
+
+Supported inputs include:
+- Legacy MATLAB files with a `savedData` root structure
+- New MATLAB files with `data` + `scanInfo` root structures
+
+The tool can be used in two ways:
+- GUI: best for loading one file, checking plots, adjusting settings, and exporting results
+- CLI batch mode: best for processing many files at once
+
+
+1. Install Python
+-----------------
+1. Install Python 3.12 or newer from:
+   https://www.python.org/downloads/windows/
+2. During installation, enable the option:
+   Add Python to PATH
+3. After installation, open PowerShell and check:
+
+python --version
+
+
+2. Open This Folder
+-------------------
+Open this folder in a terminal 
+Could either be done on box or can be copied anywhere locally and ran. 
+For example 
+Windows (Box)
+
+cd "C:\Users\<USERNAME>\Box\Backlund lab shared\code\Group Code Utilities\Lab_Data_Analysis"
+Windows (local copy)
+
+cd "C:\Users\<USERNAME>\Documents\Lab_Data_Analysis"
+macOS (Box or local copy)
+
+cd "/Users/<USERNAME>/path/to/Lab_Data_Analysis"
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+python3 -m nvfit.gui_app
+
+3. Create a Virtual Environment (can skip this if you want installed packages to be global)
+-------------------------------
+Run: 
+
+python -m venv .venv
+
+Activate it:
+
+.venv\Scripts\Activate.ps1
+
+If PowerShell blocks activation, run this once in the same window:
+
+Set-ExecutionPolicy -Scope Process Bypass
+
+Then activate again:
+
+.venv\Scripts\Activate.ps1
+
+
+4. Install Required Packages
+----------------------------
+With the virtual environment active, run:
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+
+5. Start the GUI
+----------------
+Run:
+
+python -m nvfit.gui_app
+
+Basic GUI workflow:
+- Click `Load .mat` and choose a MATLAB file
+- Leave `Profile` on `Auto` unless you want to force a specific analysis preset
+- Choose the observable mode:
+  - `contrast` for `(reference - signal) / reference`
+  - `raw_signal` for raw counts
+  - `difference` for `reference - signal`
+- Adjust ROI, binning, or smoothing if needed
+- Click fit controls to run the fit
+- Use `Save Results` to export plots and JSON/CSV outputs
+
+Main GUI sections:
+- `Data + Profile`: load the file and choose the experiment profile
+- `Overlay / Comparison`: compare multiple loaded traces
+- `Data / Preprocess`: binning, smoothing, and ROI controls
+- `Fit Strategy`: choose model family and multistart settings
+- `Fit + Export`: save plots, reports, JSON, CSV, and Origin-friendly bundles
+- `Status + Summary`: see fit quality, parameters, and extracted metrics
+
+Notes for new MATLAB files:
+- New-format XY8 / CPMG / dynamic-decoupling files are loaded automatically
+- These are fit using total evolution time on the x-axis
+- Sequence details such as pulse count, pi-pulse length, and RF frequency are saved in the exported metadata
+
+
+6. Run Batch / CLI Analysis
+---------------------------
+To process all `.mat` files in a folder:
+
+python -m nvfit.pro_batch --input-dir "insert folder path here" --output-dir "insert folder path here"
+
+To process one file only:
+
+python -m nvfit.pro_batch --single-file "insert folder path here\data.mat" --output-dir "insert folder path here"
+
+Useful options:
+- `--mode contrast`
+- `--bin-size 1`
+- `--smooth-window 1`
+- `--model-override DynamicDecoupling`
+- `--robust`
+- `--odmr-multipeak`
+
+Batch output files:
+- `<name>_fit.png`: exported plot
+- `<name>_result.json`: fit results and metadata
+- `batch_summary.csv`: one-row summary for each file
+- `validation_report.csv`: pass/warn/fail summary
+- `aggregate_report.csv`: grouped statistics
+
+
+7. Common Output Files
+----------------------
+GUI exports can include:
+- `<name>_gui_fit.png`
+- `<name>_gui_report.png`
+- `<name>_gui_result.json`
+- `<name>_gui_result.csv`
+- `<name>_origin_bundle.csv`
+
+The JSON files contain:
+- experiment type
+- selected model
+- fit parameters and errors
+- quality metrics such as R2 and RMSE
+- NV-relevant derived values
+- trace metadata from the MATLAB file
+
+
+8. Troubleshooting
+------------------
+`python` is not recognized
+- Reinstall Python and make sure `Add Python to PATH` is enabled
+- Close and reopen PowerShell after installation
+
+Package install fails
+- Make sure the virtual environment is activated
+- Run:
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
+
+GUI does not open
+- Confirm `PySide6` installed successfully:
+  python -m pip show PySide6
+- Then try:
+  python -m nvfit.gui_app
+
+MATLAB file will not load
+- Confirm the file is a supported `.mat` export
+- Legacy files should contain `savedData`
+- New files should contain `data` and `scanInfo`
+
+Fits look wrong
+- Check the selected profile
+- Try `contrast` mode first
+- Reduce smoothing or tighten the ROI
+- For folders of files, try batch mode with `--robust`
