@@ -1360,7 +1360,7 @@ class SmartFitterMainWindow(QMainWindow):
         btn_clear_mask.setVisible(False)
         mk_gl.addWidget(btn_clear_mask, 4, 0, 1, 2)
         self.mask_mode_combo = NoScrollComboBox()
-        self.mask_mode_combo.addItems(["Off", "Inspect point", "Edit points", "Range drag"])
+        self.mask_mode_combo.addItems(["Off", "Inspect point", "Measure", "Edit points", "Range drag"])
         self.mask_mode_combo.setCurrentText("Inspect point")
         self.mask_mode_combo.currentTextChanged.connect(self._update_mask_mode)
         self.mask_mode_combo.setVisible(False)
@@ -1892,6 +1892,10 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_inspect_btn.setToolTip("Read nearest-point coordinates and measurements.")
         self.quick_inspect_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Inspect point"))
         row.addWidget(self.quick_inspect_btn)
+        self.quick_measure_btn = QPushButton("Measure")
+        self.quick_measure_btn.setToolTip("Pin the nearest point and report its coordinates; use this for quick peak or cursor measurements.")
+        self.quick_measure_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Measure"))
+        row.addWidget(self.quick_measure_btn)
         self.quick_edit_btn = QPushButton("Edit points")
         self.quick_edit_btn.setToolTip("Click plotted samples to exclude or restore them; Ctrl+Z undoes the change.")
         self.quick_edit_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Edit points"))
@@ -3483,7 +3487,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.span_selector = SpanSelector(self.ax_main, self._on_range_selected, "horizontal", useblit=True)
         else:
             self._clear_crosshairs()
-        if mode != "Inspect point":
+        if mode not in {"Inspect point", "Measure"}:
             self._update_point_readout("Point readout: none")
         self.canvas.draw_idle()
 
@@ -3898,7 +3902,7 @@ class SmartFitterMainWindow(QMainWindow):
         mode = self.mask_mode_combo.currentText()
         if event.xdata is None:
             return
-        if mode in {"Inspect point", "Off"}:
+        if mode in {"Inspect point", "Measure", "Off"}:
             self._select_point_from_plot(float(event.xdata), float(event.ydata) if event.ydata is not None else None)
             return
         if mode != "Edit points" or self.ctx.x is None:
@@ -4821,7 +4825,7 @@ class SmartFitterMainWindow(QMainWindow):
         return y2d[:, col], z2d[:, col], f"Vertical linecut @ x={x2d[0, col]:.6g}"
 
     def _on_plot_motion(self, event):
-        if self.mask_mode_combo.currentText() != "Inspect point" or event.inaxes not in self._inspectable_axes():
+        if self.mask_mode_combo.currentText() not in {"Inspect point", "Measure"} or event.inaxes not in self._inspectable_axes():
             return
         if event.xdata is None:
             return
@@ -4860,7 +4864,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_plot_leave(self, event):
-        if self.mask_mode_combo.currentText() == "Inspect point":
+        if self.mask_mode_combo.currentText() in {"Inspect point", "Measure"}:
             self._clear_crosshairs()
 
     def _legend_label(self, default_label: str, short_label: str) -> str:
