@@ -793,3 +793,29 @@ def test_gui_deer_profiles_and_plot_only_position():
     assert win.ctx.trace is not None and win.ctx.trace.experiment_type == "DEERPosition"
     assert win.ctx.trace.scan_dim == "scan1d"
     assert win.strategy_box.isHidden()
+
+
+def test_gui_edit_points_uses_raw_masks_and_undo_redo():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    assert win.ctx.processed is not None
+    x0 = float(win.ctx.processed.analysis_x[0])
+    sources = set(win.ctx.processed.source_groups[0].tolist())
+    win.mask_mode_combo.setCurrentText("Edit points")
+    win._toggle_exclusion_at_x(x0)
+    assert sources.issubset(win.ctx.excluded_points)
+    win._undo()
+    assert not win.ctx.excluded_points
+    win._redo()
+    assert sources.issubset(win.ctx.excluded_points)
+
+
+def test_gui_copy_export_figure_places_image_on_clipboard():
+    app = _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    win.copy_export_figure()
+    assert not app.clipboard().image().isNull()

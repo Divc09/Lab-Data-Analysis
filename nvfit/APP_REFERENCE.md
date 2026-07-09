@@ -394,7 +394,14 @@ This release adds the following production features:
   - custom plugin model via `--plugin-file` (JSON model spec)
   - `aggregate_report.csv` generated (excluding explicitly excluded files).
 
-## 16) Plugin spec for custom model
+## 16) Analysis sessions, transforms, and clipboard
+
+- `File > Save Analysis Session...` writes an atomic, versioned `.nvfit-session.json` document. It records source fingerprints, profile/model choices, preprocessing, raw-point/range masks, analysis transforms, plot state, metadata, and view limits. Missing primary files can be located interactively; changed sources are flagged after restore.
+- Analysis transforms are display/measurement tools: baseline removal, detrend, normalization, derivative, integral, uniform resampling, and safe vector expressions. The fitting pipeline remains on the pre-transform processed data, so fit parameters retain their experiment-model meaning.
+- Point exclusion is source-index based. `Edit points` toggles all source samples represented by the clicked displayed point, works after binning, and is reversible with `Ctrl+Z`/`Ctrl+Y`.
+- `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
+
+## 17) Plugin spec for custom model
 
 `--plugin-file` and GUI custom-model loader expect JSON with:
 

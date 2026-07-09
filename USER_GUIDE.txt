@@ -87,6 +87,9 @@ Basic GUI workflow:
 - Adjust ROI, binning, or smoothing if needed
 - Click fit controls to run the fit
 - Use `Save Results` to export plots and JSON/CSV outputs
+- Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
+- Use `Edit points` to click-toggle reversible analysis exclusions; the source `.mat` file is never modified and `Ctrl+Z` restores the last edit
+- Use `File > Save Analysis Session...` to resume a named analysis later, including masks, transforms, plot state, and fit settings
 
 Main GUI sections:
 - `Data + Profile`: load the file and choose the experiment profile
@@ -95,6 +98,7 @@ Main GUI sections:
 - `Fit Strategy`: choose model family and multistart settings
 - `Fit + Export`: save plots, reports, JSON, CSV, and Origin-friendly bundles
 - `Status + Summary`: see fit quality, parameters, and extracted metrics
+- `Analysis transforms`: build a display/measurement pipeline for baseline correction, normalization, derivatives, integrals, resampling, and safe expressions; fitting continues to use the physics-preserving processed trace
 
 Notes for new MATLAB files:
 - New-format XY8 / CPMG / dynamic-decoupling files are loaded automatically

@@ -4,8 +4,9 @@ import csv
 import json
 import re
 import sys
+from io import BytesIO
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from PySide6.QtCore import (
     QMimeData,
     QTimer,
 )
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QShortcut
 from scipy.signal import find_peaks
 from PySide6.QtWidgets import (
     QApplication,
@@ -60,6 +61,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QProgressBar,
+    QStatusBar,
     QStackedWidget,
     QTabWidget,
 )
@@ -76,6 +78,7 @@ except Exception:  # pragma: no cover - optional runtime dependency during parti
     qta = None
 
 from .diagnostics import aic as _aic, bic as _bic, r_squared as _r_squared, rmse as _rmse, durbin_watson as _dw
+from .analysis_tools import AnalysisStep, ProcessedSeries, apply_steps, process_series
 from .fit_engine import FitResult, fit_model_multistart
 from .fit_workflows import FitWorkflowConfig, fit_non_ramsey
 from .io_mat import DataMode, ExperimentTrace, load_saved_data_mat
@@ -95,6 +98,7 @@ from .preprocess import apply_roi, bin_trace, smooth_trace
 from .profiles import PROFILES, FitProfile, classify_status
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
+from .sessions import load_session, resolve_source, save_session, source_descriptor
 
 
 @dataclass
@@ -115,6 +119,10 @@ class FitContext:
     sample_metadata: dict[str, str] | None = None
     active_preset_name: str = "default"
     custom_model_spec: dict[str, Any] | None = None
+    analysis_steps: list[AnalysisStep] = field(default_factory=list)
+    processed: ProcessedSeries | None = None
+    analysis_x: np.ndarray | None = None
+    analysis_y: np.ndarray | None = None
 
 
 @dataclass
@@ -689,6 +697,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.fit_worker: FitWorker | None = None
         self._param_undo_stack: list[dict] = []
         self._param_redo_stack: list[dict] = []
+        self._analysis_undo_stack: list[dict[str, Any]] = []
+        self._analysis_redo_stack: list[dict[str, Any]] = []
         self.equation_expr_template: dict[str, str] = {
             "RamseySimple": "y0 + A*np.exp(-((np.abs(t/tau))**n))*np.cos(2*np.pi*f*t + phi)",
             "RamseyHyperfine": "y0 + A*np.exp(-((np.abs(t/tau))**n))*((np.cos(2*np.pi*(f-0.00216)*t+phi)+np.cos(2*np.pi*f*t+phi)+np.cos(2*np.pi*(f+0.00216)*t+phi))/3.0)",
@@ -711,8 +721,9 @@ class SmartFitterMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self, self.on_fit)
         QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.on_robust_fit)
         QShortcut(QKeySequence("Ctrl+S"), self, self.on_save_results)
-        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo_params)
-        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo_params)
+        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
+        QShortcut(QKeySequence("Ctrl+Shift+C"), self, self.copy_export_figure)
 
         # Drag-and-drop support
         self.setAcceptDrops(True)
@@ -724,54 +735,54 @@ class SmartFitterMainWindow(QMainWindow):
     def _apply_theme(self):
         dark_qss = """
         QMainWindow, QWidget {
-            background-color: #181818;
-            color: #e6e6e6;
+            background-color: #171918;
+            color: #e8ebe8;
             font-family: "Aptos", "Calibri", sans-serif;
             font-size: 10pt;
         }
         QGroupBox {
-            border: 1px solid #343434;
+            border: 1px solid #353b36;
             border-radius: 4px;
             margin-top: 8px;
             font-weight: 600;
             padding-top: 12px;
-            background-color: #202020;
+            background-color: #202321;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             subcontrol-position: top left;
             padding: 0 4px;
-            color: #d4d4d4;
+            color: #d9dfd9;
         }
         QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
-            background-color: #242424;
-            border: 1px solid #3a3a3a;
-            border-radius: 3px;
-            color: #f0f0f0;
+            background-color: #1d211f;
+            border: 1px solid #3d4540;
+            border-radius: 4px;
+            color: #f2f5f2;
             padding: 4px;
             selection-background-color: #3d6f5f;
         }
         QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QTextEdit:focus {
-            border: 1px solid #5b8f7f;
-            background-color: #282828;
+            border: 1px solid #52947c;
+            background-color: #222824;
         }
         QPushButton {
-            background-color: #2a2a2a;
-            border: 1px solid #424242;
+            background-color: #282d2a;
+            border: 1px solid #444c46;
             border-radius: 4px;
             padding: 5px 10px;
             color: #f0f0f0;
         }
         QPushButton:hover {
-            background-color: #333333;
-            border-color: #555555;
+            background-color: #343b36;
+            border-color: #5b665e;
         }
         QPushButton:pressed {
-            background-color: #1f1f1f;
+            background-color: #1c211e;
         }
         QPushButton#PrimaryAction {
-            background-color: #2f6f5e;
-            border-color: #3c846f;
+            background-color: #367963;
+            border-color: #55a384;
             color: #ffffff;
             font-weight: 600;
         }
@@ -784,13 +795,13 @@ class SmartFitterMainWindow(QMainWindow):
             color: #cfcfcf;
         }
         QPushButton#ModeNav:checked {
-            background-color: #2b2b2b;
+            background-color: #29322d;
             color: #ffffff;
-            border-left: 3px solid #3d8b74;
+            border-left: 3px solid #5aa989;
         }
         QWidget#ModeRail {
-            background-color: #151515;
-            border-right: 1px solid #303030;
+            background-color: #121513;
+            border-right: 1px solid #303832;
         }
         QLabel#PaneTitle {
             color: #f2f2f2;
@@ -803,23 +814,23 @@ class SmartFitterMainWindow(QMainWindow):
         }
         QTableWidget {
             gridline-color: #343434;
-            background-color: #202020;
-            alternate-background-color: #242424;
-            selection-background-color: #2f6f5e;
-            border: 1px solid #343434;
+            background-color: #202321;
+            alternate-background-color: #252a27;
+            selection-background-color: #367963;
+            border: 1px solid #353b36;
         }
         QHeaderView::section {
-            background-color: #252525;
-            color: #d4d4d4;
-            border: 1px solid #343434;
+            background-color: #292f2b;
+            color: #d9dfd9;
+            border: 1px solid #3b443d;
             padding: 4px;
         }
         QScrollBar:vertical {
-            background: #181818;
+            background: #171918;
             width: 12px;
         }
         QScrollBar::handle:vertical {
-            background: #424242;
+            background: #4a554d;
             min-height: 20px;
             border-radius: 4px;
         }
@@ -844,9 +855,11 @@ class SmartFitterMainWindow(QMainWindow):
             padding: 6px 10px;
         }
         QTabBar::tab:selected {
-            background: #282828;
+            background: #2b332e;
             color: #ffffff;
         }
+        QStatusBar { background: #121513; color: #b9c4bb; border-top: 1px solid #303832; }
+        QToolTip { background: #272e2a; color: #f2f5f2; border: 1px solid #566159; padding: 4px; }
         """
         self.setStyleSheet(dark_qss)
 
@@ -1313,31 +1326,41 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_exclude_selected.setToolTip("Exclude the currently selected 1D sample from the next fit.")
         self.btn_exclude_selected.clicked.connect(self.on_exclude_selected_point)
         mk_gl.addWidget(self.btn_exclude_selected, 0, 1)
+        self.btn_edit_points = QPushButton("Edit points")
+        self.btn_edit_points.setToolTip("Toggle a reversible source-data exclusion with one click in either plot view.")
+        self.btn_edit_points.setCheckable(True)
+        self.btn_edit_points.toggled.connect(lambda checked: self.mask_mode_combo.setCurrentText("Edit points" if checked else "Inspect point"))
+        mk_gl.addWidget(self.btn_edit_points, 1, 0)
+        self.btn_restore_exclusions = QPushButton("Restore all")
+        self.btn_restore_exclusions.setToolTip("Restore every excluded point and range without changing the original MAT file.")
+        self.btn_restore_exclusions.clicked.connect(self.on_clear_exclusions)
+        mk_gl.addWidget(self.btn_restore_exclusions, 1, 1)
         self.mask_xmin = QLineEdit("")
         self.mask_xmax = QLineEdit("")
         self.mask_xmin.setPlaceholderText("x min")
         self.mask_xmax.setPlaceholderText("x max")
         self.mask_xmin.setToolTip("Lower x bound for a range to exclude from fitting.")
         self.mask_xmax.setToolTip("Upper x bound for a range to exclude from fitting.")
-        mk_gl.addWidget(QLabel("Range"), 1, 0)
+        mk_gl.addWidget(QLabel("Range"), 2, 0)
         range_row = QHBoxLayout()
         range_row.addWidget(self.mask_xmin)
         range_row.addWidget(self.mask_xmax)
-        mk_gl.addLayout(range_row, 1, 1)
+        mk_gl.addLayout(range_row, 2, 1)
         btn_add_mask = QPushButton("Add range")
         btn_add_mask.setToolTip("Exclude all 1D samples between the x bounds above.")
         btn_add_mask.clicked.connect(self.on_add_exclusion_range)
-        mk_gl.addWidget(btn_add_mask, 2, 0)
+        mk_gl.addWidget(btn_add_mask, 3, 0)
         self.btn_remove_exclusion = QPushButton("Remove selected")
         self.btn_remove_exclusion.setToolTip("Remove the highlighted exclusion entry below.")
         self.btn_remove_exclusion.clicked.connect(self.on_remove_selected_exclusion)
-        mk_gl.addWidget(self.btn_remove_exclusion, 2, 1)
+        mk_gl.addWidget(self.btn_remove_exclusion, 3, 1)
         btn_clear_mask = QPushButton("Clear exclusions")
         btn_clear_mask.setToolTip("Remove every point and range exclusion.")
         btn_clear_mask.clicked.connect(self.on_clear_exclusions)
-        mk_gl.addWidget(btn_clear_mask, 3, 0, 1, 2)
+        btn_clear_mask.setVisible(False)
+        mk_gl.addWidget(btn_clear_mask, 4, 0, 1, 2)
         self.mask_mode_combo = NoScrollComboBox()
-        self.mask_mode_combo.addItems(["Off", "Inspect point", "Mask point", "Range drag"])
+        self.mask_mode_combo.addItems(["Off", "Inspect point", "Edit points", "Range drag"])
         self.mask_mode_combo.setCurrentText("Inspect point")
         self.mask_mode_combo.currentTextChanged.connect(self._update_mask_mode)
         self.mask_mode_combo.setVisible(False)
@@ -1345,12 +1368,43 @@ class SmartFitterMainWindow(QMainWindow):
         self.point_readout_lbl.setWordWrap(True)
         self.point_readout_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
         self.point_readout_lbl.setToolTip("Last selected or hovered sample coordinate.")
-        mk_gl.addWidget(self.point_readout_lbl, 4, 0, 1, 2)
+        mk_gl.addWidget(self.point_readout_lbl, 5, 0, 1, 2)
         self.mask_list = QListWidget()
         self.mask_list.setMaximumHeight(96)
         self.mask_list.setToolTip("Current excluded points and x ranges. Select one and click Remove selected.")
-        mk_gl.addWidget(self.mask_list, 5, 0, 1, 2)
+        mk_gl.addWidget(self.mask_list, 6, 0, 1, 2)
         left_inner_layout.addWidget(mask_box)
+
+        analysis_box = QGroupBox("Analysis transforms")
+        self.analysis_box = analysis_box
+        analysis_layout = QGridLayout(analysis_box)
+        self.analysis_kind_combo = NoScrollComboBox()
+        self.analysis_kind_combo.addItems(["Baseline", "Detrend", "Normalize", "Derivative", "Integral", "Resample", "Expression"])
+        self.analysis_kind_combo.currentTextChanged.connect(self._sync_analysis_step_fields)
+        self.analysis_option_combo = NoScrollComboBox()
+        self.analysis_value_edit = QLineEdit()
+        self.analysis_value_edit.setPlaceholderText("Optional value")
+        self.analysis_value_edit.setToolTip("Resample uses a point count; Expression uses x, y, abs, sin, cos, exp, log, sqrt, or clip.")
+        add_step = QPushButton("Add transform")
+        add_step.clicked.connect(self.on_add_analysis_step)
+        remove_step = QPushButton("Remove selected")
+        remove_step.clicked.connect(self.on_remove_analysis_step)
+        clear_steps = QPushButton("Clear transforms")
+        clear_steps.clicked.connect(self.on_clear_analysis_steps)
+        self.analysis_list = QListWidget()
+        self.analysis_list.setMaximumHeight(100)
+        self.analysis_list.setToolTip("Ordered display and measurement transforms. Fitting remains on the untransformed processed trace.")
+        analysis_layout.addWidget(QLabel("Transform"), 0, 0)
+        analysis_layout.addWidget(self.analysis_kind_combo, 0, 1)
+        analysis_layout.addWidget(QLabel("Option"), 1, 0)
+        analysis_layout.addWidget(self.analysis_option_combo, 1, 1)
+        analysis_layout.addWidget(self.analysis_value_edit, 2, 0, 1, 2)
+        analysis_layout.addWidget(add_step, 3, 0)
+        analysis_layout.addWidget(remove_step, 3, 1)
+        analysis_layout.addWidget(clear_steps, 4, 0, 1, 2)
+        analysis_layout.addWidget(self.analysis_list, 5, 0, 1, 2)
+        left_inner_layout.addWidget(analysis_box)
+        self._sync_analysis_step_fields()
 
         meta_box = QGroupBox("Sample Metadata")
         self.meta_box = meta_box
@@ -1834,6 +1888,22 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_std_mode_combo.setToolTip("Choose how standard deviation is displayed.")
         self.quick_std_mode_combo.currentTextChanged.connect(self._on_quick_std_mode_changed)
         row.addWidget(self.quick_std_mode_combo)
+        self.quick_inspect_btn = QPushButton("Inspect")
+        self.quick_inspect_btn.setToolTip("Read nearest-point coordinates and measurements.")
+        self.quick_inspect_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Inspect point"))
+        row.addWidget(self.quick_inspect_btn)
+        self.quick_edit_btn = QPushButton("Edit points")
+        self.quick_edit_btn.setToolTip("Click plotted samples to exclude or restore them; Ctrl+Z undoes the change.")
+        self.quick_edit_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Edit points"))
+        row.addWidget(self.quick_edit_btn)
+        self.quick_range_btn = QPushButton("Exclude range")
+        self.quick_range_btn.setToolTip("Drag across the export plot to exclude a reversible x range.")
+        self.quick_range_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Range drag"))
+        row.addWidget(self.quick_range_btn)
+        self.copy_figure_btn = QPushButton("Copy figure")
+        self.copy_figure_btn.setToolTip("Copy the current export figure to the clipboard (Ctrl+Shift+C).")
+        self.copy_figure_btn.clicked.connect(self.copy_export_figure)
+        row.addWidget(self.copy_figure_btn)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -1936,11 +2006,15 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_filter_combo = NoScrollComboBox()
         self.batch_filter_combo.addItems(["All", "PASS", "WARN", "FAIL"])
         self.batch_filter_combo.currentTextChanged.connect(self._apply_batch_filter)
+        self.batch_search_edit = QLineEdit()
+        self.batch_search_edit.setPlaceholderText("Search file, model, metric, or path")
+        self.batch_search_edit.textChanged.connect(self._apply_batch_filter)
         btn_load_summary = QPushButton("Load Summary")
         self._set_button_icon(btn_load_summary, "fa5s.folder-open")
         btn_load_summary.clicked.connect(self._choose_batch_summary)
         results_row.addWidget(QLabel("Filter"))
         results_row.addWidget(self.batch_filter_combo)
+        results_row.addWidget(self.batch_search_edit, 2)
         results_row.addStretch(1)
         results_row.addWidget(btn_load_summary)
         layout.addLayout(results_row)
@@ -1955,6 +2029,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_results_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.batch_results_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.batch_results_table.itemSelectionChanged.connect(self._update_batch_preview)
+        self.batch_results_table.itemDoubleClicked.connect(self._open_selected_batch_result)
         layout.addWidget(self.batch_results_table, 1)
 
         lower = QSplitter(Qt.Horizontal)
@@ -1985,10 +2060,24 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_workspace_secondary_combo = NoScrollComboBox()
         self.scan_workspace_secondary_combo.addItems(["None", "Contrast", "Signal", "Reference"])
         self.scan_workspace_secondary_combo.currentTextChanged.connect(self._on_scan_workspace_secondary_changed)
+        self.scan_colormap_combo = NoScrollComboBox()
+        self.scan_colormap_combo.addItems(["viridis", "cividis", "magma", "turbo"])
+        self.scan_colormap_combo.setToolTip("Color map for 2D scan review and exported scan figures.")
+        self.scan_colormap_combo.currentTextChanged.connect(self._refresh_plot_only)
+        self.scan_reverse_chk = QCheckBox("Reverse")
+        self.scan_reverse_chk.toggled.connect(self._refresh_plot_only)
+        self.scan_robust_limits_chk = QCheckBox("Robust range")
+        self.scan_robust_limits_chk.setChecked(True)
+        self.scan_robust_limits_chk.setToolTip("Use 2nd–98th percentile color limits so isolated outliers do not flatten a scan.")
+        self.scan_robust_limits_chk.toggled.connect(self._refresh_plot_only)
         controls.addWidget(QLabel("Linecut"))
         controls.addWidget(self.scan_workspace_linecut_combo)
         controls.addWidget(QLabel("Secondary"))
         controls.addWidget(self.scan_workspace_secondary_combo)
+        controls.addWidget(QLabel("Colors"))
+        controls.addWidget(self.scan_colormap_combo)
+        controls.addWidget(self.scan_reverse_chk)
+        controls.addWidget(self.scan_robust_limits_chk)
         controls.addStretch(1)
         layout.addLayout(controls)
         self.scan_workspace_plot = None
@@ -2018,6 +2107,15 @@ class SmartFitterMainWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
         layout.addWidget(self._labeled_title("Results"))
+        result_actions = QHBoxLayout()
+        self.results_filter_edit = QLineEdit()
+        self.results_filter_edit.setPlaceholderText("Filter result fields")
+        self.results_filter_edit.textChanged.connect(self._sync_results_workspace)
+        copy_results = QPushButton("Copy selected")
+        copy_results.clicked.connect(self.copy_selected_results)
+        result_actions.addWidget(self.results_filter_edit, 1)
+        result_actions.addWidget(copy_results)
+        layout.addLayout(result_actions)
         self.results_table = QTableWidget(0, 2)
         self.results_table.setHorizontalHeaderLabels(["Field", "Value"])
         self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -2027,6 +2125,18 @@ class SmartFitterMainWindow(QMainWindow):
         self.results_text.setReadOnly(True)
         layout.addWidget(self.results_text, 1)
         self.mode_stack.addWidget(page)
+
+    def copy_selected_results(self) -> None:
+        rows = sorted({item.row() for item in self.results_table.selectedItems()})
+        if not rows:
+            return
+        lines = []
+        for row in rows:
+            key = self.results_table.item(row, 0)
+            value = self.results_table.item(row, 1)
+            lines.append(f"{key.text() if key else ''}\t{value.text() if value else ''}")
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Selected results copied", 3000)
 
     def _browse_batch_dir(self, line_edit: QLineEdit):
         start = line_edit.text().strip() or str(self.settings.value("session/last_open_dir", ""))
@@ -2126,6 +2236,9 @@ class SmartFitterMainWindow(QMainWindow):
         rows = self._batch_rows if hasattr(self, "_batch_rows") else []
         if wanted != "All":
             rows = [r for r in rows if (r.get("status") or r.get("Status") or "").upper() == wanted]
+        query = self.batch_search_edit.text().strip().lower() if hasattr(self, "batch_search_edit") else ""
+        if query:
+            rows = [r for r in rows if query in " ".join(str(value) for value in r.values()).lower()]
         self.batch_results_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             file_name = row.get("file") or row.get("filename") or row.get("File") or row.get("name") or ""
@@ -2139,6 +2252,9 @@ class SmartFitterMainWindow(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 if col == 1:
                     item.setTextAlignment(Qt.AlignCenter)
+                    color = {"PASS": "#6fcf97", "WARN": "#e0a458", "FAIL": "#e57373"}.get(status)
+                    if color:
+                        item.setForeground(QColor(color))
                 self.batch_results_table.setItem(row_idx, col, item)
         self.batch_results_table.resizeRowsToContents()
 
@@ -2152,6 +2268,17 @@ class SmartFitterMainWindow(QMainWindow):
             item = self.batch_results_table.item(row, col)
             values.append(f"{header}: {item.text() if item else ''}")
         self.batch_preview_text.setPlainText("\n".join(values))
+
+    def _open_selected_batch_result(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        path_item = self.batch_results_table.item(row, 6)
+        if path_item is None:
+            return
+        path = Path(path_item.text())
+        if not path.is_absolute() and hasattr(self, "batch_input_dir_edit"):
+            path = Path(self.batch_input_dir_edit.text()) / path
+        if path.exists() and self._load_file(str(path)):
+            self._set_workspace_mode(0)
 
     def _on_scan_workspace_linecut_changed(self, text: str):
         if hasattr(self, "scan_linecut_combo"):
@@ -2226,6 +2353,9 @@ class SmartFitterMainWindow(QMainWindow):
             )
             nv = _nv_metrics(self._active_profile().name, result, self._effective_trace_metadata())
             rows.extend((self._metric_display_label(k), self._format_value_with_units(k, v)) for k, v in nv.items())
+        query = self.results_filter_edit.text().strip().lower() if hasattr(self, "results_filter_edit") else ""
+        if query:
+            rows = [(key, value) for key, value in rows if query in f"{key} {value}".lower()]
         self.results_table.setRowCount(len(rows))
         for idx, (key, value) in enumerate(rows):
             self.results_table.setItem(idx, 0, QTableWidgetItem(key))
@@ -2313,8 +2443,15 @@ class SmartFitterMainWindow(QMainWindow):
             return
         if self.ctx.x is None or self.ctx.y is None:
             return
-        y_plot, y_label = self._display_y(y_display if y_display is not None else self.ctx.y)
-        self.live_plot_widget.plot(self.ctx.x, y_plot, pen=pg.mkPen("#3d8b74", width=2), symbol="o", symbolSize=5, symbolBrush="#3d8b74")
+        plot_x = self.ctx.analysis_x if self.ctx.analysis_x is not None else self.ctx.x
+        plot_source = y_display if y_display is not None else (self.ctx.analysis_y if self.ctx.analysis_y is not None else self.ctx.y)
+        y_plot, y_label = self._display_y(plot_source)
+        self.live_plot_widget.plot(plot_x, y_plot, pen=pg.mkPen("#5aa989", width=2), symbol="o", symbolSize=5, symbolBrush="#5aa989")
+        if self.ctx.trace is not None and self.ctx.excluded_points:
+            indices = sorted(index for index in self.ctx.excluded_points if 0 <= index < len(self.ctx.trace.x_ns))
+            if indices:
+                excluded_y, _ = self._display_y(self.ctx.trace.y[indices])
+                self.live_plot_widget.plot(self.ctx.trace.x_ns[indices], excluded_y, pen=None, symbol="x", symbolSize=10, symbolPen="#e0a458")
         active_mode = self._friendly_mode_name(self._current_data_mode())
         live_secondary_view = None
         for mode, enabled, color in (
@@ -2406,7 +2543,10 @@ class SmartFitterMainWindow(QMainWindow):
             point = self.live_plot_widget.plotItem.vb.mapSceneToView(event.scenePos())
         except Exception:
             return
-        self._select_point_from_plot(float(point.x()), float(point.y()))
+        if self.mask_mode_combo.currentText() == "Edit points":
+            self._toggle_exclusion_at_x(float(point.x()))
+        else:
+            self._select_point_from_plot(float(point.x()), float(point.y()))
         try:
             event.accept()
         except Exception:
@@ -2487,6 +2627,15 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
+        save_session_action = QAction("Save Analysis Session...", self)
+        save_session_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_session_action.triggered.connect(self.on_save_session)
+        file_menu.addAction(save_session_action)
+        load_session_action = QAction("Open Analysis Session...", self)
+        load_session_action.setShortcut(QKeySequence("Ctrl+Alt+O"))
+        load_session_action.triggered.connect(self.on_load_session)
+        file_menu.addAction(load_session_action)
+        file_menu.addSeparator()
         recent_action = QAction("Open Recent...", self)
         recent_action.triggered.connect(self.on_open_recent)
         file_menu.addAction(recent_action)
@@ -2497,6 +2646,21 @@ class SmartFitterMainWindow(QMainWindow):
         batch_action = QAction("Batch Fit…", self)
         batch_action.triggered.connect(self._open_batch_dialog)
         file_menu.addAction(batch_action)
+
+        edit_menu = self.menuBar().addMenu("Edit")
+        undo_action = QAction("Undo analysis change", self)
+        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        undo_action.triggered.connect(self._undo)
+        edit_menu.addAction(undo_action)
+        redo_action = QAction("Redo analysis change", self)
+        redo_action.setShortcut(QKeySequence("Ctrl+Y"))
+        redo_action.triggered.connect(self._redo)
+        edit_menu.addAction(redo_action)
+        edit_menu.addSeparator()
+        copy_figure_action = QAction("Copy Export Figure", self)
+        copy_figure_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        copy_figure_action.triggered.connect(self.copy_export_figure)
+        edit_menu.addAction(copy_figure_action)
 
 
         preset_menu = self.menuBar().addMenu("Presets")
@@ -2526,8 +2690,8 @@ class SmartFitterMainWindow(QMainWindow):
         box.setChecked(checked)
         box.setToolTip(f"Click the title to {'collapse' if checked else 'expand'} this section.")
         box._drawer_anim = QPropertyAnimation(box, b"maximumHeight", box)
-        box._drawer_anim.setDuration(150)
-        box._drawer_anim.setEasingCurve(QEasingCurve.OutCubic)
+        box._drawer_anim.setDuration(0)
+        box._drawer_anim.setEasingCurve(QEasingCurve.Linear)
         box._drawer_finish_connected = False
 
         def set_children_visible(state: bool):
@@ -2766,8 +2930,15 @@ class SmartFitterMainWindow(QMainWindow):
         total = self.main_splitter.width()
         if total <= 0:
             return
+        saved = self.settings.value("layout/main_splitter_sizes", [])
+        try:
+            saved_sizes = [int(value) for value in saved]
+        except (TypeError, ValueError):
+            saved_sizes = []
         mins = [330, 700, 420]
-        if total >= sum(mins):
+        if len(saved_sizes) == 3 and sum(saved_sizes) > 0:
+            sizes = saved_sizes
+        elif total >= sum(mins):
             left, center, right = mins
             center += total - sum(mins)
             sizes = [left, center, right]
@@ -3084,6 +3255,8 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _save_preferences(self):
         self._apply_plot_controls_to_state()
+        if self.main_splitter is not None:
+            self.settings.setValue("layout/main_splitter_sizes", self.main_splitter.sizes())
         s = self.settings
         s.setValue("plot/fig_width", self.plot_opts.fig_width)
         s.setValue("plot/fig_height", self.plot_opts.fig_height)
@@ -3300,6 +3473,10 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _update_mask_mode(self):
         mode = self.mask_mode_combo.currentText()
+        if hasattr(self, "btn_edit_points"):
+            self.btn_edit_points.blockSignals(True)
+            self.btn_edit_points.setChecked(mode == "Edit points")
+            self.btn_edit_points.blockSignals(False)
         if self.span_selector is not None:
             self.span_selector.set_active(False)
         if mode == "Range drag":
@@ -3310,10 +3487,114 @@ class SmartFitterMainWindow(QMainWindow):
             self._update_point_readout("Point readout: none")
         self.canvas.draw_idle()
 
+    def _analysis_snapshot(self) -> dict[str, Any]:
+        return {"excluded_points": set(self.ctx.excluded_points or set()), "exclusion_ranges": list(self.ctx.exclusion_ranges or []), "steps": [step.to_dict() for step in self.ctx.analysis_steps]}
+
+    def _record_analysis_state(self) -> None:
+        self._analysis_undo_stack.append(self._analysis_snapshot())
+        self._analysis_redo_stack.clear()
+        if len(self._analysis_undo_stack) > 100:
+            self._analysis_undo_stack.pop(0)
+
+    def _restore_analysis_state(self, snapshot: dict[str, Any]) -> None:
+        self.ctx.excluded_points = set(snapshot.get("excluded_points") or set())
+        self.ctx.exclusion_ranges = [tuple(value) for value in snapshot.get("exclusion_ranges") or []]
+        self.ctx.analysis_steps = [AnalysisStep.from_dict(value) for value in snapshot.get("steps") or []]
+        self._refresh_mask_list()
+        self._refresh_analysis_list()
+        self._refresh_processed()
+
+    def _undo(self) -> None:
+        if self._analysis_undo_stack:
+            self._analysis_redo_stack.append(self._analysis_snapshot())
+            self._restore_analysis_state(self._analysis_undo_stack.pop())
+        else:
+            self._undo_params()
+
+    def _redo(self) -> None:
+        if self._analysis_redo_stack:
+            self._analysis_undo_stack.append(self._analysis_snapshot())
+            self._restore_analysis_state(self._analysis_redo_stack.pop())
+        else:
+            self._redo_params()
+
+    def _sync_analysis_step_fields(self) -> None:
+        kind = self.analysis_kind_combo.currentText() if hasattr(self, "analysis_kind_combo") else ""
+        options = {"Baseline": ["median", "mean", "linear", "first"], "Detrend": ["linear"], "Normalize": ["minmax", "zscore", "area"], "Derivative": ["gradient"], "Integral": ["cumulative"], "Resample": ["uniform"], "Expression": ["custom"]}
+        self.analysis_option_combo.blockSignals(True)
+        self.analysis_option_combo.clear()
+        self.analysis_option_combo.addItems(options.get(kind, []))
+        self.analysis_option_combo.blockSignals(False)
+        if kind == "Resample":
+            self.analysis_value_edit.setPlaceholderText("Point count (default 200)")
+            self.analysis_value_edit.setText(self.analysis_value_edit.text() or "200")
+        elif kind == "Expression":
+            self.analysis_value_edit.setPlaceholderText("Expression, e.g. y / max(abs(y))")
+            if self.analysis_value_edit.text() == "200":
+                self.analysis_value_edit.clear()
+        else:
+            self.analysis_value_edit.clear()
+            self.analysis_value_edit.setPlaceholderText("No additional value")
+
+    def on_add_analysis_step(self) -> None:
+        kind_map = {"Baseline": "baseline", "Detrend": "detrend", "Normalize": "normalize", "Derivative": "derivative", "Integral": "integral", "Resample": "resample", "Expression": "expression"}
+        kind = kind_map[self.analysis_kind_combo.currentText()]
+        option = self.analysis_option_combo.currentText()
+        params: dict[str, Any] = {"method": option} if kind in {"baseline", "normalize"} else {}
+        if kind == "resample":
+            try:
+                params["count"] = max(2, int(self.analysis_value_edit.text() or "200"))
+            except ValueError:
+                self._message("Analysis transform", "Resample point count must be a whole number.")
+                return
+        elif kind == "expression":
+            params["expression"] = self.analysis_value_edit.text().strip() or "y"
+        self._record_analysis_state()
+        self.ctx.analysis_steps.append(AnalysisStep(kind, params))
+        try:
+            self._refresh_processed()
+        except ValueError as exc:
+            self.ctx.analysis_steps.pop()
+            self._analysis_undo_stack.pop()
+            self._message("Analysis transform", str(exc))
+            return
+        self._refresh_analysis_list()
+
+    def on_remove_analysis_step(self) -> None:
+        item = self.analysis_list.currentItem()
+        if item is None or item.data(Qt.UserRole) is None:
+            return
+        index = int(item.data(Qt.UserRole))
+        if 0 <= index < len(self.ctx.analysis_steps):
+            self._record_analysis_state()
+            self.ctx.analysis_steps.pop(index)
+            self._refresh_analysis_list()
+            self._refresh_processed()
+
+    def on_clear_analysis_steps(self) -> None:
+        if self.ctx.analysis_steps:
+            self._record_analysis_state()
+            self.ctx.analysis_steps.clear()
+            self._refresh_analysis_list()
+            self._refresh_processed()
+
+    def _refresh_analysis_list(self) -> None:
+        if not hasattr(self, "analysis_list"):
+            return
+        self.analysis_list.clear()
+        for index, step in enumerate(self.ctx.analysis_steps):
+            details = ", ".join(f"{key}={value}" for key, value in step.params.items())
+            item = QListWidgetItem(f"{index + 1}. {step.kind}" + (f" ({details})" if details else ""))
+            item.setData(Qt.UserRole, index)
+            self.analysis_list.addItem(item)
+        if not self.ctx.analysis_steps:
+            self.analysis_list.addItem("No display transforms")
+
     def _on_range_selected(self, xmin: float, xmax: float):
         if self.ctx.exclusion_ranges is None:
             self.ctx.exclusion_ranges = []
         lo, hi = (xmin, xmax) if xmin <= xmax else (xmax, xmin)
+        self._record_analysis_state()
         self.ctx.exclusion_ranges.append((float(lo), float(hi)))
         self._refresh_mask_list()
         self._refresh_processed()
@@ -3513,6 +3794,7 @@ class SmartFitterMainWindow(QMainWindow):
             return
         if hi < lo:
             lo, hi = hi, lo
+        self._record_analysis_state()
         self.ctx.exclusion_ranges.append((lo, hi))
         self._refresh_mask_list()
         self._refresh_processed()
@@ -3524,12 +3806,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
             self._message("Exclusions", "Point exclusions apply to 1D fit traces. Use linecuts or ranges for scan review.")
             return
-        idx = int(np.argmin(np.abs(self.ctx.x - float(self._selected_plot_point["x"]))))
-        if self.ctx.excluded_points is None:
-            self.ctx.excluded_points = set()
-        self.ctx.excluded_points.add(idx)
-        self._refresh_mask_list()
-        self._refresh_processed()
+        self._toggle_exclusion_at_x(float(self._selected_plot_point["x"]))
 
     def on_remove_selected_exclusion(self):
         selected = self.mask_list.selectedItems() if hasattr(self.mask_list, "selectedItems") else []
@@ -3546,6 +3823,7 @@ class SmartFitterMainWindow(QMainWindow):
                 ranges_to_remove.append(int(value))
             elif kind == "point":
                 points_to_remove.append(int(value))
+        self._record_analysis_state()
         for idx in sorted(set(ranges_to_remove), reverse=True):
             if self.ctx.exclusion_ranges is not None and 0 <= idx < len(self.ctx.exclusion_ranges):
                 self.ctx.exclusion_ranges.pop(idx)
@@ -3556,6 +3834,9 @@ class SmartFitterMainWindow(QMainWindow):
         self._refresh_processed()
 
     def on_clear_exclusions(self):
+        if not (self.ctx.excluded_points or self.ctx.exclusion_ranges):
+            return
+        self._record_analysis_state()
         self.ctx.excluded_points = set()
         self.ctx.exclusion_ranges = []
         self._refresh_mask_list()
@@ -3593,6 +3874,24 @@ class SmartFitterMainWindow(QMainWindow):
                     keep[i] = False
         return x[keep], y[keep]
 
+    def _toggle_exclusion_at_x(self, x_value: float) -> None:
+        processed = self.ctx.processed
+        if processed is None or len(processed.analysis_x) == 0:
+            return
+        displayed_index = int(np.argmin(np.abs(processed.analysis_x - float(x_value))))
+        if displayed_index >= len(processed.source_groups):
+            return
+        raw_indices = set(int(value) for value in processed.source_groups[displayed_index])
+        if not raw_indices:
+            return
+        self._record_analysis_state()
+        if raw_indices.issubset(self.ctx.excluded_points or set()):
+            self.ctx.excluded_points.difference_update(raw_indices)
+        else:
+            self.ctx.excluded_points.update(raw_indices)
+        self._refresh_mask_list()
+        self._refresh_processed()
+
     def _on_plot_click(self, event):
         if event.inaxes not in self._inspectable_axes():
             return
@@ -3602,17 +3901,9 @@ class SmartFitterMainWindow(QMainWindow):
         if mode in {"Inspect point", "Off"}:
             self._select_point_from_plot(float(event.xdata), float(event.ydata) if event.ydata is not None else None)
             return
-        if mode != "Mask point" or self.ctx.x is None:
+        if mode != "Edit points" or self.ctx.x is None:
             return
-        idx = int(np.argmin(np.abs(self.ctx.x - float(event.xdata))))
-        if self.ctx.excluded_points is None:
-            self.ctx.excluded_points = set()
-        if idx in self.ctx.excluded_points:
-            self.ctx.excluded_points.remove(idx)
-        else:
-            self.ctx.excluded_points.add(idx)
-        self._refresh_mask_list()
-        self._refresh_processed()
+        self._toggle_exclusion_at_x(float(event.xdata))
 
     def on_save_preset(self):
         out, _ = QFileDialog.getSaveFileName(self, "Save analysis preset", "", "Preset JSON (*.json)")
@@ -3648,6 +3939,93 @@ class SmartFitterMainWindow(QMainWindow):
         Path(out).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.ctx.active_preset_name = payload["preset_name"]
         self._message("Preset", f"Saved preset:\n{out}")
+
+    def copy_export_figure(self) -> None:
+        if self.ctx.trace is None:
+            self._message("Copy figure", "Load data before copying a figure.")
+            return
+        buffer = BytesIO()
+        self.fig.savefig(buffer, format="png", dpi=max(300, int(self.plot_opts.save_dpi)), bbox_inches="tight", pad_inches=0.12)
+        image = QImage.fromData(buffer.getvalue(), "PNG")
+        if image.isNull():
+            self._message("Copy figure", "The figure could not be rendered for the clipboard.")
+            return
+        QApplication.clipboard().setImage(image)
+        self.statusBar().showMessage("Export figure copied to clipboard", 4000)
+
+    def _session_payload(self, session_path: str) -> dict[str, Any]:
+        if self.ctx.trace is None:
+            raise ValueError("Load data before saving a session.")
+        trace = self.ctx.trace
+        overlays = [source_descriptor(overlay.source_path, session_path) for name, overlay in (self.ctx.loaded_traces or {}).items() if name != trace.file_name]
+        return {
+            "primary_source": source_descriptor(trace.source_path, session_path), "profile": self.profile_combo.currentText(),
+            "mode": self.mode_combo.currentText(), "model": self.model_combo.currentText(),
+            "roi": [self.roi_min.text(), self.roi_max.text()], "bin_size": self.bin_spin.value(), "smooth_window": self.smooth_spin.value(),
+            "excluded_raw_indices": sorted(self.ctx.excluded_points or set()), "exclusion_ranges": list(self.ctx.exclusion_ranges or []),
+            "analysis_steps": [step.to_dict() for step in self.ctx.analysis_steps], "plot_options": self.plot_opts.__dict__,
+            "sample_metadata": self._collect_sample_metadata(), "locks": self._collect_locks(),
+            "overlay_sources": overlays,
+            "view": {"xlim": list(self.ax_main.get_xlim()), "ylim": list(self.ax_main.get_ylim())},
+        }
+
+    def on_save_session(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save analysis session", "", "SmartFitter session (*.nvfit-session.json)")
+        if not path:
+            return
+        if not path.endswith(".nvfit-session.json"):
+            path += ".nvfit-session.json"
+        try:
+            save_session(path, self._session_payload(path))
+        except Exception as exc:
+            self._message("Save session", str(exc))
+            return
+        self.settings.setValue("session/last_session", path)
+        self.statusBar().showMessage(f"Saved analysis session: {Path(path).name}", 5000)
+
+    def on_load_session(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open analysis session", str(self.settings.value("session/last_session", "")), "SmartFitter session (*.nvfit-session.json)")
+        if not path:
+            return
+        try:
+            document = load_session(path)
+            source, changed = resolve_source(dict(document["primary_source"]), path)
+        except Exception as exc:
+            self._message("Open session", str(exc))
+            return
+        if source is None:
+            replacement, _ = QFileDialog.getOpenFileName(self, "Locate the session's primary MAT file", str(Path(path).parent), "MAT files (*.mat)")
+            source = Path(replacement) if replacement else None
+        if source is None or not self._load_file(str(source)):
+            return
+        for descriptor in document.get("overlay_sources") or []:
+            overlay_path, _changed = resolve_source(dict(descriptor), path)
+            if overlay_path is None or overlay_path.resolve() == source.resolve():
+                continue
+            try:
+                overlay = load_saved_data_mat(str(overlay_path), mode=self._current_data_mode())
+                self.ctx.loaded_traces[overlay.file_name] = overlay
+            except Exception:
+                continue
+        self._update_overlay_widgets()
+        self.profile_combo.setCurrentText(str(document.get("profile", "Auto")))
+        self.mode_combo.setCurrentText(str(document.get("mode", "contrast")))
+        self.model_combo.setCurrentText(str(document.get("model", self.model_combo.currentText())))
+        roi = document.get("roi") or ["", ""]
+        self.roi_min.setText(str(roi[0] if len(roi) else "")); self.roi_max.setText(str(roi[1] if len(roi) > 1 else ""))
+        self.bin_spin.setValue(int(document.get("bin_size", 1))); self.smooth_spin.setValue(int(document.get("smooth_window", 1)))
+        self.ctx.excluded_points = set(int(value) for value in document.get("excluded_raw_indices") or [])
+        self.ctx.exclusion_ranges = [tuple(value) for value in document.get("exclusion_ranges") or []]
+        self.ctx.analysis_steps = [AnalysisStep.from_dict(value) for value in document.get("analysis_steps") or []]
+        for key, value in dict(document.get("sample_metadata") or {}).items():
+            widget = getattr(self, f"meta_{key}", None)
+            if widget is not None: widget.setText(str(value))
+        self._refresh_mask_list(); self._refresh_analysis_list(); self._refresh_processed()
+        view = dict(document.get("view") or {})
+        if view.get("xlim") and view.get("ylim"):
+            self.ax_main.set_xlim(*view["xlim"]); self.ax_main.set_ylim(*view["ylim"]); self.canvas.draw_idle()
+        self.settings.setValue("session/last_session", path)
+        self.statusBar().showMessage("Session restored" + ("; source file has changed" if changed else ""), 6000)
 
     def on_load_preset(self):
         p, _ = QFileDialog.getOpenFileName(self, "Load analysis preset", "", "Preset JSON (*.json)")
@@ -3768,7 +4146,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.settings.setValue("session/last_open_dir", str(Path(file_path).parent))
         self._load_file(file_path)
 
-    def _load_file(self, file_path: str):
+    def _load_file(self, file_path: str, *, preserve_analysis: bool = False):
         if self._is_loading:
             return False
         preserve_mode_override = self._mode_override_active
@@ -3790,6 +4168,12 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.odmr_peaks = None
         self._selected_plot_point = None
         self._scan_cursor = None
+        if not preserve_analysis:
+            self.ctx.excluded_points = set()
+            self.ctx.exclusion_ranges = []
+            self.ctx.analysis_steps = []
+            self._analysis_undo_stack.clear()
+            self._analysis_redo_stack.clear()
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
         self.ctx.loaded_traces[trace.file_name] = trace
@@ -3822,7 +4206,7 @@ class SmartFitterMainWindow(QMainWindow):
         path = Path(self.ctx.trace.source_path)
         if path.exists():
             preserve_mode_override = self._mode_override_active
-            if self._load_file(str(path)):
+            if self._load_file(str(path), preserve_analysis=True):
                 self._mode_override_active = preserve_mode_override
                 self._update_profile_hint()
         else:
@@ -3923,10 +4307,15 @@ class SmartFitterMainWindow(QMainWindow):
         return np.asarray(matrix[:, iteration_index], dtype=float), label
 
     def _processed_trace_series(self, trace: ExperimentTrace, y_full: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        x, y = trace.x_ns.copy(), np.asarray(y_full, dtype=float).copy()
-        x, y = bin_trace(x, y, self.bin_spin.value())
-        x, y = apply_roi(x, y, *self._parse_roi())
-        return self._apply_exclusions(x, y)
+        processed = process_series(
+            trace.x_ns,
+            np.asarray(y_full, dtype=float),
+            bin_size=self.bin_spin.value(),
+            roi=self._parse_roi(),
+            excluded_raw_indices=self.ctx.excluded_points,
+            exclusion_ranges=self.ctx.exclusion_ranges,
+        )
+        return processed.fit_x, processed.fit_y
 
     def _selected_iteration_matrix(self, trace: ExperimentTrace, mode: str) -> tuple[np.ndarray, np.ndarray, list[int], str]:
         matrix, label = self._iteration_source_for_mode(trace, mode)
@@ -4256,10 +4645,12 @@ class SmartFitterMainWindow(QMainWindow):
             pass
 
     def _nearest_trace_point(self, xdata: float) -> tuple[int, float, float] | None:
-        if self.ctx.x is None or self.ctx.y is None or len(self.ctx.x) == 0:
+        x = self.ctx.analysis_x if self.ctx.analysis_x is not None else self.ctx.x
+        y = self.ctx.analysis_y if self.ctx.analysis_y is not None else self.ctx.y
+        if x is None or y is None or len(x) == 0:
             return None
-        idx = int(np.argmin(np.abs(self.ctx.x - float(xdata))))
-        return idx, float(self.ctx.x[idx]), float(self.ctx.y[idx])
+        idx = int(np.argmin(np.abs(x - float(xdata))))
+        return idx, float(x[idx]), float(y[idx])
 
     def _raw_index_for_processed_x(self, x_value: float) -> int | None:
         if self.ctx.trace is None or len(self.ctx.trace.x_ns) == 0:
@@ -4709,7 +5100,7 @@ class SmartFitterMainWindow(QMainWindow):
         old_x = None if self.ctx.x is None else self.ctx.x.copy()
         old_y = None if self.ctx.y is None else self.ctx.y.copy()
         old_y_sm = None if self.ctx.y_smooth is None else self.ctx.y_smooth.copy()
-        x, y = tr.x_ns.copy(), tr.y.copy()
+        y = tr.y.copy()
         # Optional baseline/reference subtraction from overlay trace.
         baseline_name = self.baseline_combo.currentText().strip() if hasattr(self, "baseline_combo") else "None"
         if baseline_name and baseline_name != "None" and self.ctx.loaded_traces and baseline_name in self.ctx.loaded_traces:
@@ -4718,30 +5109,32 @@ class SmartFitterMainWindow(QMainWindow):
             order = np.argsort(bx)
             bx = bx[order]
             by = by[order]
-            y = y - np.interp(x, bx, by, left=by[0], right=by[-1])
-        x, y = bin_trace(x, y, self.bin_spin.value())
+            y = y - np.interp(tr.x_ns, bx, by, left=by[0], right=by[-1])
+        processed = process_series(
+            tr.x_ns,
+            y,
+            bin_size=self.bin_spin.value(),
+            roi=self._parse_roi(),
+            excluded_raw_indices=self.ctx.excluded_points,
+            exclusion_ranges=self.ctx.exclusion_ranges,
+            steps=self.ctx.analysis_steps,
+        )
+        x, y = processed.fit_x, processed.fit_y
         y_sm = smooth_trace(y, self.smooth_spin.value())
-        roi_min, roi_max = self._parse_roi()
-        x, y = apply_roi(x, y, roi_min, roi_max)
-        _, y_sm = apply_roi(bin_trace(tr.x_ns, tr.y, self.bin_spin.value())[0], y_sm, roi_min, roi_max)
-        x, y = self._apply_exclusions(x, y)
         if len(x) == 0 or len(y) == 0:
             if self.ctx.fit_result is not None and not self._is_loading:
                 self._clear_stale_fit("processed data changed")
             self.ctx.x = np.array([])
             self.ctx.y = np.array([])
             self.ctx.y_smooth = np.array([])
+            self.ctx.analysis_x = np.array([])
+            self.ctx.analysis_y = np.array([])
+            self.ctx.processed = processed
             self.summary_text.setPlainText("No points remain after ROI / exclusion / observable filtering.")
             self.ax_main.clear()
             self.ax_res.clear()
             self.canvas.draw_idle()
             return
-        x_sm, y_sm = self._apply_exclusions(x.copy(), y_sm[: len(x)])
-        # Align smoothed vector if exclusion changed lengths.
-        if len(x_sm) == len(x):
-            y_sm = y_sm[: len(x)]
-        else:
-            y_sm = np.interp(x, x_sm, y_sm, left=y_sm[0] if len(y_sm) else 0.0, right=y_sm[-1] if len(y_sm) else 0.0)
         processed_changed = (
             self._arrays_differ(old_x, x)
             or self._arrays_differ(old_y, y)
@@ -4752,6 +5145,10 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.x = x
         self.ctx.y = y
         self.ctx.y_smooth = y_sm
+        self.ctx.processed = processed
+        self.ctx.analysis_x = processed.analysis_x
+        self.ctx.analysis_y = processed.analysis_y
+        self._refresh_analysis_list()
         self._plot_raw()
 
     def _plot_raw(self):
@@ -4777,7 +5174,17 @@ class SmartFitterMainWindow(QMainWindow):
             xmin, xmax, ymin, ymax = extent
             linecut = self._extract_scan_linecut()
             self._configure_scan2d_layout(show_linecut=linecut is not None, extent=extent)
-            mesh = self.ax_main.pcolormesh(x_edges, y_edges, self.ctx.trace.z2d, shading="flat")
+            cmap = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "viridis"
+            if hasattr(self, "scan_reverse_chk") and self.scan_reverse_chk.isChecked():
+                cmap += "_r"
+            mesh = self.ax_main.pcolormesh(x_edges, y_edges, self.ctx.trace.z2d, shading="flat", cmap=cmap)
+            if hasattr(self, "scan_robust_limits_chk") and self.scan_robust_limits_chk.isChecked():
+                finite = np.asarray(self.ctx.trace.z2d, dtype=float)
+                finite = finite[np.isfinite(finite)]
+                if len(finite) > 1:
+                    low, high = np.percentile(finite, [2, 98])
+                    if high > low:
+                        mesh.set_clim(float(low), float(high))
             self.ax_main.set_xlim(xmin, xmax)
             self.ax_main.set_ylim(ymin, ymax)
             # The axes box is already fitted to the scan's physical aspect by
@@ -4809,12 +5216,21 @@ class SmartFitterMainWindow(QMainWindow):
                 self.ax_res.set_ylabel(self._current_observable_label())
                 self.ax_res.grid(True, alpha=0.3)
         else:
-            y_disp, y_lab = self._display_y(self.ctx.y)
+            plot_x = self.ctx.analysis_x if self.ctx.analysis_x is not None else self.ctx.x
+            plot_y = self.ctx.analysis_y if self.ctx.analysis_y is not None else self.ctx.y
+            y_disp, y_lab = self._display_y(plot_y)
             primary_series.append(np.asarray(y_disp, dtype=float))
             if self.plot_opts.show_data:
-                self._plot_series(self.ax_main, self.ctx.x, y_disp, self._legend_label("Data", "Data"), role="data")
-            self._add_observable_layers(primary_series)
-            self._add_iteration_layer(primary_series)
+                self._plot_series(self.ax_main, plot_x, y_disp, self._legend_label("Data", "Data"), role="data")
+            if not self.ctx.analysis_steps:
+                self._add_observable_layers(primary_series)
+                self._add_iteration_layer(primary_series)
+            if self.ctx.trace is not None and self.ctx.excluded_points:
+                indices = sorted(index for index in self.ctx.excluded_points if 0 <= index < len(self.ctx.trace.x_ns))
+                if indices:
+                    excluded_x = self.ctx.trace.x_ns[indices]
+                    excluded_y, _ = self._display_y(self.ctx.trace.y[indices])
+                    self.ax_main.plot(excluded_x, excluded_y, "x", color="#e0a458", ms=6, mew=1.5, label=self._legend_label("Excluded", "Excluded"))
             # Overlay selected traces.
             if self.ctx.loaded_traces:
                 for i in range(self.overlay_list.count()):
@@ -4834,6 +5250,8 @@ class SmartFitterMainWindow(QMainWindow):
                     primary_series.append(np.asarray(ty_disp, dtype=float))
                     self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", alpha=0.5)
             if (
+                not self.ctx.analysis_steps
+                and
                 self.plot_opts.show_smoothed
                 and self.smooth_spin.value() > 1
                 and self.ctx.y_smooth is not None
@@ -5195,6 +5613,7 @@ class SmartFitterMainWindow(QMainWindow):
             text += f" ({reason})"
         self.status_lbl.setText(text)
         self.status_lbl.setStyleSheet(f"QLabel {{ color: {color}; font-weight: bold; }}")
+        self.statusBar().showMessage(f"{status}: {reason}" if reason else status, 5000)
 
     def _drag_paths_from_event(self, event) -> list[str]:
         if not event.mimeData().hasUrls():
@@ -5553,6 +5972,12 @@ class SmartFitterMainWindow(QMainWindow):
         x = self.ctx.x
         if x is None:
             return
+        raw_x = np.asarray(x, dtype=float)
+        raw_y = np.asarray(y_raw, dtype=float)
+        fit_for_display = np.asarray(fit_result.y_fit, dtype=float)
+        if self.ctx.analysis_steps:
+            x, y_raw, _ = apply_steps(raw_x, raw_y, self.ctx.analysis_steps)
+            _fit_x, fit_for_display, _ = apply_steps(raw_x, fit_for_display, self.ctx.analysis_steps)
         view_state = self._capture_view_state() if not self._is_loading else None
         self._apply_plot_controls_to_state()
         self._clear_secondary_axis()
@@ -5565,16 +5990,17 @@ class SmartFitterMainWindow(QMainWindow):
         primary_series: list[np.ndarray] = []
         if isinstance(fit_result.extras, dict) and fit_result.extras.get("plot_y_label"):
             y_disp = np.asarray(y_raw, dtype=float)
-            yfit_disp = np.asarray(fit_result.y_fit, dtype=float)
+            yfit_disp = fit_for_display
             y_lab = str(fit_result.extras.get("plot_y_label"))
         else:
             y_disp, y_lab = self._display_y(y_raw)
-            yfit_disp, _ = self._display_y(fit_result.y_fit)
+            yfit_disp, _ = self._display_y(fit_for_display)
         primary_series.append(np.asarray(y_disp, dtype=float))
         if self.plot_opts.show_data:
             self._plot_series(self.ax_main, x, y_disp, self._legend_label("Data", "Data"), role="data")
-        self._add_observable_layers(primary_series)
-        self._add_iteration_layer(primary_series)
+        if not self.ctx.analysis_steps:
+            self._add_observable_layers(primary_series)
+            self._add_iteration_layer(primary_series)
         if self.ctx.loaded_traces:
             for i in range(self.overlay_list.count()):
                 item = self.overlay_list.item(i)
@@ -5639,9 +6065,9 @@ class SmartFitterMainWindow(QMainWindow):
         self._apply_combined_legend()
         self.ax_main.set_title(f"{self.ctx.trace.file_name if self.ctx.trace else ''} | " + rf"$R^2$={fit_result.r2:.3f}")
 
-        fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else y_raw
+        fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else raw_y
         residual = fit_target - fit_result.y_fit
-        self.ax_res.set_visible(self.plot_opts.show_residual or self.plot_opts.show_fft_panel)
+        self.ax_res.set_visible((self.plot_opts.show_residual or self.plot_opts.show_fft_panel) and not self.ctx.analysis_steps)
         if self.plot_opts.show_fft_panel:
             y_fft = y_raw
             if len(x) > 3:
@@ -5653,7 +6079,7 @@ class SmartFitterMainWindow(QMainWindow):
                 self.ax_res.set_ylabel("FFT amplitude")
                 self.ax_res.grid(True, alpha=0.3)
         elif self.plot_opts.show_residual:
-            self.ax_res.plot(x, residual, ".", ms=3)
+            self.ax_res.plot(raw_x, residual, ".", ms=3)
             self.ax_res.axhline(0.0, ls="--", lw=1, color="k")
             self.ax_res.set_xlabel(self.ctx.trace.x_label if self.ctx.trace else "X")
             self.ax_res.set_ylabel("Residual")
@@ -5709,6 +6135,8 @@ class SmartFitterMainWindow(QMainWindow):
             "exclusion_ranges": list(self.ctx.exclusion_ranges or []),
             "excluded_points_count": int(len(self.ctx.excluded_points or set())),
             "rabi_dead_time_ns": float(self.rabi_dead_time_ns.value()),
+            "analysis_steps": [step.to_dict() for step in self.ctx.analysis_steps],
+            "analysis_provenance": ([] if self.ctx.processed is None else self.ctx.processed.provenance),
         }
         payload = {
             "file": self.ctx.trace.file_name,
@@ -5777,7 +6205,7 @@ class SmartFitterMainWindow(QMainWindow):
                 for k, v in sample_md.items():
                     writer.writerow([f"sample:{k}", v])
                 for k, v in provenance.items():
-                    writer.writerow([f"provenance:{k}", v])
+                    writer.writerow([f"provenance:{k}", json.dumps(v) if isinstance(v, (list, dict)) else v])
             saved_paths.append(csv_path)
 
         # Save an annotated report figure with key extracted metrics.
@@ -5877,6 +6305,8 @@ class SmartFitterMainWindow(QMainWindow):
                         "y_processed",
                         "y_fit",
                         "residual",
+                        "x_analysis",
+                        "y_analysis",
                     ]
                 )
                 tr = self.ctx.trace
@@ -5892,7 +6322,9 @@ class SmartFitterMainWindow(QMainWindow):
                     yp = self.ctx.y[i] if i < len(self.ctx.y) else ""
                     yf = y_fit[i] if i < len(y_fit) else ""
                     rv = residual[i] if i < len(residual) else ""
-                    writer.writerow([xo, yo, so, ro, xp, yp, yf, rv])
+                    ax = self.ctx.analysis_x[i] if self.ctx.analysis_x is not None and i < len(self.ctx.analysis_x) else ""
+                    ay = self.ctx.analysis_y[i] if self.ctx.analysis_y is not None and i < len(self.ctx.analysis_y) else ""
+                    writer.writerow([xo, yo, so, ro, xp, yp, yf, rv, ax, ay])
             origin_meta = out / f"{stem}_origin_bundle_meta.json"
             with origin_meta.open("w", encoding="utf-8") as f:
                 json.dump({"sample_metadata": sample_md, "trace_metadata": trace_metadata, "provenance": provenance, "nv_metrics": nv}, f, indent=2)
