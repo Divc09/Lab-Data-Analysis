@@ -13,6 +13,7 @@ import numpy as np
 from scipy.signal import find_peaks
 
 from .diagnostics import aic, bic, durbin_watson, r_squared, rmse
+from .analysis_tools import process_series
 from .fit_engine import FitResult, fit_model_multistart
 from .fit_workflows import FitWorkflowConfig, fit_non_ramsey
 from .io_mat import load_saved_data_mat
@@ -21,7 +22,7 @@ from .models import (
     build_custom_expression_model,
     spin_echo_model,
 )
-from .preprocess import apply_roi, bin_trace, smooth_trace
+from .preprocess import smooth_trace
 from .profiles import PROFILES, classify_status
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
@@ -746,10 +747,10 @@ def run_batch(
 
         profile = PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
 
-        x, y = bin_trace(trace.x_ns, trace.y, bin_size)
+        processed = process_series(trace.x_ns, trace.y, bin_size=bin_size, roi=(roi_min, roi_max))
+        x, y = processed.fit_x, processed.fit_y
         if smooth_window > 1:
             y = smooth_trace(y, smooth_window)
-        x, y = apply_roi(x, y, roi_min, roi_max)
 
         stem = _output_stem(input_dir, mat_file, recursive=recursive)
         fit_png = output_dir / f"{stem}_fit.png"

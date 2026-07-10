@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from nvfit.models import (
     build_custom_expression_model,
@@ -35,4 +36,13 @@ def test_odmr_multi_and_custom_model_finite():
     model = build_custom_expression_model("y0 + A*np.cos(2*np.pi*f*t+phi)", ["y0", "A", "f", "phi"])
     y2 = model(t, 0.01, 0.02, 0.005, 0.0)
     assert np.isfinite(y2).all()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["np.__dict__", "t[0]", "[value for value in t]", "__import__('os')", "(1).__class__"],
+)
+def test_custom_model_expression_rejects_unsafe_syntax(expression):
+    with pytest.raises(ValueError):
+        build_custom_expression_model(expression, ["A"])
 

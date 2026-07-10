@@ -3,6 +3,5 @@ scipy
 matplotlib
 h5py
 PySide6
-pyqtgraph
 qtawesome
 pytest

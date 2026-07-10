@@ -9,9 +9,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from nvfit.fit_engine import FitResult
+from nvfit.app_state import FitOutcome, FitRequest
 from nvfit.gui_app import IterationSelectionDialog, SmartFitterMainWindow
 
 
@@ -98,7 +99,7 @@ def test_gui_drop_loading_and_annotation_smoke():
     assert any("R^2" in line for line in lines)
     assert any("Analysis mode:" in line for line in lines)
     assert any("Delay [ns]" in line for line in lines)
-    assert "Recommended mode" in win.profile_hint_lbl.text()
+    assert "Recommended mode" in win.profile_hint_lbl.toolTip()
 
 
 def test_gui_drag_path_filter_accepts_mat_only():
@@ -111,14 +112,12 @@ def test_gui_drag_path_filter_accepts_mat_only():
     assert [Path(p) for p in paths] == [Path(r"C:\tmp\one.mat")]
 
 
-def test_gui_embedded_plot_views_defer_file_drops_to_window():
+def test_gui_uses_one_wysiwyg_plot_and_window_owns_file_drops():
     _app()
     win = SmartFitterMainWindow()
 
-    for plot_widget in (win.live_plot_widget, win.scan_workspace_plot):
-        if plot_widget is not None:
-            assert not plot_widget.acceptDrops()
-            assert not plot_widget.viewport().acceptDrops()
+    assert win.live_plot_widget is None
+    assert win.scan_workspace_plot is None
     assert win.acceptDrops()
 
 
@@ -145,7 +144,7 @@ def test_gui_inspect_click_updates_point_readout():
     assert len(win.ctx.x) == point_count
 
 
-def test_gui_live_plot_click_selection_pins_nearest_point():
+def test_gui_wysiwyg_plot_click_selection_pins_nearest_point_without_legend_entry():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
@@ -157,8 +156,8 @@ def test_gui_live_plot_click_selection_pins_nearest_point():
     assert win._selected_plot_point is not None
     assert abs(win._selected_plot_point["x"] - float(win.ctx.x[idx])) < 1e-9
     assert "Point readout" in win.live_readout_lbl.text()
-    assert win.live_selection_marker is not None
-    assert any(line.get_label() == "Point" for line in win.ax_main.lines)
+    assert any(line.get_label() == "_nolegend_" for line in win.ax_main.lines)
+    assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
 
 
 def test_gui_scan_visibility_and_summary_for_2d_scan():
@@ -187,6 +186,8 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+    win.scan_equal_aspect_chk.setChecked(True)
+    win._refresh_plot_only()
 
     finite = np.asarray(win.ctx.trace.z2d, dtype=float)
     finite = finite[np.isfinite(finite)]
@@ -200,8 +201,7 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     mesh = win.ax_main.collections[0]
     assert mesh.get_cmap().name == "magma"
     assert mesh.get_clim() == pytest.approx((low, high))
-    assert win.scan_workspace_colormap_combo.currentText() == "magma"
-    assert win.scan_workspace_scale_combo.currentText() == "Manual"
+    assert win.scan_low_percentile_spin.isEnabled() is False
 
     _x_edges, _y_edges, extent = win._scan2d_extent(win.ctx.trace)
     xlim = (extent[0] + 0.15 * (extent[1] - extent[0]), extent[1] - 0.15 * (extent[1] - extent[0]))
@@ -209,6 +209,7 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     for edit, value in ((win.scan_xmin_edit, xlim[0]), (win.scan_xmax_edit, xlim[1]), (win.scan_ymin_edit, ylim[0]), (win.scan_ymax_edit, ylim[1])):
         edit.setText(f"{value:.12g}")
     win._apply_scan_view_limits()
+    assert not win.scan_equal_aspect_chk.isChecked()
     assert win.ax_main.get_xlim() == pytest.approx(xlim)
     assert win.ax_main.get_ylim() == pytest.approx(ylim)
 
@@ -260,6 +261,8 @@ def test_gui_june5_stage_scan_export_extent_and_colorbar_layout():
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(JUNE5_2D_STAGE))
+    win.scan_equal_aspect_chk.setChecked(True)
+    win._refresh_plot_only()
 
     assert win.ctx.trace is not None
     assert win.ctx.trace.scan_dim == "scan2d"
@@ -282,7 +285,7 @@ def test_gui_june5_stage_scan_export_extent_and_colorbar_layout():
     assert rendered_aspect == pytest.approx(1.0, rel=0.03)
 
 
-def test_gui_live_scan_click_selection_updates_cursor_and_crosshair():
+def test_gui_scan_click_selection_updates_cursor_on_wysiwyg_plot():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
@@ -296,8 +299,7 @@ def test_gui_live_scan_click_selection_updates_cursor_and_crosshair():
     assert win._scan_cursor == (x0, y0)
     assert win._selected_plot_point["z"] == z0
     assert "z=" in win.live_readout_lbl.text()
-    assert win.live_selection_vline is not None
-    assert win.live_selection_hline is not None
+    assert any(np.allclose(line.get_xdata(), [x0, x0]) for line in win.ax_main.lines)
 
 
 def test_gui_exclusion_workflow_uses_selected_point_and_ranges():
@@ -539,7 +541,7 @@ def test_gui_workspace_modes_batch_summary_and_results(tmp_path):
     messages = []
     win._message = lambda title, text: messages.append((title, text))
 
-    assert win.mode_stack.count() == 4
+    assert win.mode_stack.count() == 2
     win._set_workspace_mode(1)
     assert win.mode_stack.currentIndex() == 1
 
@@ -579,10 +581,10 @@ def test_gui_workspace_modes_batch_summary_and_results(tmp_path):
         selection_note="selected shifted single-frequency Rabi model",
     )
     win.on_fit_finished(fake_result)
-    win._set_workspace_mode(3)
-    assert win.mode_stack.currentIndex() == 3
-    assert "Analysis mode: RabiShifted" in win.results_text.toPlainText()
-    assert win.results_table.rowCount() > 0
+    win._set_workspace_mode(0)
+    assert win.mode_stack.currentIndex() == 0
+    assert "Analysis mode: RabiShifted" in win.summary_text.toPlainText()
+    assert not win.results_box.isHidden()
 
 
 def test_gui_options_drawers_defaults_and_tooltips():
@@ -593,7 +595,7 @@ def test_gui_options_drawers_defaults_and_tooltips():
     assert not win.overlay_box.isChecked()
     assert not win.prep_box.isChecked()
     assert win.strategy_box.isChecked()
-    assert not win.mask_box.isChecked()
+    assert not win.advanced_box.isChecked()
     assert not win.plot_box.isChecked()
     assert not win.annotation_box.isChecked()
     assert win.export_box.isChecked()
@@ -620,9 +622,23 @@ def test_gui_options_drawers_defaults_and_tooltips():
     win.rabi_mode_combo.setCurrentText("Long damped Rabi")
     assert "long decayed scans" in win.rabi_model_help_lbl.text()
 
-    win.mask_box.setChecked(True)
+    win.advanced_box.setChecked(True)
     assert not win.btn_exclude_selected.isHidden()
     assert not win.mask_list.isHidden()
+
+
+def test_gui_layout_is_two_workspaces_without_horizontal_panel_scrolling():
+    app = _app()
+    win = SmartFitterMainWindow()
+    win.resize(1366, 768)
+    win.show()
+    app.processEvents()
+
+    assert win.mode_stack.count() == 2
+    assert win.left_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert win.right_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert win.live_plot_widget is None
+    assert sum(win.main_splitter.sizes()) <= win.main_splitter.width() + 4
 
 
 def test_gui_metadata_panel_and_observable_layers_do_not_change_mode():
@@ -811,18 +827,17 @@ def test_gui_iteration_dialog_all_none_selection():
     assert dlg.selected_indices() == set()
 
 
-def test_gui_scan_explorer_workspace_syncs_with_loaded_scan():
+def test_gui_map_controls_replace_separate_scan_workspace():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
 
-    win._set_workspace_mode(2)
-    assert win.mode_stack.currentIndex() == 2
-    assert "Max point" in win.scan_workspace_summary.toPlainText()
-
-    win.scan_workspace_linecut_combo.setCurrentText("Best-point horizontal")
-    assert win.scan_linecut_combo.currentText() == "Best-point horizontal"
+    assert win.mode_stack.count() == 2
+    assert not win.scan_quick_bar.isHidden()
+    assert "Max point" in win.scan_summary_text.toPlainText()
+    win.scan_linecut_combo.setCurrentText("Best-point horizontal")
+    assert win.ax_res.get_visible()
 
 
 @pytest.mark.skipif(not TDD_ROOT.exists(), reason="429_TDD data directory is not available")
@@ -852,12 +867,12 @@ def test_gui_selected_marker_toggles_and_clears_without_changing_data():
 
     win._select_point_from_plot(x0, refresh=True)
     assert win._selected_plot_point is not None
-    assert win.clear_marker_btn.isEnabled()
-    assert any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
+    assert not win.clear_marker_btn.isHidden()
+    assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
 
     win._select_point_from_plot(x0, refresh=True)
     assert win._selected_plot_point is None
-    assert not win.clear_marker_btn.isEnabled()
+    assert win.clear_marker_btn.isHidden()
     assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
     assert len(win.ctx.x) == original_count
 
@@ -874,3 +889,93 @@ def test_gui_copy_export_figure_places_image_on_clipboard():
     win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
     win.copy_export_figure()
     assert not app.clipboard().image().isNull()
+
+
+def _fake_fit(win: SmartFitterMainWindow, model_name: str = "Rabi") -> FitResult:
+    return FitResult(
+        model_name=model_name,
+        param_names=["y0", "A", "f", "phi"],
+        params=np.array([0.0, 0.02, 0.003, 0.0]),
+        errors=np.array([0.001, 0.001, 0.0001, 0.01]),
+        y_fit=np.asarray(win.ctx.y, dtype=float).copy(),
+        r2=0.95,
+        rmse=0.002,
+        aic=1.0,
+        bic=2.0,
+        durbin_watson=1.9,
+        bound_hits=[False] * 4,
+        success=True,
+        message="ok",
+    )
+
+
+def test_gui_discards_late_fit_result_after_analysis_changes():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    request = FitRequest(1, win._current_fit_signature())
+    win._active_fit_request = request
+    win.ctx.x = win.ctx.x + 1.0
+
+    win.on_fit_finished(FitOutcome(request, _fake_fit(win)))
+
+    assert win.ctx.fit_result is None
+    assert "discarded" in win.status_lbl.text().lower()
+
+
+def test_gui_undo_history_is_chronological_across_parameters_and_masks():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    win._populate_param_table(["A"], np.array([1.0]))
+    win.param_table.item(0, 1).setText("2")
+    win._record_analysis_state("range exclusion")
+    win.ctx.exclusion_ranges.append((0.0, 1.0))
+
+    win._undo()
+    assert win.ctx.exclusion_ranges == []
+    assert float(win.param_table.item(0, 1).text()) == 2.0
+    win._undo()
+    assert float(win.param_table.item(0, 1).text()) == 1.0
+
+
+def test_gui_session_v2_restores_plot_locks_and_fit_state(tmp_path, monkeypatch):
+    _app()
+    session_path = tmp_path / "complete.nvfit-session.json"
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    win.show_legend_chk.setChecked(False)
+    win.ctx.exclusion_ranges = [(float(win.ctx.x[2]), float(win.ctx.x[3]))]
+    win._refresh_processed()
+    win.ctx.pending_locks = {"A": (0.02, True, 0.0, 0.1)}
+    win.on_fit_finished(_fake_fit(win))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(session_path), ""))
+    win.on_save_session()
+
+    restored = SmartFitterMainWindow()
+    restored._message = lambda *args, **kwargs: None
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(session_path), ""))
+    restored.on_load_session()
+
+    assert restored.ctx.trace is not None
+    assert not restored.show_legend_chk.isChecked()
+    assert restored.ctx.exclusion_ranges == win.ctx.exclusion_ranges
+    assert restored.ctx.pending_locks["A"][1]
+    assert restored.ctx.fit_result is not None
+
+
+def test_gui_clearing_2d_cursor_does_not_recreate_best_point():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+    x0 = float(win.ctx.trace.x2d[0, 0])
+    y0 = float(win.ctx.trace.y2d[0, 0])
+    win._select_point_from_plot(x0, y0, refresh=True)
+    win.clear_selected_marker(refresh=True)
+
+    assert win._scan_cursor is None
+    assert win._selected_plot_point is None

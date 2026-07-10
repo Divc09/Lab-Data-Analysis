@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from typing import Callable
 
@@ -123,13 +124,40 @@ def build_custom_expression_model(expression: str, param_names: list[str]) -> Ca
     Build a custom model callable from a NumPy-safe expression.
     Expression can reference: t, np, and parameters by name.
     """
-    allowed = {"np": np}
+    allowed_functions = {
+        "abs": np.abs,
+        "sin": np.sin,
+        "cos": np.cos,
+        "tan": np.tan,
+        "exp": np.exp,
+        "log": np.log,
+        "sqrt": np.sqrt,
+        "clip": np.clip,
+        "pi": np.pi,
+    }
+    normalized = expression.replace("np.", "")
+    tree = ast.parse(normalized, mode="eval")
+    allowed_names = {"t", *param_names, *allowed_functions}
+    allowed_calls = set(allowed_functions) - {"pi"}
+    allowed_nodes = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call, ast.Name, ast.Load,
+        ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
+        ast.USub, ast.UAdd,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError("Custom expressions may use only numbers, operators, parameters, t, and approved functions.")
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise ValueError(f"Unsupported name in custom expression: {node.id}")
+        if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in allowed_calls):
+            raise ValueError("Custom expressions may call only approved mathematical functions.")
+    code = compile(tree, "<custom model>", "eval")
 
     def _model(t, *params):
         local = {"t": t}
         for n, v in zip(param_names, params):
             local[n] = v
-        return np.asarray(eval(expression, {"__builtins__": {}}, {**allowed, **local}), dtype=float)
+        return np.asarray(eval(code, {"__builtins__": {}}, {**allowed_functions, **local}), dtype=float)
 
     return _model
 

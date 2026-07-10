@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pytest
 
 from nvfit.analysis_tools import AnalysisStep, apply_steps, process_series
+from nvfit.preprocess import bin_trace
 from nvfit.sessions import load_session, resolve_source, save_session, source_descriptor
 
 
@@ -15,6 +17,16 @@ def test_process_series_preserves_sources_and_raw_index_masks():
     assert np.allclose(y, original)
     assert np.allclose(processed.fit_x, [1.0, 2.5, 4.5, 7.0])
     assert [group.tolist() for group in processed.source_groups] == [[1], [2, 3], [4, 5], [7]]
+
+
+def test_legacy_and_source_preserving_binning_keep_the_same_partial_bin():
+    x = np.arange(5, dtype=float)
+    y = x * 2.0
+    bx, by = bin_trace(x, y, 2)
+    processed = process_series(x, y, bin_size=2)
+    assert np.array_equal(bx, processed.fit_x)
+    assert np.array_equal(by, processed.fit_y)
+    assert len(bx) == 3
 
 
 @pytest.mark.parametrize(
@@ -58,3 +70,11 @@ def test_session_round_trip_and_changed_source_warning(tmp_path):
     source.write_bytes(b"second")
     _resolved, changed = resolve_source(loaded["primary_source"], session_path)
     assert changed
+
+
+def test_session_v1_document_migrates_on_load(tmp_path):
+    path = tmp_path / "legacy.nvfit-session.json"
+    path.write_text(json.dumps({"format": "nvfit-session", "version": 1, "analysis_steps": []}), encoding="utf-8")
+    loaded = load_session(path)
+    assert loaded["version"] == 2
+    assert loaded["migrated_from"] == 1

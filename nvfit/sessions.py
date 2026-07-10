@@ -3,20 +3,36 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from pathlib import Path
 from typing import Any
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+SUPPORTED_SESSION_VERSIONS = {1, SESSION_VERSION}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def source_descriptor(path: str | Path, session_path: str | Path | None = None) -> dict[str, Any]:
     p = Path(path).resolve()
     stat = p.stat()
-    result: dict[str, Any] = {"absolute_path": str(p), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    result: dict[str, Any] = {
+        "absolute_path": str(p),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": _sha256(p),
+    }
     if session_path is not None:
         try:
-            result["relative_path"] = str(p.relative_to(Path(session_path).resolve().parent))
+            result["relative_path"] = os.path.relpath(p, Path(session_path).resolve().parent)
         except ValueError:
+            # Windows cannot express a relative path across drive letters.
             pass
     return result
 
@@ -32,6 +48,8 @@ def resolve_source(descriptor: dict[str, Any], session_path: str | Path) -> tupl
         if candidate.exists():
             stat = candidate.stat()
             changed = stat.st_size != descriptor.get("size_bytes") or stat.st_mtime_ns != descriptor.get("mtime_ns")
+            if descriptor.get("sha256") and not changed:
+                changed = _sha256(candidate) != descriptor.get("sha256")
             return candidate.resolve(), changed
     return None, False
 
@@ -48,6 +66,8 @@ def save_session(path: str | Path, payload: dict[str, Any]) -> Path:
 
 def load_session(path: str | Path) -> dict[str, Any]:
     document = json.loads(Path(path).read_text(encoding="utf-8"))
-    if document.get("format") != "nvfit-session" or document.get("version") != SESSION_VERSION:
+    if document.get("format") != "nvfit-session" or document.get("version") not in SUPPORTED_SESSION_VERSIONS:
         raise ValueError("Unsupported SmartFitter session file.")
+    if document.get("version") == 1:
+        document = {**document, "version": SESSION_VERSION, "migrated_from": 1}
     return document

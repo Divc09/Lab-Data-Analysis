@@ -146,13 +146,13 @@ This metadata is used in:
 
 Main class: `SmartFitterMainWindow` in `gui_app.py`.
 
-### 8.1 Three-pane scientific workbench
+### 8.1 Analyze and Batch workspaces
 
-- **Left pane (Data / Prep)**: Data + Profile, Overlay / Comparison, Data / Preprocess, Interactive Cleaning / Mask, Sample Metadata.
-- **Center pane (Plot focus)**: Main plot, residual/FFT panel, and full Matplotlib navigation toolbar.
-- **Right pane (Analysis / Export)**: Fit Strategy, Plot Controls, Quick Actions, parameter editor, Fit + Export, Status + Summary.
+- **Analyze**: a compact Data/Prepare panel, one WYSIWYG Matplotlib plot, and a contextual Fit Results or 2D Map Controls inspector.
+- **Batch**: folder setup, progress/cancellation, searchable results, a run log, and selected-result details.
+- Reversible fit exclusions and transforms remain available under the collapsed **Advanced** section without plot interaction modes.
 
-Left and right panes are scrollable with collapsible section groups.
+Analyze side panes are scrollable with collapsible section groups and no horizontal scrolling at the supported 1366x768 minimum layout.
 Mouse-wheel safety is enforced for combo/spin controls: wheel changes are ignored unless the widget has focus.
 
 ### 8.2 Plot controls
@@ -209,10 +209,7 @@ Behavior:
 
 ### 8.7 Preferences/options
 
-Menu: `Options`
-
-- `Preferences...`
-- `Save Current Preferences`
+Persistent controls live directly in the Plot, Annotation, Export, and Map sections. `Options > Save Current Preferences` stores them without a duplicate preferences dialog.
 
 Preferences are persisted via `QSettings("BacklundLab", "SmartFitterPy")`.
 
@@ -396,11 +393,11 @@ This release adds the following production features:
 
 ## 16) Analysis sessions, transforms, and clipboard
 
-- `File > Save Analysis Session...` writes an atomic, versioned `.nvfit-session.json` document. It records source fingerprints, profile/model choices, preprocessing, raw-point/range masks, analysis transforms, plot state, metadata, and view limits. Missing primary files can be located interactively; changed sources are flagged after restore.
+- `File > Save Analysis Session...` writes an atomic v2 `.nvfit-session.json` document and can read v1 sessions. It records source fingerprints, overlays/baselines, profile/model choices, locks, preprocessing, masks, transforms, plot/map state, metadata, view limits, and valid fit state. Missing sources can be located interactively; changed sources invalidate stale fits.
 - Analysis transforms are display/measurement tools: baseline removal, detrend, normalization, derivative, integral, uniform resampling, and safe vector expressions. The fitting pipeline remains on the pre-transform processed data, so fit parameters retain their experiment-model meaning.
-- Plot clicks create a temporary yellow inspection marker. Clicking the same point again, pressing `Escape`, or using `Clear marker` removes that marker and its legend entry without changing or excluding any measured data.
+- Plot clicks create a temporary yellow inspection marker that is excluded from the legend. Clicking the same point again, pressing `Escape`, or using `Clear` removes it without changing or excluding measured data.
 - `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
-- A contextual 2D toolbar appears above the plot for scan maps. It controls colormap/reversal, auto versus percentile-robust versus manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, and equal-axis scaling. Color settings are shared with Scan Explorer and persisted in `QSettings`.
+- A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, optional equal-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
 
 ## 17) Plugin spec for custom model
 

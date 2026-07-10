@@ -17,12 +17,11 @@ def bin_trace(x: np.ndarray, y: np.ndarray, bin_size: int) -> tuple[np.ndarray, 
     b = max(1, int(bin_size))
     if b == 1:
         return x.copy(), y.copy()
-    n = (len(x) // b) * b
-    if n <= 0:
-        return x.copy(), y.copy()
-    x_b = np.mean(x[:n].reshape(-1, b), axis=1)
-    y_b = np.mean(y[:n].reshape(-1, b), axis=1)
-    return x_b, y_b
+    # Keep the final partial bin. Dropping it made GUI overlays, batch fits,
+    # and the source-index-preserving pipeline disagree on the final samples.
+    x_bins = [np.mean(x[start : start + b]) for start in range(0, len(x), b)]
+    y_bins = [np.mean(y[start : start + b]) for start in range(0, len(y), b)]
+    return np.asarray(x_bins, dtype=float), np.asarray(y_bins, dtype=float)
 
 
 def smooth_trace(y: np.ndarray, window: int = 1, polyorder: int = 2) -> np.ndarray:

@@ -84,7 +84,7 @@ Run:
 python -m nvfit.gui_app
 
 Basic GUI workflow:
-- Click `Load .mat` and choose a MATLAB file
+- Use `Open MAT...` in the command bar, press Ctrl+O, or drop a MATLAB file onto the window
 - Leave `Profile` on `Auto` unless you want to force a specific analysis preset
 - Choose the observable mode:
   - `contrast` for `(reference - signal) / reference`
@@ -94,18 +94,15 @@ Basic GUI workflow:
 - Click fit controls to run the fit
 - Use `Save Results` to export plots and JSON/CSV outputs
 - Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
-- Clicking a point pins a yellow inspection marker. Click the same point again, press `Escape`, or use `Clear marker` to remove the marker and its legend entry; the data itself is never changed
-- Use `File > Save Analysis Session...` to resume a named analysis later, including masks, transforms, plot state, and fit settings
-- For 2D scans, use the contextual toolbar above the plot to change colormap and color limits, type exact X/Y bounds, pan, box-zoom, wheel-zoom, reset to the full map, or toggle equal physical axis scaling
+- Clicking a point pins a temporary yellow marker without adding it to the legend. Click it again, press `Escape`, or use `Clear` to remove it; the data itself is never changed
+- Use `File > Save Analysis Session...` to resume a named analysis later, including overlays, masks, transforms, locks, plot/map state, and a still-valid fit result
+- For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, or toggle equal physical axis scaling
 
-Main GUI sections:
-- `Data + Profile`: load the file and choose the experiment profile
-- `Overlay / Comparison`: compare multiple loaded traces
-- `Data / Preprocess`: binning, smoothing, and ROI controls
-- `Fit Strategy`: choose model family and multistart settings
-- `Fit + Export`: save plots, reports, JSON, CSV, and Origin-friendly bundles
-- `Status + Summary`: see fit quality, parameters, and extracted metrics
-- `Analysis transforms`: build a display/measurement pipeline for baseline correction, normalization, derivatives, integrals, resampling, and safe expressions; fitting continues to use the physics-preserving processed trace
+The GUI has two workspaces:
+- `Analyze`: load one MAT file, prepare it, fit it, inspect the WYSIWYG plot, and export results
+- `Batch`: process folders, monitor/cancel work, filter outcomes, and open a result in Analyze
+
+Analyze uses a compact Data/Prepare panel, one export-quality plot, and a contextual Fit Results or Map Controls inspector. Reversible fit exclusions and analysis transforms are kept under the collapsed `Advanced` section.
 
 Notes for new MATLAB files:
 - New-format XY8 / CPMG / dynamic-decoupling files are loaded automatically
