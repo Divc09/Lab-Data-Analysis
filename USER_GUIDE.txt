@@ -73,6 +73,12 @@ python -m pip install -r requirements.txt
 
 5. Start the GUI
 ----------------
+Windows, without a terminal:
+- Double-click `Launch SmartFitter.vbs` in this folder.
+- It starts the GUI without leaving a terminal window open.
+- For one-click desktop access, right-click the launcher and choose `Send to > Desktop (create shortcut)`.
+
+Terminal alternative:
 Run:
 
 python -m nvfit.gui_app
