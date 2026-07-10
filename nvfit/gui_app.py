@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -530,6 +532,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._apply_plot_controls_to_state()
         self._apply_figure_size()
         self._apply_theme()
+        self._update_trace_mode_visibility()
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self.canvas.mpl_connect("axes_leave_event", self._on_plot_leave)
@@ -576,146 +579,259 @@ class SmartFitterMainWindow(QMainWindow):
     def _apply_theme(self):
         dark_qss = """
         QMainWindow, QWidget {
-            background-color: #171918;
-            color: #e8ebe8;
-            font-family: "Tahoma";
+            background-color: #0d1210;
+            color: #eaf1ed;
+            font-family: "Segoe UI";
             font-size: 10pt;
         }
+        QLabel {
+            background: transparent;
+        }
+        QScrollArea, QScrollArea > QWidget > QWidget {
+            border: none;
+            background: transparent;
+        }
+        QWidget#SidePanel {
+            background-color: #101613;
+        }
+        QWidget#PlotColumn {
+            background-color: #0d1210;
+        }
         QGroupBox {
-            border: 1px solid #353b36;
-            border-radius: 4px;
-            margin-top: 8px;
+            border: 1px solid #29332e;
+            border-radius: 10px;
+            margin-top: 14px;
             font-weight: 600;
-            padding-top: 12px;
-            background-color: #202321;
+            padding: 15px 9px 9px 9px;
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #19201d, stop:1 #151b18);
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             subcontrol-position: top left;
-            padding: 0 4px;
-            color: #d9dfd9;
+            left: 10px;
+            padding: 2px 7px;
+            color: #dce7e1;
+            background-color: #111714;
+            border-radius: 5px;
+        }
+        QGroupBox::indicator {
+            width: 0px;
+            height: 0px;
         }
         QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
-            background-color: #1d211f;
-            border: 1px solid #3d4540;
-            border-radius: 4px;
-            color: #f2f5f2;
-            padding: 4px;
-            selection-background-color: #3d6f5f;
+            background-color: #0f1512;
+            border: 1px solid #34423b;
+            border-radius: 7px;
+            color: #f1f6f3;
+            padding: 6px 8px;
+            selection-background-color: #2e8b69;
+            min-height: 20px;
         }
-        QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QTextEdit:focus {
-            border: 1px solid #52947c;
-            background-color: #222824;
+        QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover, QTextEdit:hover {
+            border-color: #46584f;
+        }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QTextEdit:focus {
+            border: 1px solid #55c99a;
+            background-color: #131b17;
         }
         QPushButton {
-            background-color: #282d2a;
-            border: 1px solid #444c46;
-            border-radius: 4px;
-            padding: 5px 10px;
-            color: #f0f0f0;
+            background-color: #202923;
+            border: 1px solid #3a4840;
+            border-radius: 7px;
+            padding: 7px 12px;
+            color: #edf4f0;
+            min-height: 20px;
+            font-weight: 600;
         }
         QPushButton:hover {
-            background-color: #343b36;
-            border-color: #5b665e;
+            background-color: #29352e;
+            border-color: #587064;
         }
         QPushButton:pressed {
-            background-color: #1c211e;
+            background-color: #16201b;
         }
         QPushButton:disabled, QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
-            color: #777d79;
-            background-color: #1a1d1b;
-            border-color: #2c312e;
+            color: #68756e;
+            background-color: #121714;
+            border-color: #242d28;
         }
         QPushButton#PrimaryAction {
-            background-color: #367963;
-            border-color: #55a384;
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #23845f, stop:1 #38a879);
+            border-color: #59c99b;
             color: #ffffff;
-            font-weight: 600;
+            font-weight: 700;
+            padding-left: 15px;
+            padding-right: 15px;
+        }
+        QPushButton#PrimaryAction:hover {
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2c9b71, stop:1 #47bc89);
+            border-color: #80ddb6;
+        }
+        QPushButton#CommandAction {
+            background-color: transparent;
+            border-color: #2c3932;
         }
         QPushButton#WorkspaceTab {
             border: 0;
-            border-radius: 4px;
-            padding: 6px 10px;
+            border-radius: 7px;
+            padding: 7px 12px;
             background-color: transparent;
-            color: #cfcfcf;
+            color: #9daca4;
+            font-weight: 600;
         }
+        QPushButton#WorkspaceTab:hover { background-color: #1b241f; color: #dce7e1; }
         QPushButton#WorkspaceTab:checked {
-            background-color: #29322d;
+            background-color: #22352c;
             color: #ffffff;
-            border-bottom: 2px solid #5aa989;
+            border-bottom: 2px solid #54c998;
         }
         QWidget#WorkspaceBar {
-            background-color: #121513;
-            border-bottom: 1px solid #303832;
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #121815, stop:0.55 #101512, stop:1 #151b18);
+            border-bottom: 1px solid #27312c;
         }
         QLabel#AppTitle {
-            color: #f2f2f2;
-            font-size: 12pt;
+            color: #f5faf7;
+            font-family: "Segoe UI";
+            font-size: 15pt;
             font-weight: 700;
-            padding-right: 10px;
+            padding: 2px 14px 2px 2px;
         }
-        QWidget#ScanQuickBar {
-            background-color: #1d211f;
-            border-top: 1px solid #353b36;
-            border-bottom: 1px solid #353b36;
+        QLabel#FileChip, QLabel#StatusChip {
+            background-color: #18201c;
+            border: 1px solid #2e3b34;
+            border-radius: 7px;
+            padding: 5px 9px;
+            color: #b8c5be;
+        }
+        QLabel#StatusChip {
+            color: #73d4ad;
+            font-weight: 700;
+        }
+        QGroupBox#ScanQuickBar {
+            border-color: #315244;
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1a2821, stop:1 #152019);
         }
         QLabel#PaneTitle {
-            color: #f2f2f2;
+            color: #f4f8f6;
+            font-family: "Segoe UI";
             font-weight: 700;
-            font-size: 12pt;
-            padding: 3px 0;
+            font-size: 15pt;
+            padding: 4px 2px;
         }
         QLabel#MutedLabel {
-            color: #a7a7a7;
+            color: #91a098;
+        }
+        QFrame#PlotShell {
+            background-color: #f3f6f4;
+            border: 1px solid #39443f;
+            border-radius: 11px;
+        }
+        QFrame#ReadoutBar {
+            background-color: #151d19;
+            border: 1px solid #27332d;
+            border-radius: 8px;
+        }
+        QWidget#EmptyState {
+            background-color: #111714;
+            border: 1px dashed #35463d;
+            border-radius: 12px;
+        }
+        QLabel#EmptyStateTitle {
+            color: #edf5f0;
+            font-size: 17pt;
+            font-weight: 700;
+        }
+        QLabel#EmptyStateText {
+            color: #8fa198;
+            font-size: 11pt;
+        }
+        QToolButton {
+            background-color: #151c18;
+            border: 1px solid #2c3832;
+            border-radius: 7px;
+            color: #aebbb4;
+            padding: 6px 10px;
+            font-weight: 600;
+        }
+        QToolButton:hover { background-color: #202b25; color: #f0f6f2; border-color: #46584f; }
+        QToolButton:checked { background-color: #254637; color: #7ee0b7; border-color: #4cad86; }
+        QToolBar {
+            background-color: #e8eeea;
+            border: none;
+            border-bottom: 1px solid #cbd4cf;
+            spacing: 4px;
+            padding: 4px 6px;
+        }
+        QToolBar QToolButton {
+            background-color: transparent;
+            border: none;
+            color: #24302a;
+            padding: 5px;
+        }
+        QToolBar QToolButton:hover { background-color: #d8e2dc; border-radius: 5px; }
+        QSplitter::handle { background-color: #1c2520; }
+        QSplitter::handle:horizontal { width: 5px; }
+        QSplitter::handle:hover { background-color: #3d6d58; }
+        QMenuBar { background-color: #0b0f0d; color: #bdc8c2; spacing: 4px; }
+        QMenuBar::item { padding: 5px 9px; border-radius: 5px; }
+        QMenuBar::item:selected { background-color: #1c2721; color: #ffffff; }
+        QMenu { background-color: #171e1a; color: #e7efea; border: 1px solid #34413a; padding: 5px; }
+        QMenu::item { padding: 7px 28px 7px 10px; border-radius: 5px; }
+        QMenu::item:selected { background-color: #28513f; }
+        QProgressBar {
+            background-color: #101512;
+            border: 1px solid #2c3731;
+            border-radius: 6px;
+            text-align: center;
+            color: #cbd6d0;
+            min-height: 18px;
+        }
+        QProgressBar::chunk {
+            border-radius: 5px;
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2d946d, stop:1 #58c997);
         }
         QTableWidget {
-            gridline-color: #343434;
-            background-color: #202321;
-            alternate-background-color: #252a27;
-            selection-background-color: #367963;
-            border: 1px solid #353b36;
+            gridline-color: #2a342f;
+            background-color: #121815;
+            alternate-background-color: #171e1a;
+            selection-background-color: #285f48;
+            selection-color: #ffffff;
+            border: 1px solid #2e3933;
+            border-radius: 8px;
         }
         QHeaderView::section {
-            background-color: #292f2b;
-            color: #d9dfd9;
-            border: 1px solid #3b443d;
-            padding: 4px;
+            background-color: #202923;
+            color: #cbd7d0;
+            border: none;
+            border-right: 1px solid #35423b;
+            border-bottom: 1px solid #35423b;
+            padding: 7px;
+            font-weight: 700;
         }
         QScrollBar:vertical {
-            background: #171918;
-            width: 12px;
+            background: transparent;
+            width: 9px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical {
-            background: #4a554d;
-            min-height: 20px;
+            background: #3c4c43;
+            min-height: 28px;
             border-radius: 4px;
         }
+        QScrollBar::handle:vertical:hover { background: #587064; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0px;
         }
         QCheckBox {
-            spacing: 5px;
+            spacing: 7px;
+            color: #d5dfd9;
         }
         QCheckBox::indicator {
-            width: 13px;
-            height: 13px;
+            width: 15px;
+            height: 15px;
         }
-        QTabWidget::pane {
-            border: 1px solid #303030;
-            top: -1px;
-        }
-        QTabBar::tab {
-            background: #202020;
-            color: #cfcfcf;
-            border: 1px solid #303030;
-            padding: 6px 10px;
-        }
-        QTabBar::tab:selected {
-            background: #2b332e;
-            color: #ffffff;
-        }
-        QStatusBar { background: #121513; color: #b9c4bb; border-top: 1px solid #303832; }
-        QToolTip { background: #272e2a; color: #f2f5f2; border: 1px solid #566159; padding: 4px; }
+        QStatusBar { background: #0b100d; color: #96a49c; border-top: 1px solid #253029; padding-left: 6px; }
+        QToolTip { background: #202923; color: #f2f7f4; border: 1px solid #566a60; border-radius: 5px; padding: 6px; }
         """
         self.setStyleSheet(dark_qss)
 
@@ -739,8 +855,8 @@ class SmartFitterMainWindow(QMainWindow):
         workspace_bar = QWidget()
         workspace_bar.setObjectName("WorkspaceBar")
         workspace_layout = QHBoxLayout(workspace_bar)
-        workspace_layout.setContentsMargins(12, 7, 12, 7)
-        workspace_layout.setSpacing(6)
+        workspace_layout.setContentsMargins(14, 9, 14, 9)
+        workspace_layout.setSpacing(8)
         app_title = QLabel("SmartFitter")
         app_title.setObjectName("AppTitle")
         workspace_layout.addWidget(app_title)
@@ -760,25 +876,30 @@ class SmartFitterMainWindow(QMainWindow):
             self.mode_button_group.addButton(btn, idx)
             self.mode_buttons[key] = btn
             workspace_layout.addWidget(btn)
-        open_button = QPushButton("Open MAT…")
-        open_button.setToolTip("Open a MATLAB data file (Ctrl+O).")
-        open_button.clicked.connect(self.on_load)
-        workspace_layout.addWidget(open_button)
-        session_button = QPushButton("Open session…")
-        session_button.setToolTip("Restore a saved SmartFitter analysis session.")
-        session_button.clicked.connect(self.on_load_session)
-        workspace_layout.addWidget(session_button)
+        self.command_open_btn = QPushButton("Open MAT…")
+        self.command_open_btn.setObjectName("CommandAction")
+        self.command_open_btn.setToolTip("Open a MATLAB data file (Ctrl+O).")
+        self.command_open_btn.clicked.connect(self.on_load)
+        self._set_button_icon(self.command_open_btn, "fa5s.folder-open")
+        workspace_layout.addWidget(self.command_open_btn)
+        self.command_session_btn = QPushButton("Open session…")
+        self.command_session_btn.setObjectName("CommandAction")
+        self.command_session_btn.setToolTip("Restore a saved SmartFitter analysis session.")
+        self.command_session_btn.clicked.connect(self.on_load_session)
+        self._set_button_icon(self.command_session_btn, "fa5s.history")
+        workspace_layout.addWidget(self.command_session_btn)
         self.command_fit_btn = QPushButton("Run fit")
         self.command_fit_btn.setObjectName("PrimaryAction")
         self.command_fit_btn.setToolTip("Fit the current trace (Ctrl+F).")
         self.command_fit_btn.clicked.connect(self.on_fit)
+        self._set_button_icon(self.command_fit_btn, "fa5s.play")
         workspace_layout.addWidget(self.command_fit_btn)
         workspace_layout.addStretch(1)
         self.command_file_lbl = QLabel("No file loaded")
-        self.command_file_lbl.setObjectName("MutedLabel")
+        self.command_file_lbl.setObjectName("FileChip")
         workspace_layout.addWidget(self.command_file_lbl)
         self.command_state_lbl = QLabel("N/A")
-        self.command_state_lbl.setObjectName("MutedLabel")
+        self.command_state_lbl.setObjectName("StatusChip")
         workspace_layout.addWidget(self.command_state_lbl)
         layout.addWidget(workspace_bar)
 
@@ -809,6 +930,7 @@ class SmartFitterMainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
 
         left = QWidget()
+        left.setObjectName("SidePanel")
         left.setMinimumWidth(240)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -822,6 +944,7 @@ class SmartFitterMainWindow(QMainWindow):
         splitter.addWidget(left)
 
         center = QWidget()
+        center.setObjectName("PlotColumn")
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         self._build_plot_quick_toolbar(center_layout)
@@ -830,26 +953,64 @@ class SmartFitterMainWindow(QMainWindow):
         self.live_image_item = None
         self.live_curve_items: list[Any] = []
         self.plot_tabs = None
-        center_layout.addWidget(self.toolbar)
-        center_layout.addWidget(self.canvas, 1)
+        self.plot_stack = QStackedWidget()
+        empty_state = QWidget()
+        empty_state.setObjectName("EmptyState")
+        empty_layout = QVBoxLayout(empty_state)
+        empty_layout.setContentsMargins(40, 40, 40, 40)
+        empty_layout.addStretch(1)
+        empty_icon = QLabel("◇")
+        empty_icon.setAlignment(Qt.AlignCenter)
+        empty_icon.setStyleSheet("QLabel { color: #56c99a; font-size: 32pt; }")
+        empty_layout.addWidget(empty_icon)
+        empty_title = QLabel("Start with a MATLAB data file")
+        empty_title.setObjectName("EmptyStateTitle")
+        empty_title.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(empty_title)
+        empty_text = QLabel("Drop a .mat file anywhere in the window, or choose Open MAT above.")
+        empty_text.setObjectName("EmptyStateText")
+        empty_text.setAlignment(Qt.AlignCenter)
+        empty_text.setWordWrap(True)
+        empty_layout.addWidget(empty_text)
+        empty_layout.addStretch(1)
+        self.plot_stack.addWidget(empty_state)
+
+        plot_shell = QFrame()
+        plot_shell.setObjectName("PlotShell")
+        plot_layout = QVBoxLayout(plot_shell)
+        plot_layout.setContentsMargins(1, 1, 1, 1)
+        plot_layout.setSpacing(0)
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.canvas, 1)
+        shadow = QGraphicsDropShadowEffect(plot_shell)
+        shadow.setBlurRadius(20)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(0, 0, 0, 110))
+        plot_shell.setGraphicsEffect(shadow)
+        self.plot_stack.addWidget(plot_shell)
+        self.plot_stack.setCurrentIndex(0)
+        center_layout.addWidget(self.plot_stack, 1)
         self.live_readout_lbl = QLabel("Point readout: click a plotted sample")
         self.live_readout_lbl.setObjectName("MutedLabel")
         self.live_readout_lbl.setMinimumHeight(24)
         self.live_readout_lbl.setToolTip("Shows the nearest data coordinates. Click the selected point again or press Escape to remove its marker.")
-        readout_row = QHBoxLayout()
-        readout_row.setContentsMargins(0, 0, 0, 0)
+        readout_bar = QFrame()
+        readout_bar.setObjectName("ReadoutBar")
+        readout_row = QHBoxLayout(readout_bar)
+        readout_row.setContentsMargins(10, 5, 6, 5)
         readout_row.addWidget(self.live_readout_lbl, 1)
         self.clear_marker_btn = QPushButton("Clear")
         self.clear_marker_btn.setToolTip("Remove the temporary selected-point marker. This never changes the data.")
         self.clear_marker_btn.setVisible(False)
         self.clear_marker_btn.clicked.connect(self.clear_selected_marker)
         readout_row.addWidget(self.clear_marker_btn)
-        center_layout.addLayout(readout_row)
+        center_layout.addWidget(readout_bar)
         splitter.addWidget(center)
 
         single_layout.addWidget(splitter)
 
         right = QWidget()
+        right.setObjectName("SidePanel")
         right.setMinimumWidth(360)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1515,8 +1676,10 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_summary_text.setMaximumHeight(120)
         scan_gl.addWidget(self.scan_summary_text, 4, 0, 1, 2)
         self.scan_go_peak_btn = QPushButton("Go to peak")
+        self._set_button_icon(self.scan_go_peak_btn, "fa5s.arrow-up")
         self.scan_go_peak_btn.clicked.connect(lambda: self._go_to_scan_extreme("max"))
         self.scan_go_dip_btn = QPushButton("Go to dip")
+        self._set_button_icon(self.scan_go_dip_btn, "fa5s.arrow-down")
         self.scan_go_dip_btn.clicked.connect(lambda: self._go_to_scan_extreme("min"))
         scan_gl.addWidget(self.scan_go_peak_btn, 5, 0)
         scan_gl.addWidget(self.scan_go_dip_btn, 5, 1)
@@ -1566,10 +1729,12 @@ class SmartFitterMainWindow(QMainWindow):
         ex_gl = QGridLayout(export_box)
         self.btn_fit = QPushButton("Run Fit")
         self.btn_fit.setObjectName("PrimaryAction")
+        self._set_button_icon(self.btn_fit, "fa5s.play")
         self.btn_fit.clicked.connect(self.on_fit)
         ex_gl.addWidget(self.btn_fit, 0, 0)
         
         self.btn_robust_fit = QPushButton("Robust Fit")
+        self._set_button_icon(self.btn_robust_fit, "fa5s.shield-alt")
         self.btn_robust_fit.setToolTip("Run multiple fits with varying data ranges to find the most stable result.")
         self.btn_robust_fit.clicked.connect(self.on_robust_fit)
         ex_gl.addWidget(self.btn_robust_fit, 0, 1)
@@ -1586,11 +1751,12 @@ class SmartFitterMainWindow(QMainWindow):
         self.fit_help_lbl.setVisible(False)
         ex_gl.addWidget(self.fit_help_lbl, 1, 0, 1, 3)
 
-        btn_save = QPushButton("Save Results")
-        btn_save.setObjectName("PrimaryAction")
-        btn_save.setToolTip("Save plot, residual plot, JSON and CSV report with extracted NV metrics.")
-        btn_save.clicked.connect(self.on_save_results)
-        ex_gl.addWidget(btn_save, 2, 0, 1, 3)
+        self.btn_save = QPushButton("Save Results")
+        self.btn_save.setObjectName("PrimaryAction")
+        self._set_button_icon(self.btn_save, "fa5s.save")
+        self.btn_save.setToolTip("Save plot, residual plot, JSON and CSV report with extracted NV metrics.")
+        self.btn_save.clicked.connect(self.on_save_results)
+        ex_gl.addWidget(self.btn_save, 2, 0, 1, 3)
         self.exp_png_chk = QCheckBox("PNG")
         self.exp_png_chk.setChecked(True)
         self.exp_pdf_chk = QCheckBox("PDF")
@@ -1669,6 +1835,7 @@ class SmartFitterMainWindow(QMainWindow):
         results_actions = QHBoxLayout()
         results_actions.addStretch(1)
         copy_summary_btn = QPushButton("Copy summary")
+        self._set_button_icon(copy_summary_btn, "fa5s.copy")
         copy_summary_btn.clicked.connect(self._copy_summary_text)
         results_actions.addWidget(copy_summary_btn)
         results_layout.addLayout(results_actions)
@@ -1731,7 +1898,7 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _build_plot_quick_toolbar(self, layout: QVBoxLayout):
         row = QHBoxLayout()
-        row.setContentsMargins(6, 4, 6, 4)
+        row.setContentsMargins(4, 2, 4, 6)
         row.setSpacing(6)
 
         self.quick_data_btn = self._make_quick_toggle("Data", "Show measured data points.", self._on_quick_data_toggled)
@@ -1757,8 +1924,10 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_std_mode_combo.currentTextChanged.connect(self._on_quick_std_mode_changed)
         row.addStretch(1)
         self.copy_figure_btn = QPushButton("Copy figure")
+        self._set_button_icon(self.copy_figure_btn, "fa5s.copy")
         self.copy_figure_btn.setToolTip("Copy the current export figure to the clipboard (Ctrl+Shift+C).")
         self.copy_figure_btn.clicked.connect(self.copy_export_figure)
+        self.copy_figure_btn.setEnabled(False)
         row.addWidget(self.copy_figure_btn)
         layout.addLayout(row)
 
@@ -1777,15 +1946,17 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_reverse_chk = QCheckBox("Reverse")
         self.scan_reverse_chk.toggled.connect(self._on_scan_style_changed)
         outer.addWidget(QLabel("Colormap"), 0, 0)
-        outer.addWidget(self.scan_colormap_combo, 0, 1)
-        outer.addWidget(self.scan_reverse_chk, 0, 2)
+        outer.addWidget(self.scan_colormap_combo, 0, 1, 1, 2)
+        outer.addWidget(QLabel("Direction"), 1, 0)
+        self.scan_reverse_chk.setText("Reverse color order")
+        outer.addWidget(self.scan_reverse_chk, 1, 1, 1, 2)
 
         self.scan_scale_combo = NoScrollComboBox()
         self.scan_scale_combo.addItems(["Auto", "Robust percentiles", "Manual"])
         self.scan_scale_combo.setCurrentText("Robust percentiles")
         self.scan_scale_combo.currentTextChanged.connect(self._on_scan_scale_changed)
-        outer.addWidget(QLabel("Color scale"), 1, 0)
-        outer.addWidget(self.scan_scale_combo, 1, 1, 1, 2)
+        outer.addWidget(QLabel("Color scale"), 2, 0)
+        outer.addWidget(self.scan_scale_combo, 2, 1, 1, 2)
 
         self.scan_low_percentile_spin = QDoubleSpinBox()
         self.scan_high_percentile_spin = QDoubleSpinBox()
@@ -1795,23 +1966,23 @@ class SmartFitterMainWindow(QMainWindow):
             spin.setSingleStep(0.5)
             spin.setValue(value)
             spin.valueChanged.connect(self._on_scan_style_changed)
-        outer.addWidget(QLabel("Lower percentile"), 2, 0)
-        outer.addWidget(self.scan_low_percentile_spin, 2, 1, 1, 2)
-        outer.addWidget(QLabel("Upper percentile"), 3, 0)
-        outer.addWidget(self.scan_high_percentile_spin, 3, 1, 1, 2)
+        outer.addWidget(QLabel("Lower percentile"), 3, 0)
+        outer.addWidget(self.scan_low_percentile_spin, 3, 1, 1, 2)
+        outer.addWidget(QLabel("Upper percentile"), 4, 0)
+        outer.addWidget(self.scan_high_percentile_spin, 4, 1, 1, 2)
 
         self.scan_vmin_edit = QLineEdit()
         self.scan_vmax_edit = QLineEdit()
         for edit in (self.scan_vmin_edit, self.scan_vmax_edit):
             edit.editingFinished.connect(self._apply_manual_scan_color_limits)
-        outer.addWidget(QLabel("Color minimum"), 4, 0)
-        outer.addWidget(self.scan_vmin_edit, 4, 1, 1, 2)
-        outer.addWidget(QLabel("Color maximum"), 5, 0)
-        outer.addWidget(self.scan_vmax_edit, 5, 1, 1, 2)
+        outer.addWidget(QLabel("Color minimum"), 5, 0)
+        outer.addWidget(self.scan_vmin_edit, 5, 1, 1, 2)
+        outer.addWidget(QLabel("Color maximum"), 6, 0)
+        outer.addWidget(self.scan_vmax_edit, 6, 1, 1, 2)
 
         self.scan_xmin_edit = QLineEdit(); self.scan_xmax_edit = QLineEdit()
         self.scan_ymin_edit = QLineEdit(); self.scan_ymax_edit = QLineEdit()
-        for row, (label, edit) in enumerate((("X minimum", self.scan_xmin_edit), ("X maximum", self.scan_xmax_edit), ("Y minimum", self.scan_ymin_edit), ("Y maximum", self.scan_ymax_edit)), start=6):
+        for row, (label, edit) in enumerate((("X minimum", self.scan_xmin_edit), ("X maximum", self.scan_xmax_edit), ("Y minimum", self.scan_ymin_edit), ("Y maximum", self.scan_ymax_edit)), start=7):
             edit.returnPressed.connect(self._apply_scan_view_limits)
             outer.addWidget(QLabel(label), row, 0)
             outer.addWidget(edit, row, 1, 1, 2)
@@ -1830,15 +2001,15 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_zoom_btn.setCheckable(True)
         self.scan_zoom_btn.setToolTip("Drag a rectangle on the export map to zoom. The mouse wheel also zooms at the pointer.")
         self.scan_zoom_btn.clicked.connect(self._toggle_scan_zoom)
-        outer.addWidget(reset_view, 10, 0)
-        outer.addWidget(apply_view, 10, 1, 1, 2)
-        outer.addWidget(self.scan_pan_btn, 11, 0)
-        outer.addWidget(self.scan_zoom_btn, 11, 1, 1, 2)
+        outer.addWidget(reset_view, 11, 0)
+        outer.addWidget(apply_view, 11, 1, 1, 2)
+        outer.addWidget(self.scan_pan_btn, 12, 0)
+        outer.addWidget(self.scan_zoom_btn, 12, 1, 1, 2)
         self.scan_equal_aspect_chk = QCheckBox("Equal physical axes")
         self.scan_equal_aspect_chk.setChecked(False)
         self.scan_equal_aspect_chk.setToolTip("Show equal physical distances at equal screen scale.")
         self.scan_equal_aspect_chk.toggled.connect(self._on_scan_style_changed)
-        outer.addWidget(self.scan_equal_aspect_chk, 12, 0, 1, 3)
+        outer.addWidget(self.scan_equal_aspect_chk, 13, 0, 1, 3)
 
         self.scan_quick_bar.setVisible(False)
         layout.addWidget(self.scan_quick_bar)
@@ -1861,10 +2032,14 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _build_batch_workspace(self):
         page = QWidget()
+        page.setObjectName("WorkspacePage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
         layout.addWidget(self._labeled_title("Batch Analysis"))
+        subtitle = QLabel("Process a folder, monitor quality at a glance, and open any result directly in Analyze.")
+        subtitle.setObjectName("MutedLabel")
+        layout.addWidget(subtitle)
 
         folders = QGroupBox("Folders")
         folders_layout = QGridLayout(folders)
@@ -1873,6 +2048,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_input_dir_edit.textChanged.connect(self._update_batch_pending_count)
         btn_input = QPushButton("Browse")
         btn_output = QPushButton("Browse")
+        self._set_button_icon(btn_input, "fa5s.folder-open")
+        self._set_button_icon(btn_output, "fa5s.folder-open")
         btn_input.clicked.connect(lambda: self._browse_batch_dir(self.batch_input_dir_edit))
         btn_output.clicked.connect(lambda: self._browse_batch_dir(self.batch_output_dir_edit))
         folders_layout.addWidget(QLabel("Input"), 0, 0)
@@ -1916,6 +2093,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_button_icon(self.batch_run_btn, "fa5s.play")
         self.batch_run_btn.clicked.connect(self._on_batch_run)
         self.batch_cancel_btn = QPushButton("Cancel")
+        self._set_button_icon(self.batch_cancel_btn, "fa5s.stop")
         self.batch_cancel_btn.setEnabled(False)
         self.batch_cancel_btn.setToolTip("Stop after the current file finishes.")
         self.batch_cancel_btn.clicked.connect(self._cancel_batch)
@@ -1958,6 +2136,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_button_icon(btn_load_summary, "fa5s.folder-open")
         btn_load_summary.clicked.connect(self._choose_batch_summary)
         self.batch_open_output_btn = QPushButton("Open output folder")
+        self._set_button_icon(self.batch_open_output_btn, "fa5s.external-link-alt")
         self.batch_open_output_btn.clicked.connect(self._open_batch_output_dir)
         results_row.addWidget(QLabel("Filter"))
         results_row.addWidget(self.batch_filter_combo)
@@ -1986,6 +2165,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_log_text = QTextEdit()
         self.batch_log_text.setReadOnly(True)
         self.batch_log_text.setMaximumHeight(150)
+        self.batch_log_text.setPlaceholderText("Batch progress and messages will appear here.")
         log_layout.addWidget(self.batch_log_text)
         preview_box = QGroupBox("Selected result")
         preview_layout = QVBoxLayout(preview_box)
@@ -2704,8 +2884,11 @@ class SmartFitterMainWindow(QMainWindow):
         menu.addAction(save_pref_action)
 
     def _set_group_collapsible(self, box: QGroupBox, checked: bool = True):
+        base_title = box.title()
+        box._drawer_title = base_title
         box.setCheckable(True)
         box.setChecked(checked)
+        box.setTitle(f"{'▾' if checked else '▸'}  {base_title}")
         box.setToolTip(f"Click the title to {'collapse' if checked else 'expand'} this section.")
         box._drawer_anim = QPropertyAnimation(box, b"maximumHeight", box)
         box._drawer_anim.setDuration(0)
@@ -2725,6 +2908,8 @@ class SmartFitterMainWindow(QMainWindow):
                     item.layout().setEnabled(state)
 
         def toggle_children(state: bool):
+            box.setTitle(f"{'▾' if state else '▸'}  {base_title}")
+            box.setToolTip(f"Click the title to {'collapse' if state else 'expand'} this section.")
             collapsed_h = 30
             box._drawer_anim.stop()
             if getattr(box, "_drawer_finish_connected", False):
@@ -3177,9 +3362,13 @@ class SmartFitterMainWindow(QMainWindow):
         is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
         is_fit_trace = bool(self.ctx.trace is None or self.ctx.trace.fit_allowed)
+        fit_enabled = bool(is_fit_trace and self.ctx.trace is not None and self._active_fit_request is None)
         self.strategy_box.setVisible(is_fit_trace)
         self.command_fit_btn.setVisible(is_fit_trace)
-        self.command_fit_btn.setEnabled(is_fit_trace and self.ctx.trace is not None and self._active_fit_request is None)
+        self.command_fit_btn.setEnabled(fit_enabled)
+        self.btn_fit.setEnabled(fit_enabled)
+        self.btn_robust_fit.setEnabled(fit_enabled)
+        self.btn_save.setEnabled(self.ctx.trace is not None)
         self.scan_tools_box.setVisible(is_scan)
         self.param_box.setVisible(is_fit_trace)
         self.scan_help_lbl.setVisible(False)
@@ -4356,6 +4545,10 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Load error", f"Loaded trace is empty after applying observable mode '{self._friendly_mode_name(mode)}'.")
             return False
         self.ctx.trace = trace
+        if hasattr(self, "plot_stack"):
+            self.plot_stack.setCurrentIndex(1)
+        if hasattr(self, "copy_figure_btn"):
+            self.copy_figure_btn.setEnabled(True)
         if hasattr(self, "command_file_lbl"):
             self.command_file_lbl.setText(trace.file_name)
             self.command_file_lbl.setToolTip(str(Path(trace.source_path).resolve()))
@@ -5267,7 +5460,37 @@ class SmartFitterMainWindow(QMainWindow):
             handles += h2
             labels += l2
         if handles:
-            self.ax_main.legend(handles, labels, loc=self.plot_opts.legend_loc, fontsize=self.plot_opts.legend_font_size)
+            legend = self.ax_main.legend(
+                handles,
+                labels,
+                loc=self.plot_opts.legend_loc,
+                fontsize=self.plot_opts.legend_font_size,
+                frameon=True,
+                fancybox=True,
+                framealpha=0.94,
+            )
+            legend.get_frame().set_facecolor("#ffffff")
+            legend.get_frame().set_edgecolor("#c8d2cc")
+
+    def _apply_axes_visual_style(self):
+        """Keep the scientific plot bright, quiet, and readable inside the dark workbench."""
+        self.fig.patch.set_facecolor("#f3f6f4")
+        axes = [self.ax_main, self.ax_res, self._ax_secondary, self._scan_colorbar_ax]
+        for ax in axes:
+            if ax is None or not ax.get_visible():
+                continue
+            ax.set_facecolor("#ffffff")
+            ax.set_axisbelow(True)
+            ax.tick_params(axis="both", colors="#526159", labelsize=9, width=0.8)
+            ax.xaxis.label.set_color("#26332d")
+            ax.yaxis.label.set_color("#26332d")
+            ax.title.set_color("#1d2923")
+            for spine in ax.spines.values():
+                spine.set_color("#c8d2cc")
+                spine.set_linewidth(0.8)
+        if self._scan_colorbar is not None:
+            self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=8)
+            self._scan_colorbar.ax.yaxis.label.set_color("#26332d")
 
     def _autoscale_current_axes(self):
         if self._ax_secondary is not None:
@@ -5524,6 +5747,7 @@ class SmartFitterMainWindow(QMainWindow):
                     self.ax_res.grid(True, alpha=0.3)
         self._autoscale_current_axes()
         self._restore_view_state(view_state)
+        self._apply_axes_visual_style()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
 
@@ -6362,6 +6586,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.ax_res.grid(True, alpha=0.3)
         self._autoscale_current_axes()
         self._restore_view_state(view_state)
+        self._apply_axes_visual_style()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
 

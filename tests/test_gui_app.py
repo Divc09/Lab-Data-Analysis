@@ -31,6 +31,24 @@ def _fixture(*parts: str) -> Path:
     return Path(__file__).resolve().parents[1].joinpath(*parts)
 
 
+def test_startup_empty_state_and_loaded_action_availability():
+    _app()
+    win = SmartFitterMainWindow()
+
+    assert win.plot_stack.currentIndex() == 0
+    assert not win.command_fit_btn.isEnabled()
+    assert not win.btn_fit.isEnabled()
+    assert not win.btn_save.isEnabled()
+    assert not win.copy_figure_btn.isEnabled()
+
+    assert win._load_file(str(_fixture("TestData", "Rabi_2206GHz4ns.mat")))
+    assert win.plot_stack.currentIndex() == 1
+    assert win.command_fit_btn.isEnabled()
+    assert win.btn_fit.isEnabled()
+    assert win.btn_save.isEnabled()
+    assert win.copy_figure_btn.isEnabled()
+
+
 def test_odmr_display_defaults_to_measured_peaks_and_only_dip_view_inverts():
     _app()
     win = SmartFitterMainWindow()
