@@ -94,7 +94,7 @@ Basic GUI workflow:
 - Click fit controls to run the fit
 - Use `Save Results` to export plots and JSON/CSV outputs
 - Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
-- Use `Edit points` to click-toggle reversible analysis exclusions; the source `.mat` file is never modified and `Ctrl+Z` restores the last edit
+- Clicking a point pins a yellow inspection marker. Click the same point again, press `Escape`, or use `Clear marker` to remove the marker and its legend entry; the data itself is never changed
 - Use `File > Save Analysis Session...` to resume a named analysis later, including masks, transforms, plot state, and fit settings
 
 Main GUI sections:

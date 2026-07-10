@@ -724,6 +724,7 @@ class SmartFitterMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
         QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
         QShortcut(QKeySequence("Ctrl+Shift+C"), self, self.copy_export_figure)
+        QShortcut(QKeySequence("Escape"), self, self.clear_selected_marker)
 
         # Drag-and-drop support
         self.setAcceptDrops(True)
@@ -988,8 +989,16 @@ class SmartFitterMainWindow(QMainWindow):
         self.live_readout_lbl = QLabel("Point readout: click a point in Live inspect")
         self.live_readout_lbl.setObjectName("MutedLabel")
         self.live_readout_lbl.setMinimumHeight(24)
-        self.live_readout_lbl.setToolTip("Shows the nearest data coordinates from hover or click in the live plot.")
-        center_layout.addWidget(self.live_readout_lbl)
+        self.live_readout_lbl.setToolTip("Shows the nearest data coordinates. Click the selected point again or press Escape to remove its marker.")
+        readout_row = QHBoxLayout()
+        readout_row.setContentsMargins(0, 0, 0, 0)
+        readout_row.addWidget(self.live_readout_lbl, 1)
+        self.clear_marker_btn = QPushButton("Clear marker")
+        self.clear_marker_btn.setToolTip("Remove the yellow selected-point marker and its legend entry. This never changes the data.")
+        self.clear_marker_btn.setEnabled(False)
+        self.clear_marker_btn.clicked.connect(self.clear_selected_marker)
+        readout_row.addWidget(self.clear_marker_btn)
+        center_layout.addLayout(readout_row)
         splitter.addWidget(center)
 
         single_layout.addWidget(splitter)
@@ -1326,41 +1335,31 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_exclude_selected.setToolTip("Exclude the currently selected 1D sample from the next fit.")
         self.btn_exclude_selected.clicked.connect(self.on_exclude_selected_point)
         mk_gl.addWidget(self.btn_exclude_selected, 0, 1)
-        self.btn_edit_points = QPushButton("Edit points")
-        self.btn_edit_points.setToolTip("Toggle a reversible source-data exclusion with one click in either plot view.")
-        self.btn_edit_points.setCheckable(True)
-        self.btn_edit_points.toggled.connect(lambda checked: self.mask_mode_combo.setCurrentText("Edit points" if checked else "Inspect point"))
-        mk_gl.addWidget(self.btn_edit_points, 1, 0)
-        self.btn_restore_exclusions = QPushButton("Restore all")
-        self.btn_restore_exclusions.setToolTip("Restore every excluded point and range without changing the original MAT file.")
-        self.btn_restore_exclusions.clicked.connect(self.on_clear_exclusions)
-        mk_gl.addWidget(self.btn_restore_exclusions, 1, 1)
         self.mask_xmin = QLineEdit("")
         self.mask_xmax = QLineEdit("")
         self.mask_xmin.setPlaceholderText("x min")
         self.mask_xmax.setPlaceholderText("x max")
         self.mask_xmin.setToolTip("Lower x bound for a range to exclude from fitting.")
         self.mask_xmax.setToolTip("Upper x bound for a range to exclude from fitting.")
-        mk_gl.addWidget(QLabel("Range"), 2, 0)
+        mk_gl.addWidget(QLabel("Range"), 1, 0)
         range_row = QHBoxLayout()
         range_row.addWidget(self.mask_xmin)
         range_row.addWidget(self.mask_xmax)
-        mk_gl.addLayout(range_row, 2, 1)
+        mk_gl.addLayout(range_row, 1, 1)
         btn_add_mask = QPushButton("Add range")
         btn_add_mask.setToolTip("Exclude all 1D samples between the x bounds above.")
         btn_add_mask.clicked.connect(self.on_add_exclusion_range)
-        mk_gl.addWidget(btn_add_mask, 3, 0)
+        mk_gl.addWidget(btn_add_mask, 2, 0)
         self.btn_remove_exclusion = QPushButton("Remove selected")
         self.btn_remove_exclusion.setToolTip("Remove the highlighted exclusion entry below.")
         self.btn_remove_exclusion.clicked.connect(self.on_remove_selected_exclusion)
-        mk_gl.addWidget(self.btn_remove_exclusion, 3, 1)
+        mk_gl.addWidget(self.btn_remove_exclusion, 2, 1)
         btn_clear_mask = QPushButton("Clear exclusions")
         btn_clear_mask.setToolTip("Remove every point and range exclusion.")
         btn_clear_mask.clicked.connect(self.on_clear_exclusions)
-        btn_clear_mask.setVisible(False)
-        mk_gl.addWidget(btn_clear_mask, 4, 0, 1, 2)
+        mk_gl.addWidget(btn_clear_mask, 3, 0, 1, 2)
         self.mask_mode_combo = NoScrollComboBox()
-        self.mask_mode_combo.addItems(["Off", "Inspect point", "Measure", "Edit points", "Range drag"])
+        self.mask_mode_combo.addItems(["Inspect point"])
         self.mask_mode_combo.setCurrentText("Inspect point")
         self.mask_mode_combo.currentTextChanged.connect(self._update_mask_mode)
         self.mask_mode_combo.setVisible(False)
@@ -1368,11 +1367,11 @@ class SmartFitterMainWindow(QMainWindow):
         self.point_readout_lbl.setWordWrap(True)
         self.point_readout_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
         self.point_readout_lbl.setToolTip("Last selected or hovered sample coordinate.")
-        mk_gl.addWidget(self.point_readout_lbl, 5, 0, 1, 2)
+        mk_gl.addWidget(self.point_readout_lbl, 4, 0, 1, 2)
         self.mask_list = QListWidget()
         self.mask_list.setMaximumHeight(96)
         self.mask_list.setToolTip("Current excluded points and x ranges. Select one and click Remove selected.")
-        mk_gl.addWidget(self.mask_list, 6, 0, 1, 2)
+        mk_gl.addWidget(self.mask_list, 5, 0, 1, 2)
         left_inner_layout.addWidget(mask_box)
 
         analysis_box = QGroupBox("Analysis transforms")
@@ -1888,22 +1887,6 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_std_mode_combo.setToolTip("Choose how standard deviation is displayed.")
         self.quick_std_mode_combo.currentTextChanged.connect(self._on_quick_std_mode_changed)
         row.addWidget(self.quick_std_mode_combo)
-        self.quick_inspect_btn = QPushButton("Inspect")
-        self.quick_inspect_btn.setToolTip("Read nearest-point coordinates and measurements.")
-        self.quick_inspect_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Inspect point"))
-        row.addWidget(self.quick_inspect_btn)
-        self.quick_measure_btn = QPushButton("Measure")
-        self.quick_measure_btn.setToolTip("Pin the nearest point and report its coordinates; use this for quick peak or cursor measurements.")
-        self.quick_measure_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Measure"))
-        row.addWidget(self.quick_measure_btn)
-        self.quick_edit_btn = QPushButton("Edit points")
-        self.quick_edit_btn.setToolTip("Click plotted samples to exclude or restore them; Ctrl+Z undoes the change.")
-        self.quick_edit_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Edit points"))
-        row.addWidget(self.quick_edit_btn)
-        self.quick_range_btn = QPushButton("Exclude range")
-        self.quick_range_btn.setToolTip("Drag across the export plot to exclude a reversible x range.")
-        self.quick_range_btn.clicked.connect(lambda: self.mask_mode_combo.setCurrentText("Range drag"))
-        row.addWidget(self.quick_range_btn)
         self.copy_figure_btn = QPushButton("Copy figure")
         self.copy_figure_btn.setToolTip("Copy the current export figure to the clipboard (Ctrl+Shift+C).")
         self.copy_figure_btn.clicked.connect(self.copy_export_figure)
@@ -2547,10 +2530,7 @@ class SmartFitterMainWindow(QMainWindow):
             point = self.live_plot_widget.plotItem.vb.mapSceneToView(event.scenePos())
         except Exception:
             return
-        if self.mask_mode_combo.currentText() == "Edit points":
-            self._toggle_exclusion_at_x(float(point.x()))
-        else:
-            self._select_point_from_plot(float(point.x()), float(point.y()))
+        self._select_point_from_plot(float(point.x()), float(point.y()))
         try:
             event.accept()
         except Exception:
@@ -2590,8 +2570,12 @@ class SmartFitterMainWindow(QMainWindow):
             px = float(self.ctx.trace.x2d[row, col])
             py = float(self.ctx.trace.y2d[row, col])
             z = float(self.ctx.trace.z2d[row, col])
+            if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px) and np.isclose(float(self._selected_plot_point.get("y", np.nan)), py):
+                self.clear_selected_marker(refresh=refresh)
+                return
             self._scan_cursor = (px, py)
             self._selected_plot_point = {"x": px, "y": py, "z": z}
+            self.clear_marker_btn.setEnabled(True)
             self.scan_cursor_lbl.setText(f"Cursor: x={px:.6g}, y={py:.6g}, z={z:.6g}")
             self._update_point_readout(
                 f"Point readout: x={self._format_inspect_value(px)}, "
@@ -2602,7 +2586,11 @@ class SmartFitterMainWindow(QMainWindow):
             if nearest is None:
                 return
             _, px, py = nearest
+            if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px):
+                self.clear_selected_marker(refresh=refresh)
+                return
             self._selected_plot_point = {"x": px, "y": py}
+            self.clear_marker_btn.setEnabled(True)
             iter_text = self._point_iteration_readout(px)
             secondary = self._nearest_secondary_point(float(xdata))
             if secondary is not None:
@@ -2626,6 +2614,18 @@ class SmartFitterMainWindow(QMainWindow):
             if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
                 self.scan_cursor_lbl.setText(f"Cursor: x={self._format_inspect_value(px)}, y={self._format_inspect_value(py)}")
         if refresh:
+            self._refresh_plot_only()
+
+    def clear_selected_marker(self, _checked: bool = False, *, refresh: bool = True):
+        """Clear only the pinned inspection marker; measured data is untouched."""
+        self._selected_plot_point = None
+        self._scan_cursor = None
+        if hasattr(self, "clear_marker_btn"):
+            self.clear_marker_btn.setEnabled(False)
+        self._update_point_readout("Point readout: none")
+        if hasattr(self, "scan_cursor_lbl"):
+            self.scan_cursor_lbl.setText("Cursor: none")
+        if refresh and self.ctx.trace is not None:
             self._refresh_plot_only()
 
 
@@ -3477,18 +3477,9 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _update_mask_mode(self):
         mode = self.mask_mode_combo.currentText()
-        if hasattr(self, "btn_edit_points"):
-            self.btn_edit_points.blockSignals(True)
-            self.btn_edit_points.setChecked(mode == "Edit points")
-            self.btn_edit_points.blockSignals(False)
         if self.span_selector is not None:
             self.span_selector.set_active(False)
-        if mode == "Range drag":
-            self.span_selector = SpanSelector(self.ax_main, self._on_range_selected, "horizontal", useblit=True)
-        else:
-            self._clear_crosshairs()
-        if mode not in {"Inspect point", "Measure"}:
-            self._update_point_readout("Point readout: none")
+        self._clear_crosshairs()
         self.canvas.draw_idle()
 
     def _analysis_snapshot(self) -> dict[str, Any]:
@@ -3810,7 +3801,17 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
             self._message("Exclusions", "Point exclusions apply to 1D fit traces. Use linecuts or ranges for scan review.")
             return
-        self._toggle_exclusion_at_x(float(self._selected_plot_point["x"]))
+        processed = self.ctx.processed
+        if processed is None or len(processed.analysis_x) == 0:
+            return
+        displayed_index = int(np.argmin(np.abs(processed.analysis_x - float(self._selected_plot_point["x"]))))
+        if displayed_index >= len(processed.source_groups):
+            return
+        raw_indices = set(int(value) for value in processed.source_groups[displayed_index])
+        self._record_analysis_state()
+        self.ctx.excluded_points.update(raw_indices)
+        self._refresh_mask_list()
+        self._refresh_processed()
 
     def on_remove_selected_exclusion(self):
         selected = self.mask_list.selectedItems() if hasattr(self.mask_list, "selectedItems") else []
@@ -3878,36 +3879,14 @@ class SmartFitterMainWindow(QMainWindow):
                     keep[i] = False
         return x[keep], y[keep]
 
-    def _toggle_exclusion_at_x(self, x_value: float) -> None:
-        processed = self.ctx.processed
-        if processed is None or len(processed.analysis_x) == 0:
-            return
-        displayed_index = int(np.argmin(np.abs(processed.analysis_x - float(x_value))))
-        if displayed_index >= len(processed.source_groups):
-            return
-        raw_indices = set(int(value) for value in processed.source_groups[displayed_index])
-        if not raw_indices:
-            return
-        self._record_analysis_state()
-        if raw_indices.issubset(self.ctx.excluded_points or set()):
-            self.ctx.excluded_points.difference_update(raw_indices)
-        else:
-            self.ctx.excluded_points.update(raw_indices)
-        self._refresh_mask_list()
-        self._refresh_processed()
-
     def _on_plot_click(self, event):
         if event.inaxes not in self._inspectable_axes():
             return
         mode = self.mask_mode_combo.currentText()
         if event.xdata is None:
             return
-        if mode in {"Inspect point", "Measure", "Off"}:
+        if mode == "Inspect point":
             self._select_point_from_plot(float(event.xdata), float(event.ydata) if event.ydata is not None else None)
-            return
-        if mode != "Edit points" or self.ctx.x is None:
-            return
-        self._toggle_exclusion_at_x(float(event.xdata))
 
     def on_save_preset(self):
         out, _ = QFileDialog.getSaveFileName(self, "Save analysis preset", "", "Preset JSON (*.json)")
@@ -4172,6 +4151,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.odmr_peaks = None
         self._selected_plot_point = None
         self._scan_cursor = None
+        if hasattr(self, "clear_marker_btn"):
+            self.clear_marker_btn.setEnabled(False)
         if not preserve_analysis:
             self.ctx.excluded_points = set()
             self.ctx.exclusion_ranges = []
@@ -4825,7 +4806,7 @@ class SmartFitterMainWindow(QMainWindow):
         return y2d[:, col], z2d[:, col], f"Vertical linecut @ x={x2d[0, col]:.6g}"
 
     def _on_plot_motion(self, event):
-        if self.mask_mode_combo.currentText() not in {"Inspect point", "Measure"} or event.inaxes not in self._inspectable_axes():
+        if self.mask_mode_combo.currentText() != "Inspect point" or event.inaxes not in self._inspectable_axes():
             return
         if event.xdata is None:
             return
@@ -4864,7 +4845,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_plot_leave(self, event):
-        if self.mask_mode_combo.currentText() in {"Inspect point", "Measure"}:
+        if self.mask_mode_combo.currentText() == "Inspect point":
             self._clear_crosshairs()
 
     def _legend_label(self, default_label: str, short_label: str) -> str:

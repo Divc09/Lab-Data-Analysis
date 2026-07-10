@@ -138,6 +138,12 @@ def test_gui_inspect_click_updates_point_readout():
     assert "Point readout" in win.point_readout_lbl.text()
     assert win.live_readout_lbl.text() == win.point_readout_lbl.text()
 
+    point_count = len(win.ctx.x)
+    win._on_plot_click(event)
+    assert win._selected_plot_point is None
+    assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
+    assert len(win.ctx.x) == point_count
+
 
 def test_gui_live_plot_click_selection_pins_nearest_point():
     _app()
@@ -795,21 +801,29 @@ def test_gui_deer_profiles_and_plot_only_position():
     assert win.strategy_box.isHidden()
 
 
-def test_gui_edit_points_uses_raw_masks_and_undo_redo():
+def test_gui_selected_marker_toggles_and_clears_without_changing_data():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
-    assert win.ctx.processed is not None
-    x0 = float(win.ctx.processed.analysis_x[0])
-    sources = set(win.ctx.processed.source_groups[0].tolist())
-    win.mask_mode_combo.setCurrentText("Edit points")
-    win._toggle_exclusion_at_x(x0)
-    assert sources.issubset(win.ctx.excluded_points)
-    win._undo()
-    assert not win.ctx.excluded_points
-    win._redo()
-    assert sources.issubset(win.ctx.excluded_points)
+    original_count = len(win.ctx.x)
+    x0 = float(win.ctx.x[0])
+
+    win._select_point_from_plot(x0, refresh=True)
+    assert win._selected_plot_point is not None
+    assert win.clear_marker_btn.isEnabled()
+    assert any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
+
+    win._select_point_from_plot(x0, refresh=True)
+    assert win._selected_plot_point is None
+    assert not win.clear_marker_btn.isEnabled()
+    assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
+    assert len(win.ctx.x) == original_count
+
+    win._select_point_from_plot(x0, refresh=False)
+    win.clear_selected_marker(refresh=False)
+    assert win._selected_plot_point is None
+    assert len(win.ctx.x) == original_count
 
 
 def test_gui_copy_export_figure_places_image_on_clipboard():
