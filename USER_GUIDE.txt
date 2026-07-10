@@ -96,6 +96,7 @@ Basic GUI workflow:
 - Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
 - Clicking a point pins a yellow inspection marker. Click the same point again, press `Escape`, or use `Clear marker` to remove the marker and its legend entry; the data itself is never changed
 - Use `File > Save Analysis Session...` to resume a named analysis later, including masks, transforms, plot state, and fit settings
+- For 2D scans, use the contextual toolbar above the plot to change colormap and color limits, type exact X/Y bounds, pan, box-zoom, wheel-zoom, reset to the full map, or toggle equal physical axis scaling
 
 Main GUI sections:
 - `Data + Profile`: load the file and choose the experiment profile

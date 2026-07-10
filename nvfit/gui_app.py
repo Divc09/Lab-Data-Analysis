@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from matplotlib import colormaps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -677,6 +678,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._secondary_plot_data: tuple[np.ndarray, np.ndarray, str] | None = None
         self._scan_colorbar = None
         self._scan_colorbar_ax = None
+        self._scan_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._syncing_scan_controls = False
         self._crosshair_v = None
         self._crosshair_h = None
         self.live_selection_marker = None
@@ -715,6 +718,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self.canvas.mpl_connect("axes_leave_event", self._on_plot_leave)
+        self.canvas.mpl_connect("scroll_event", self._on_scan_scroll)
+        self.canvas.mpl_connect("button_release_event", self._on_scan_navigation_finished)
 
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+O"), self, self.on_load)
@@ -803,6 +808,11 @@ class SmartFitterMainWindow(QMainWindow):
         QWidget#ModeRail {
             background-color: #121513;
             border-right: 1px solid #303832;
+        }
+        QWidget#ScanQuickBar {
+            background-color: #1d211f;
+            border-top: 1px solid #353b36;
+            border-bottom: 1px solid #353b36;
         }
         QLabel#PaneTitle {
             color: #f2f2f2;
@@ -954,6 +964,7 @@ class SmartFitterMainWindow(QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         self._build_plot_quick_toolbar(center_layout)
+        self._build_scan_quick_toolbar(center_layout)
         self.plot_tabs = QTabWidget()
         live_page = QWidget()
         live_layout = QVBoxLayout(live_page)
@@ -1894,6 +1905,81 @@ class SmartFitterMainWindow(QMainWindow):
         row.addStretch(1)
         layout.addLayout(row)
 
+    def _build_scan_quick_toolbar(self, layout: QVBoxLayout):
+        self.scan_quick_bar = QWidget()
+        self.scan_quick_bar.setObjectName("ScanQuickBar")
+        outer = QVBoxLayout(self.scan_quick_bar)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(5)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(6)
+        color_row.addWidget(QLabel("2D color"))
+        self.scan_colormap_combo = NoScrollComboBox()
+        self.scan_colormap_combo.addItems(["viridis", "cividis", "magma", "inferno", "plasma", "turbo", "coolwarm", "RdBu", "gray"])
+        self.scan_colormap_combo.setToolTip("Change the 2D map colormap immediately.")
+        self.scan_colormap_combo.currentTextChanged.connect(self._on_scan_style_changed)
+        color_row.addWidget(self.scan_colormap_combo)
+        self.scan_reverse_chk = QCheckBox("Reverse")
+        self.scan_reverse_chk.toggled.connect(self._on_scan_style_changed)
+        color_row.addWidget(self.scan_reverse_chk)
+        color_row.addWidget(QLabel("Color range"))
+        self.scan_scale_combo = NoScrollComboBox()
+        self.scan_scale_combo.addItems(["Auto", "Robust 2–98%", "Manual"])
+        self.scan_scale_combo.setCurrentText("Robust 2–98%")
+        self.scan_scale_combo.currentTextChanged.connect(self._on_scan_scale_changed)
+        color_row.addWidget(self.scan_scale_combo)
+        self.scan_vmin_edit = QLineEdit()
+        self.scan_vmax_edit = QLineEdit()
+        for edit, placeholder in ((self.scan_vmin_edit, "Color min"), (self.scan_vmax_edit, "Color max")):
+            edit.setPlaceholderText(placeholder)
+            edit.setFixedWidth(86)
+            edit.editingFinished.connect(self._apply_manual_scan_color_limits)
+            color_row.addWidget(edit)
+        color_row.addStretch(1)
+        outer.addLayout(color_row)
+
+        view_row = QHBoxLayout()
+        view_row.setSpacing(6)
+        view_row.addWidget(QLabel("View"))
+        self.scan_xmin_edit = QLineEdit(); self.scan_xmax_edit = QLineEdit()
+        self.scan_ymin_edit = QLineEdit(); self.scan_ymax_edit = QLineEdit()
+        for label, edit in (("X min", self.scan_xmin_edit), ("X max", self.scan_xmax_edit), ("Y min", self.scan_ymin_edit), ("Y max", self.scan_ymax_edit)):
+            edit.setPlaceholderText(label)
+            edit.setFixedWidth(78)
+            edit.returnPressed.connect(self._apply_scan_view_limits)
+            view_row.addWidget(edit)
+        apply_view = QPushButton("Apply")
+        apply_view.setToolTip("Apply the typed X/Y view bounds.")
+        apply_view.clicked.connect(self._apply_scan_view_limits)
+        view_row.addWidget(apply_view)
+        reset_view = QPushButton("Full view")
+        reset_view.setToolTip("Reset the map to its complete X/Y extent.")
+        reset_view.clicked.connect(self._reset_scan_view)
+        view_row.addWidget(reset_view)
+        self.scan_pan_btn = QPushButton("Pan")
+        self.scan_pan_btn.setCheckable(True)
+        self.scan_pan_btn.setToolTip("Drag the export map to move around.")
+        self.scan_pan_btn.clicked.connect(self._toggle_scan_pan)
+        view_row.addWidget(self.scan_pan_btn)
+        self.scan_zoom_btn = QPushButton("Box zoom")
+        self.scan_zoom_btn.setCheckable(True)
+        self.scan_zoom_btn.setToolTip("Drag a rectangle on the export map to zoom. The mouse wheel also zooms at the pointer.")
+        self.scan_zoom_btn.clicked.connect(self._toggle_scan_zoom)
+        view_row.addWidget(self.scan_zoom_btn)
+        self.scan_equal_aspect_chk = QCheckBox("Equal axes")
+        self.scan_equal_aspect_chk.setChecked(True)
+        self.scan_equal_aspect_chk.setToolTip("Show equal physical distances at equal screen scale.")
+        self.scan_equal_aspect_chk.toggled.connect(self._on_scan_style_changed)
+        view_row.addWidget(self.scan_equal_aspect_chk)
+        view_row.addStretch(1)
+        outer.addLayout(view_row)
+
+        self.scan_quick_bar.setVisible(False)
+        layout.addWidget(self.scan_quick_bar)
+        self.scan_vmin_edit.setEnabled(False)
+        self.scan_vmax_edit.setEnabled(False)
+
     def _labeled_title(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("PaneTitle")
@@ -2047,24 +2133,33 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_workspace_secondary_combo = NoScrollComboBox()
         self.scan_workspace_secondary_combo.addItems(["None", "Contrast", "Signal", "Reference"])
         self.scan_workspace_secondary_combo.currentTextChanged.connect(self._on_scan_workspace_secondary_changed)
-        self.scan_colormap_combo = NoScrollComboBox()
-        self.scan_colormap_combo.addItems(["viridis", "cividis", "magma", "turbo"])
-        self.scan_colormap_combo.setToolTip("Color map for 2D scan review and exported scan figures.")
-        self.scan_colormap_combo.currentTextChanged.connect(self._refresh_plot_only)
-        self.scan_reverse_chk = QCheckBox("Reverse")
-        self.scan_reverse_chk.toggled.connect(self._refresh_plot_only)
-        self.scan_robust_limits_chk = QCheckBox("Robust range")
-        self.scan_robust_limits_chk.setChecked(True)
-        self.scan_robust_limits_chk.setToolTip("Use 2nd–98th percentile color limits so isolated outliers do not flatten a scan.")
-        self.scan_robust_limits_chk.toggled.connect(self._refresh_plot_only)
+        self.scan_workspace_colormap_combo = NoScrollComboBox()
+        self.scan_workspace_colormap_combo.addItems([self.scan_colormap_combo.itemText(i) for i in range(self.scan_colormap_combo.count())])
+        self.scan_workspace_colormap_combo.setCurrentText(self.scan_colormap_combo.currentText())
+        self.scan_workspace_colormap_combo.currentTextChanged.connect(self._on_workspace_scan_style_changed)
+        self.scan_workspace_scale_combo = NoScrollComboBox()
+        self.scan_workspace_scale_combo.addItems([self.scan_scale_combo.itemText(i) for i in range(self.scan_scale_combo.count())])
+        self.scan_workspace_scale_combo.setCurrentText(self.scan_scale_combo.currentText())
+        self.scan_workspace_scale_combo.currentTextChanged.connect(self._on_workspace_scan_style_changed)
+        self.scan_workspace_vmin_edit = QLineEdit(self.scan_vmin_edit.text())
+        self.scan_workspace_vmax_edit = QLineEdit(self.scan_vmax_edit.text())
+        for edit, placeholder in ((self.scan_workspace_vmin_edit, "Color min"), (self.scan_workspace_vmax_edit, "Color max")):
+            edit.setPlaceholderText(placeholder)
+            edit.setFixedWidth(86)
+            edit.setEnabled(self.scan_workspace_scale_combo.currentText() == "Manual")
+            edit.editingFinished.connect(self._on_workspace_scan_manual_limits)
+        self.scan_workspace_reverse_chk = QCheckBox("Reverse")
+        self.scan_workspace_reverse_chk.toggled.connect(self._on_workspace_scan_style_changed)
         controls.addWidget(QLabel("Linecut"))
         controls.addWidget(self.scan_workspace_linecut_combo)
         controls.addWidget(QLabel("Secondary"))
         controls.addWidget(self.scan_workspace_secondary_combo)
         controls.addWidget(QLabel("Colors"))
-        controls.addWidget(self.scan_colormap_combo)
-        controls.addWidget(self.scan_reverse_chk)
-        controls.addWidget(self.scan_robust_limits_chk)
+        controls.addWidget(self.scan_workspace_colormap_combo)
+        controls.addWidget(self.scan_workspace_scale_combo)
+        controls.addWidget(self.scan_workspace_vmin_edit)
+        controls.addWidget(self.scan_workspace_vmax_edit)
+        controls.addWidget(self.scan_workspace_reverse_chk)
         controls.addStretch(1)
         layout.addLayout(controls)
         self.scan_workspace_plot = None
@@ -2277,6 +2372,186 @@ class SmartFitterMainWindow(QMainWindow):
             self.scan_secondary_combo.setCurrentText(text)
         self._sync_scan_workspace()
 
+    def _on_workspace_scan_style_changed(self, *_args):
+        if self._syncing_scan_controls:
+            return
+        self._syncing_scan_controls = True
+        try:
+            self.scan_colormap_combo.setCurrentText(self.scan_workspace_colormap_combo.currentText())
+            self.scan_scale_combo.setCurrentText(self.scan_workspace_scale_combo.currentText())
+            self.scan_reverse_chk.setChecked(self.scan_workspace_reverse_chk.isChecked())
+            self.scan_vmin_edit.setText(self.scan_workspace_vmin_edit.text())
+            self.scan_vmax_edit.setText(self.scan_workspace_vmax_edit.text())
+        finally:
+            self._syncing_scan_controls = False
+        self._on_scan_scale_changed(self.scan_scale_combo.currentText())
+
+    def _on_workspace_scan_manual_limits(self):
+        if self.scan_workspace_scale_combo.currentText() != "Manual":
+            self.scan_workspace_scale_combo.setCurrentText("Manual")
+        else:
+            self._on_workspace_scan_style_changed()
+
+    def _sync_scan_style_controls(self):
+        if not hasattr(self, "scan_workspace_colormap_combo"):
+            return
+        self._syncing_scan_controls = True
+        try:
+            self.scan_workspace_colormap_combo.setCurrentText(self.scan_colormap_combo.currentText())
+            self.scan_workspace_scale_combo.setCurrentText(self.scan_scale_combo.currentText())
+            self.scan_workspace_reverse_chk.setChecked(self.scan_reverse_chk.isChecked())
+            self.scan_workspace_vmin_edit.setText(self.scan_vmin_edit.text())
+            self.scan_workspace_vmax_edit.setText(self.scan_vmax_edit.text())
+            manual = self.scan_scale_combo.currentText() == "Manual"
+            self.scan_workspace_vmin_edit.setEnabled(manual)
+            self.scan_workspace_vmax_edit.setEnabled(manual)
+        finally:
+            self._syncing_scan_controls = False
+
+    def _on_scan_scale_changed(self, text: str):
+        manual = text == "Manual"
+        if hasattr(self, "scan_vmin_edit"):
+            self.scan_vmin_edit.setEnabled(manual)
+            self.scan_vmax_edit.setEnabled(manual)
+        if not self._syncing_scan_controls:
+            self._on_scan_style_changed()
+
+    def _on_scan_style_changed(self, *_args):
+        if self._syncing_scan_controls:
+            return
+        self._sync_scan_style_controls()
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            self._refresh_plot_only()
+            self._sync_scan_style_controls()
+            self._sync_scan_workspace()
+
+    def _apply_manual_scan_color_limits(self):
+        if self.scan_scale_combo.currentText() != "Manual":
+            return
+        try:
+            low = float(self.scan_vmin_edit.text())
+            high = float(self.scan_vmax_edit.text())
+        except ValueError:
+            return
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            self.statusBar().showMessage("Color maximum must be greater than color minimum", 4000)
+            return
+        self._on_scan_style_changed()
+
+    def _scan_colormap_name(self) -> str:
+        name = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "viridis"
+        return f"{name}_r" if hasattr(self, "scan_reverse_chk") and self.scan_reverse_chk.isChecked() else name
+
+    def _scan_color_limits(self, values: np.ndarray) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if len(finite) == 0:
+            return 0.0, 1.0
+        mode = self.scan_scale_combo.currentText() if hasattr(self, "scan_scale_combo") else "Auto"
+        if mode == "Manual":
+            try:
+                low, high = float(self.scan_vmin_edit.text()), float(self.scan_vmax_edit.text())
+                if np.isfinite(low) and np.isfinite(high) and high > low:
+                    return low, high
+            except ValueError:
+                pass
+        if mode == "Robust 2–98%" and len(finite) > 1:
+            low, high = [float(value) for value in np.percentile(finite, [2, 98])]
+        else:
+            low, high = float(np.min(finite)), float(np.max(finite))
+        if np.isclose(low, high):
+            pad = max(abs(low) * 0.01, 1e-12)
+            low, high = low - pad, high + pad
+        if mode != "Manual" and hasattr(self, "scan_vmin_edit"):
+            self.scan_vmin_edit.setText(f"{low:.6g}")
+            self.scan_vmax_edit.setText(f"{high:.6g}")
+        return low, high
+
+    def _apply_scan_image_style(self, image, values: np.ndarray) -> None:
+        if pg is None or image is None:
+            return
+        cmap = colormaps[self._scan_colormap_name()]
+        lookup = np.asarray(cmap(np.linspace(0.0, 1.0, 256)) * 255, dtype=np.ubyte)
+        image.setLookupTable(lookup)
+        image.setLevels(self._scan_color_limits(values))
+
+    def _update_scan_view_fields(self, xlim: tuple[float, float], ylim: tuple[float, float]) -> None:
+        for edit, value in ((self.scan_xmin_edit, xlim[0]), (self.scan_xmax_edit, xlim[1]), (self.scan_ymin_edit, ylim[0]), (self.scan_ymax_edit, ylim[1])):
+            edit.setText(f"{float(value):.6g}")
+
+    def _apply_scan_view_limits(self):
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        try:
+            xlim = (float(self.scan_xmin_edit.text()), float(self.scan_xmax_edit.text()))
+            ylim = (float(self.scan_ymin_edit.text()), float(self.scan_ymax_edit.text()))
+        except ValueError:
+            self.statusBar().showMessage("Enter numeric X/Y view bounds", 4000)
+            return
+        if not all(np.isfinite(value) for value in (*xlim, *ylim)) or xlim[1] <= xlim[0] or ylim[1] <= ylim[0]:
+            self.statusBar().showMessage("View maxima must be greater than minima", 4000)
+            return
+        self._scan_view_limits = (xlim, ylim)
+        self.ax_main.set_xlim(*xlim)
+        self.ax_main.set_ylim(*ylim)
+        self.canvas.draw_idle()
+
+    def _reset_scan_view(self):
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        scan_extent = self._scan2d_extent(self.ctx.trace)
+        if scan_extent is None:
+            return
+        xmin, xmax, ymin, ymax = scan_extent[2]
+        self._scan_view_limits = None
+        self.ax_main.set_xlim(xmin, xmax)
+        self.ax_main.set_ylim(ymin, ymax)
+        self._update_scan_view_fields((xmin, xmax), (ymin, ymax))
+        self.canvas.draw_idle()
+
+    def _toggle_scan_pan(self, checked: bool):
+        mode = str(self.toolbar.mode).lower()
+        if checked:
+            if "zoom" in mode:
+                self.toolbar.zoom()
+            if "pan" not in str(self.toolbar.mode).lower():
+                self.toolbar.pan()
+            self.scan_zoom_btn.setChecked(False)
+        elif "pan" in mode:
+            self.toolbar.pan()
+
+    def _toggle_scan_zoom(self, checked: bool):
+        mode = str(self.toolbar.mode).lower()
+        if checked:
+            if "pan" in mode:
+                self.toolbar.pan()
+            if "zoom" not in str(self.toolbar.mode).lower():
+                self.toolbar.zoom()
+            self.scan_pan_btn.setChecked(False)
+        elif "zoom" in mode:
+            self.toolbar.zoom()
+
+    def _on_scan_navigation_finished(self, event):
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes is not self.ax_main:
+            return
+        self._scan_view_limits = (tuple(float(value) for value in self.ax_main.get_xlim()), tuple(float(value) for value in self.ax_main.get_ylim()))
+        self._update_scan_view_fields(*self._scan_view_limits)
+
+    def _on_scan_scroll(self, event):
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes is not self.ax_main:
+            return
+        xlim, ylim = self.ax_main.get_xlim(), self.ax_main.get_ylim()
+        center_x = float(event.xdata) if event.xdata is not None else float(np.mean(xlim))
+        center_y = float(event.ydata) if event.ydata is not None else float(np.mean(ylim))
+        factor = 0.8 if event.button == "up" else 1.25
+        new_xlim = (center_x - (center_x - xlim[0]) * factor, center_x + (xlim[1] - center_x) * factor)
+        new_ylim = (center_y - (center_y - ylim[0]) * factor, center_y + (ylim[1] - center_y) * factor)
+        self.ax_main.set_xlim(*new_xlim)
+        self.ax_main.set_ylim(*new_ylim)
+        self._scan_view_limits = (new_xlim, new_ylim)
+        self._update_scan_view_fields(new_xlim, new_ylim)
+        self.canvas.draw_idle()
+
     def _sync_scan_workspace(self):
         if not hasattr(self, "scan_workspace_summary"):
             return
@@ -2297,6 +2572,8 @@ class SmartFitterMainWindow(QMainWindow):
         trace = self.ctx.trace
         if trace.scan_dim == "scan2d" and trace.z2d is not None:
             image = pg.ImageItem(np.asarray(trace.z2d, dtype=float).T)
+            self._apply_scan_image_style(image, trace.z2d)
+            self.scan_workspace_image = image
             self.scan_workspace_plot.addItem(image)
             scan_extent = self._scan2d_extent(trace)
             if scan_extent is not None:
@@ -2404,6 +2681,8 @@ class SmartFitterMainWindow(QMainWindow):
             return
         if self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None:
             image = pg.ImageItem(np.asarray(self.ctx.trace.z2d, dtype=float).T)
+            self._apply_scan_image_style(image, self.ctx.trace.z2d)
+            self.live_image_item = image
             self.live_plot_widget.addItem(image)
             scan_extent = self._scan2d_extent(self.ctx.trace)
             if scan_extent is not None:
@@ -3165,6 +3444,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_linecut_combo.setVisible(is_scan2d)
         self.scan_secondary_lbl.setVisible(is_scan1d)
         self.scan_secondary_combo.setVisible(is_scan1d)
+        if hasattr(self, "scan_quick_bar"):
+            self.scan_quick_bar.setVisible(is_scan2d)
         for widget in getattr(self, "fit_export_widgets", []):
             widget.setVisible(False if widget.property("drawerHidden") else is_fit_trace)
         if is_scan2d:
@@ -3293,6 +3574,12 @@ class SmartFitterMainWindow(QMainWindow):
         s.setValue("plot/annotation_nv_metrics", self.plot_opts.annotation_show_nv_metrics)
         s.setValue("plot/annotation_params", self.plot_opts.annotation_show_params)
         s.setValue("plot/plot_style", self.plot_opts.plot_style)
+        s.setValue("scan/colormap", self.scan_colormap_combo.currentText())
+        s.setValue("scan/color_scale", self.scan_scale_combo.currentText())
+        s.setValue("scan/reverse_colormap", self.scan_reverse_chk.isChecked())
+        s.setValue("scan/equal_aspect", self.scan_equal_aspect_chk.isChecked())
+        s.setValue("scan/color_min", self.scan_vmin_edit.text())
+        s.setValue("scan/color_max", self.scan_vmax_edit.text())
         s.setValue("export/png", self.exp_png_chk.isChecked())
         s.setValue("export/pdf", self.exp_pdf_chk.isChecked())
         s.setValue("export/svg", self.exp_svg_chk.isChecked())
@@ -3337,6 +3624,22 @@ class SmartFitterMainWindow(QMainWindow):
         self.ann_nv_metrics_chk.setChecked(str(s.value("plot/annotation_nv_metrics", "true")).lower() != "false")
         self.ann_params_chk.setChecked(str(s.value("plot/annotation_params", "false")).lower() == "true")
         self.plot_style_combo.setCurrentText(str(s.value("plot/plot_style", "Line + scatter")))
+        scan_cmap = str(s.value("scan/colormap", "viridis"))
+        scan_scale = str(s.value("scan/color_scale", "Robust 2–98%"))
+        scan_reverse = str(s.value("scan/reverse_colormap", "false")).lower() == "true"
+        scan_equal = str(s.value("scan/equal_aspect", "true")).lower() != "false"
+        self._syncing_scan_controls = True
+        try:
+            self.scan_colormap_combo.setCurrentText(scan_cmap)
+            self.scan_scale_combo.setCurrentText(scan_scale)
+            self.scan_reverse_chk.setChecked(scan_reverse)
+            self.scan_equal_aspect_chk.setChecked(scan_equal)
+            self.scan_vmin_edit.setText(str(s.value("scan/color_min", "")))
+            self.scan_vmax_edit.setText(str(s.value("scan/color_max", "")))
+        finally:
+            self._syncing_scan_controls = False
+        self.scan_vmin_edit.setEnabled(scan_scale == "Manual")
+        self.scan_vmax_edit.setEnabled(scan_scale == "Manual")
         self.exp_png_chk.setChecked(str(s.value("export/png", "true")).lower() != "false")
         self.exp_pdf_chk.setChecked(str(s.value("export/pdf", "false")).lower() == "true")
         self.exp_svg_chk.setChecked(str(s.value("export/svg", "false")).lower() == "true")
@@ -3356,6 +3659,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.exp_report_pdf_chk.setChecked(False)
         self._update_contextual_visibility()
         self._sync_quick_toolbar_from_state()
+        self._sync_scan_style_controls()
 
     def _update_contextual_visibility(self):
         model = self.model_combo.currentText()
@@ -3880,6 +4184,8 @@ class SmartFitterMainWindow(QMainWindow):
         return x[keep], y[keep]
 
     def _on_plot_click(self, event):
+        if str(getattr(self.toolbar, "mode", "")):
+            return
         if event.inaxes not in self._inspectable_axes():
             return
         mode = self.mask_mode_combo.currentText()
@@ -4151,6 +4457,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.odmr_peaks = None
         self._selected_plot_point = None
         self._scan_cursor = None
+        self._scan_view_limits = None
         if hasattr(self, "clear_marker_btn"):
             self.clear_marker_btn.setEnabled(False)
         if not preserve_analysis:
@@ -4967,11 +5274,13 @@ class SmartFitterMainWindow(QMainWindow):
         y_span = abs(float(ymax) - float(ymin))
         aspect = x_span / y_span if y_span > 0 else 1.0
         if show_linecut:
-            main_rect = self._fit_axes_box_to_aspect([0.09, 0.45, 0.66, 0.42], aspect)
+            base_rect = [0.09, 0.45, 0.66, 0.42]
+            main_rect = self._fit_axes_box_to_aspect(base_rect, aspect) if self.scan_equal_aspect_chk.isChecked() else base_rect
             self.ax_res.set_position([0.09, 0.12, 0.66, 0.20])
             self.ax_res.set_visible(True)
         else:
-            main_rect = self._fit_axes_box_to_aspect([0.09, 0.12, 0.66, 0.76], aspect)
+            base_rect = [0.09, 0.12, 0.66, 0.76]
+            main_rect = self._fit_axes_box_to_aspect(base_rect, aspect) if self.scan_equal_aspect_chk.isChecked() else base_rect
             self.ax_res.set_visible(False)
         self.ax_main.set_position(main_rect)
         cbar_pad = 0.016
@@ -5159,23 +5468,18 @@ class SmartFitterMainWindow(QMainWindow):
             xmin, xmax, ymin, ymax = extent
             linecut = self._extract_scan_linecut()
             self._configure_scan2d_layout(show_linecut=linecut is not None, extent=extent)
-            cmap = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "viridis"
-            if hasattr(self, "scan_reverse_chk") and self.scan_reverse_chk.isChecked():
-                cmap += "_r"
-            mesh = self.ax_main.pcolormesh(x_edges, y_edges, self.ctx.trace.z2d, shading="flat", cmap=cmap)
-            if hasattr(self, "scan_robust_limits_chk") and self.scan_robust_limits_chk.isChecked():
-                finite = np.asarray(self.ctx.trace.z2d, dtype=float)
-                finite = finite[np.isfinite(finite)]
-                if len(finite) > 1:
-                    low, high = np.percentile(finite, [2, 98])
-                    if high > low:
-                        mesh.set_clim(float(low), float(high))
-            self.ax_main.set_xlim(xmin, xmax)
-            self.ax_main.set_ylim(ymin, ymax)
+            low, high = self._scan_color_limits(self.ctx.trace.z2d)
+            mesh = self.ax_main.pcolormesh(
+                x_edges, y_edges, self.ctx.trace.z2d, shading="flat",
+                cmap=self._scan_colormap_name(), vmin=low, vmax=high,
+            )
             # The axes box is already fitted to the scan's physical aspect by
             # _configure_scan2d_layout. Use datalim so a previously removed
             # twinx axis cannot make Matplotlib reject the deferred Qt draw.
-            self.ax_main.set_aspect("equal", adjustable="datalim")
+            if self.scan_equal_aspect_chk.isChecked():
+                self.ax_main.set_aspect("equal", adjustable="datalim")
+            else:
+                self.ax_main.set_aspect("auto")
             self.ax_main.set_xlabel(self._friendly_axis_label(self.ctx.trace.scan_axes[0] if len(self.ctx.trace.scan_axes) > 0 else "X"))
             self.ax_main.set_ylabel(self._friendly_axis_label(self.ctx.trace.scan_axes[1] if len(self.ctx.trace.scan_axes) > 1 else "Y"))
             self.ax_main.set_title(f"{self.ctx.trace.file_name} | 2D scan map")
@@ -5190,8 +5494,13 @@ class SmartFitterMainWindow(QMainWindow):
                 self.ax_main.axvline(cx, color="#90caf9", lw=1.0, ls="--")
                 self.ax_main.axhline(cy, color="#90caf9", lw=1.0, ls="--")
                 self.scan_cursor_lbl.setText(f"Cursor: x={cx:.6g}, y={cy:.6g}")
-            self.ax_main.set_xlim(xmin, xmax)
-            self.ax_main.set_ylim(ymin, ymax)
+            if self._scan_view_limits is None:
+                view_xlim, view_ylim = (xmin, xmax), (ymin, ymax)
+            else:
+                view_xlim, view_ylim = self._scan_view_limits
+            self.ax_main.set_xlim(*view_xlim)
+            self.ax_main.set_ylim(*view_ylim)
+            self._update_scan_view_fields(view_xlim, view_ylim)
             self.ax_res.set_visible(linecut is not None)
             if linecut is not None:
                 lx, ly, title = linecut

@@ -400,6 +400,7 @@ This release adds the following production features:
 - Analysis transforms are display/measurement tools: baseline removal, detrend, normalization, derivative, integral, uniform resampling, and safe vector expressions. The fitting pipeline remains on the pre-transform processed data, so fit parameters retain their experiment-model meaning.
 - Plot clicks create a temporary yellow inspection marker. Clicking the same point again, pressing `Escape`, or using `Clear marker` removes that marker and its legend entry without changing or excluding any measured data.
 - `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
+- A contextual 2D toolbar appears above the plot for scan maps. It controls colormap/reversal, auto versus percentile-robust versus manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, and equal-axis scaling. Color settings are shared with Scan Explorer and persisted in `QSettings`.
 
 ## 17) Plugin spec for custom model
 

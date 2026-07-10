@@ -169,6 +169,7 @@ def test_gui_scan_visibility_and_summary_for_2d_scan():
 
     assert win.ctx.trace is not None
     assert win.ctx.trace.scan_dim == "scan2d"
+    assert not win.scan_quick_bar.isHidden()
     assert not win.scan_tools_box.isHidden()
     assert win.strategy_box.isHidden()
     assert win.btn_fit.isHidden()
@@ -179,6 +180,46 @@ def test_gui_scan_visibility_and_summary_for_2d_scan():
     x_edges, y_edges, extent = win._scan2d_extent(win.ctx.trace)
     assert np.allclose(win.ax_main.get_xlim(), (extent[0], extent[1]))
     assert np.allclose(win.ax_main.get_ylim(), (extent[2], extent[3]))
+
+
+def test_gui_2d_quick_controls_update_color_limits_and_view():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+
+    finite = np.asarray(win.ctx.trace.z2d, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    low, high = [float(value) for value in np.percentile(finite, [10, 90])]
+    win.scan_colormap_combo.setCurrentText("magma")
+    win.scan_scale_combo.setCurrentText("Manual")
+    win.scan_vmin_edit.setText(f"{low:.12g}")
+    win.scan_vmax_edit.setText(f"{high:.12g}")
+    win._apply_manual_scan_color_limits()
+
+    mesh = win.ax_main.collections[0]
+    assert mesh.get_cmap().name == "magma"
+    assert mesh.get_clim() == pytest.approx((low, high))
+    assert win.scan_workspace_colormap_combo.currentText() == "magma"
+    assert win.scan_workspace_scale_combo.currentText() == "Manual"
+
+    _x_edges, _y_edges, extent = win._scan2d_extent(win.ctx.trace)
+    xlim = (extent[0] + 0.15 * (extent[1] - extent[0]), extent[1] - 0.15 * (extent[1] - extent[0]))
+    ylim = (extent[2] + 0.20 * (extent[3] - extent[2]), extent[3] - 0.20 * (extent[3] - extent[2]))
+    for edit, value in ((win.scan_xmin_edit, xlim[0]), (win.scan_xmax_edit, xlim[1]), (win.scan_ymin_edit, ylim[0]), (win.scan_ymax_edit, ylim[1])):
+        edit.setText(f"{value:.12g}")
+    win._apply_scan_view_limits()
+    assert win.ax_main.get_xlim() == pytest.approx(xlim)
+    assert win.ax_main.get_ylim() == pytest.approx(ylim)
+
+    before_xspan = np.ptp(win.ax_main.get_xlim())
+    event = SimpleNamespace(inaxes=win.ax_main, xdata=float(np.mean(xlim)), ydata=float(np.mean(ylim)), button="up")
+    win._on_scan_scroll(event)
+    assert np.ptp(win.ax_main.get_xlim()) < before_xspan
+
+    win._reset_scan_view()
+    assert win.ax_main.get_xlim() == pytest.approx((extent[0], extent[1]))
+    assert win.ax_main.get_ylim() == pytest.approx((extent[2], extent[3]))
     pos = win.ax_main.get_position()
     fig_w, fig_h = win.fig.get_size_inches()
     rendered_aspect = (pos.width * fig_w) / (pos.height * fig_h)
