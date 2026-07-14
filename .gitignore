@@ -8,6 +8,7 @@ __pycache__/
 .codex/
 .agents/
 .vscode/
+skills-lock.json
 
 # Generated analysis outputs and local session files
 Batch Processing Tests/
