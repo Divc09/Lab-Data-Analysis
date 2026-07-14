@@ -320,6 +320,36 @@ def test_gui_scan_click_selection_updates_cursor_on_wysiwyg_plot():
     assert any(np.allclose(line.get_xdata(), [x0, x0]) for line in win.ax_main.lines)
 
 
+def test_gui_cursor_linecuts_leave_navigation_mode_and_follow_selected_cell():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+
+    win.scan_pan_btn.click()
+    assert "pan" in str(win.toolbar.mode).lower()
+
+    win.scan_linecut_combo.setCurrentText("Cursor horizontal")
+    assert not str(win.toolbar.mode)
+    assert not win.scan_pan_btn.isChecked()
+    assert not win.scan_zoom_btn.isChecked()
+
+    row, col = 3, 7
+    x0 = float(win.ctx.trace.x2d[row, col])
+    y0 = float(win.ctx.trace.y2d[row, col])
+    win._on_plot_click(SimpleNamespace(dblclick=False, inaxes=win.ax_main, xdata=x0, ydata=y0))
+
+    assert win._scan_cursor == (x0, y0)
+    assert win.ax_res.get_visible()
+    assert np.allclose(win.ax_res.lines[0].get_xdata(), win.ctx.trace.x2d[row, :])
+    assert np.allclose(win.ax_res.lines[0].get_ydata(), win.ctx.trace.z2d[row, :])
+
+    win.scan_linecut_combo.setCurrentText("Cursor vertical")
+    assert win.ax_res.get_visible()
+    assert np.allclose(win.ax_res.lines[0].get_xdata(), win.ctx.trace.y2d[:, col])
+    assert np.allclose(win.ax_res.lines[0].get_ydata(), win.ctx.trace.z2d[:, col])
+
+
 def test_gui_exclusion_workflow_uses_selected_point_and_ranges():
     _app()
     win = SmartFitterMainWindow()

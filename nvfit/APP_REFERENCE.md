@@ -157,16 +157,27 @@ Mouse-wheel safety is enforced for combo/spin controls: wheel changes are ignore
 
 ### 8.2 Plot controls
 
-Current toggles/settings:
+The Plot section keeps the high-frequency data-layer toggles, overall trace style, figure size, and export DPI. Detailed presentation editing is centralized in the modeless **Plot Editor**, opened from **Edit plot...**, the plot context menu, or by double-clicking a legend, annotation, title, axis label, or tick label.
+
+The Plot Editor contains:
+
+- **Series & Legend**: editable labels and order, independent plot/legend visibility, color, line, marker, width, opacity, and global legend frame/layout controls.
+- **Annotation Lines**: ordered dynamic fit/metadata rows with separate live-plot and report visibility, editable labels, units, number formats, and custom static lines. Dynamic values update after a refit.
+- **Titles & Axes**: auto or custom titles/labels plus per-axis major/minor tick spacing, formatting, placement, appearance, and exact manual position/label tables.
+
+Edits update the WYSIWYG figure immediately. Current-file overrides survive redraws and same-file mode reloads but reset when a different primary file is selected. **Save as defaults** explicitly promotes the current presentation to future files; reset actions restore the saved or factory presentation.
+
+Base plot toggles/settings include:
 
 - Show data/smoothed/fit/ODMR peaks
 - Show residual subplot
-- Show legend
-- Legend location + font size
+- Observable and iteration layers
+- Confidence and Rabi-envelope layers
+- Overall plot style
 - Figure width/height
 - Save DPI
 
-These settings affect both live plot and exported figures.
+Presentation settings affect the live plot, clipboard image, PNG/PDF/SVG outputs, and annotated report figures. Batch CLI plots remain independent.
 
 ### 8.3 Parameter editor
 
@@ -213,7 +224,7 @@ Persistent controls live directly in the Plot, Annotation, Export, and Map secti
 
 Preferences are persisted via `QSettings("BacklundLab", "SmartFitterPy")`.
 
-Stored examples:
+Stored examples and migrated legacy settings:
 
 - figure size
 - save DPI
@@ -222,6 +233,8 @@ Stored examples:
 - series visibility toggles
 - export format toggles
 - report-content selector checkboxes
+
+Legacy legend/annotation preferences and session/preset fields are still read and mapped into the Plot Editor. Detailed per-series, line-by-line annotation, title, and tick overrides do not change the analysis-session schema.
 
 ## 9) Export and output schema
 
@@ -396,6 +409,7 @@ This release adds the following production features:
 - `File > Save Analysis Session...` writes an atomic v2 `.nvfit-session.json` document and can read v1 sessions. It records source fingerprints, overlays/baselines, profile/model choices, locks, preprocessing, masks, transforms, plot/map state, metadata, view limits, and valid fit state. Missing sources can be located interactively; changed sources invalidate stale fits.
 - Analysis transforms are display/measurement tools: baseline removal, detrend, normalization, derivative, integral, uniform resampling, and safe vector expressions. The fitting pipeline remains on the pre-transform processed data, so fit parameters retain their experiment-model meaning.
 - Plot clicks create a temporary yellow inspection marker that is excluded from the legend. Clicking the same point again, pressing `Escape`, or using `Clear` removes it without changing or excluding measured data.
+- Double-clicking presentation objects takes priority over point inspection and opens the Plot Editor at the matching series, annotation, title/label, or tick section.
 - `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
 - A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, optional equal-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
 

@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 from matplotlib import colormaps
+from matplotlib.colors import to_hex
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -110,6 +111,17 @@ from .profiles import PROFILES, FitProfile, classify_status
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
 from .sessions import load_session, resolve_source, save_session, source_descriptor
+from .plot_presentation import (
+    AnnotationDescriptor,
+    AnnotationOverride,
+    PlotEditorDialog,
+    PlotPresentationState,
+    SeriesDescriptor,
+    apply_series_override,
+    apply_tick_style,
+    format_annotation_value,
+    resolved_series,
+)
 
 
 FitContext = AnalysisDocument
@@ -477,6 +489,17 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.sample_metadata = {}
         self.settings = QSettings("BacklundLab", "SmartFitterPy")
         self.plot_opts = PlotOptions()
+        self.presentation_factory = PlotPresentationState()
+        self.presentation_defaults = self.presentation_factory.clone()
+        self.presentation_state = self.presentation_defaults.clone()
+        self.plot_editor: PlotEditorDialog | None = None
+        self._series_registry: list[SeriesDescriptor] = []
+        self._active_legend = None
+        self._plot_annotation_artist = None
+        self._detail_axis_role = "residual"
+        self._comparison_plot_data: tuple[list[float], list[str], str] | None = None
+        self._presentation_source: str | None = None
+        self._applying_presentation_change = False
         self.span_selector = None  # legacy sessions may still reference range masks
         self.main_splitter: QSplitter | None = None
         self._startup_splitter_applied = False
@@ -530,6 +553,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._install_dirty_tracking()
         self._load_preferences()
         self._apply_plot_controls_to_state()
+        self._initialize_presentation_state()
         self._apply_figure_size()
         self._apply_theme()
         self._update_trace_mode_visibility()
@@ -1561,7 +1585,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.legend_loc_combo.addItems(["best", "upper right", "upper left", "lower right", "lower left"])
         self.legend_loc_combo.setToolTip("Legend anchor location on plot.")
         self.legend_loc_combo.currentTextChanged.connect(self._refresh_plot_only)
-        plot_gl.addWidget(QLabel("Legend location"), 12, 0)
+        self.legend_loc_label = QLabel("Legend location")
+        self.legend_loc_label.setProperty("drawerHidden", True)
+        plot_gl.addWidget(self.legend_loc_label, 12, 0)
         plot_gl.addWidget(self.legend_loc_combo, 12, 1)
 
         self.legend_font_spin = NoScrollSpinBox()
@@ -1569,8 +1595,25 @@ class SmartFitterMainWindow(QMainWindow):
         self.legend_font_spin.setValue(9)
         self.legend_font_spin.setToolTip("Legend text size.")
         self.legend_font_spin.valueChanged.connect(self._refresh_plot_only)
-        plot_gl.addWidget(QLabel("Legend font"), 13, 0)
+        self.legend_font_label = QLabel("Legend font")
+        self.legend_font_label.setProperty("drawerHidden", True)
+        plot_gl.addWidget(self.legend_font_label, 13, 0)
         plot_gl.addWidget(self.legend_font_spin, 13, 1)
+
+        self.edit_plot_btn = QPushButton("Edit plot…")
+        self.edit_plot_btn.setToolTip("Edit legend entries, annotation lines, titles, axis labels, and ticks.")
+        self.edit_plot_btn.clicked.connect(self._open_plot_editor)
+        plot_gl.addWidget(self.edit_plot_btn, 12, 0, 2, 2)
+        for widget in (
+            self.show_legend_chk,
+            self.legend_compact_chk,
+            self.legend_loc_combo,
+            self.legend_font_spin,
+            self.legend_loc_label,
+            self.legend_font_label,
+        ):
+            widget.setProperty("drawerHidden", True)
+            widget.setVisible(False)
 
         self.fig_w_spin = NoScrollDoubleSpinBox()
         self.fig_w_spin.setRange(4.0, 30.0)
@@ -1646,6 +1689,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.ann_params_chk.toggled.connect(self._refresh_plot_only)
         ann_gl.addWidget(self.ann_params_chk, 6, 0, 1, 2)
         right_inner_layout.addWidget(annotation_box)
+        annotation_box.setVisible(False)
 
         self.scan_tools_box = QGroupBox("Scan")
         scan_gl = QGridLayout(self.scan_tools_box)
@@ -1661,7 +1705,7 @@ class SmartFitterMainWindow(QMainWindow):
         scan_gl.addWidget(self.scan_cursor_lbl, 1, 0, 1, 2)
         self.scan_linecut_combo = NoScrollComboBox()
         self.scan_linecut_combo.addItems(["None", "Cursor horizontal", "Cursor vertical", "Best-point horizontal", "Best-point vertical"])
-        self.scan_linecut_combo.currentTextChanged.connect(self._refresh_plot_only)
+        self.scan_linecut_combo.currentTextChanged.connect(self._on_scan_linecut_changed)
         self.scan_linecut_lbl = QLabel("Linecut view")
         scan_gl.addWidget(self.scan_linecut_lbl, 2, 0)
         scan_gl.addWidget(self.scan_linecut_combo, 2, 1)
@@ -1778,6 +1822,8 @@ class SmartFitterMainWindow(QMainWindow):
         ex_gl.addWidget(self.exp_csv_chk, 6, 0)
         ex_gl.addWidget(self.exp_origin_chk, 6, 1)
         self.report_content_lbl = QLabel("Report content")
+        self.report_content_lbl.setProperty("drawerHidden", True)
+        self.report_content_lbl.setVisible(False)
         ex_gl.addWidget(self.report_content_lbl, 7, 0, 1, 2)
         self.report_metric_checks: dict[str, QCheckBox] = {}
         self.fit_export_widgets = [self.btn_fit, self.btn_robust_fit, self.fit_help_lbl, self.exp_report_png_chk, self.exp_report_pdf_chk, self.report_content_lbl]
@@ -1811,6 +1857,8 @@ class SmartFitterMainWindow(QMainWindow):
             chk = QCheckBox(label)
             chk.setChecked(key in {"r2", "rmse", "T2_star_ns", "T1_ns", "T2rho_ns", "pi_time_ns", "delay_ns", "rabi_freq_MHz", "D", "E", "fwhm"})
             self.report_metric_checks[key] = chk
+            chk.setProperty("drawerHidden", True)
+            chk.setVisible(False)
             self.fit_export_widgets.append(chk)
             ex_gl.addWidget(chk, rr, cc)
             cc += 1
@@ -1861,6 +1909,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_group_collapsible(meta_box, checked=False)
         self._set_group_collapsible(plot_box, checked=False)
         self._set_group_collapsible(annotation_box, checked=False)
+        annotation_box.setVisible(False)
         self._set_group_collapsible(self.scan_tools_box, checked=False)
         self._set_group_collapsible(action_box, checked=False)
         self._set_group_collapsible(param_box, checked=False)
@@ -2485,6 +2534,25 @@ class SmartFitterMainWindow(QMainWindow):
         self._update_scan_view_fields((xmin, xmax), (ymin, ymax))
         self.canvas.draw_idle()
 
+    def _deactivate_scan_navigation(self) -> None:
+        """Return the map to point-picking mode without changing its view."""
+        mode = str(self.toolbar.mode).lower()
+        if "pan" in mode:
+            self.toolbar.pan()
+        elif "zoom" in mode:
+            self.toolbar.zoom()
+        for button in (self.scan_pan_btn, self.scan_zoom_btn):
+            button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(False)
+
+    def _on_scan_linecut_changed(self, mode: str) -> None:
+        if mode.startswith("Cursor"):
+            self._deactivate_scan_navigation()
+            if self._scan_cursor is None:
+                self.statusBar().showMessage("Click the 2D map to choose the cursor linecut", 4000)
+        self._refresh_plot_only()
+
     def _toggle_scan_pan(self, checked: bool):
         mode = str(self.toolbar.mode).lower()
         if checked:
@@ -2811,6 +2879,9 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _show_plot_context_menu(self, position) -> None:
         menu = QMenu(self)
+        edit_action = menu.addAction("Edit plot…")
+        edit_action.triggered.connect(self._open_plot_editor)
+        menu.addSeparator()
         copy_action = menu.addAction("Copy figure")
         copy_action.triggered.connect(self.copy_export_figure)
         save_action = menu.addAction("Save results…")
@@ -3457,6 +3528,115 @@ class SmartFitterMainWindow(QMainWindow):
     def _open_batch_dialog(self):
         self._set_workspace_mode(1)
 
+    def _legacy_presentation_state(self) -> PlotPresentationState:
+        """Translate the existing PlotOptions/QSettings surface into editor defaults."""
+        state = PlotPresentationState()
+        state.legend.visible = bool(self.plot_opts.show_legend)
+        state.legend.location = str(self.plot_opts.legend_loc)
+        state.legend.font_size = int(self.plot_opts.legend_font_size)
+        state.annotation_style.mode = str(self.plot_opts.annotation_mode)
+        state.annotation_style.visible = state.annotation_style.mode != "Off"
+        state.annotation_style.location = str(self.plot_opts.annotation_loc)
+        state.annotation_style.font_size = int(self.plot_opts.annotation_font_size)
+        return state
+
+    def _initialize_presentation_state(self) -> None:
+        self.presentation_factory = PlotPresentationState()
+        saved = self.settings.value("presentation/defaults_v1", "")
+        if saved:
+            try:
+                defaults = PlotPresentationState.from_json(str(saved))
+            except Exception:
+                defaults = self._legacy_presentation_state()
+        else:
+            defaults = self._legacy_presentation_state()
+        self.presentation_defaults = defaults
+        self.presentation_state = defaults.clone()
+
+    def _sync_presentation_from_legacy_options(self) -> None:
+        """Keep old session/preset payloads meaningful without serializing new overrides."""
+        state = self.presentation_state
+        state.legend.visible = bool(self.plot_opts.show_legend)
+        state.legend.location = str(self.plot_opts.legend_loc)
+        state.legend.font_size = int(self.plot_opts.legend_font_size)
+        state.annotation_style.mode = str(self.plot_opts.annotation_mode)
+        state.annotation_style.visible = state.annotation_style.mode != "Off"
+        state.annotation_style.location = str(self.plot_opts.annotation_loc)
+        state.annotation_style.font_size = int(self.plot_opts.annotation_font_size)
+
+    def _open_plot_editor(self, _checked: bool = False, *, section: str = "series", axis_role: str | None = None, dimension: str | None = None) -> None:
+        if self.plot_editor is None:
+            self.plot_editor = PlotEditorDialog(self)
+        self.plot_editor.open_for(section, axis_role=axis_role, dimension=dimension)
+
+    def _on_presentation_changed(self) -> None:
+        self._applying_presentation_change = True
+        try:
+            if self.ctx.trace is not None:
+                self._refresh_plot_only()
+            else:
+                self.canvas.draw_idle()
+        finally:
+            self._applying_presentation_change = False
+
+    def _refresh_open_plot_editor(self) -> None:
+        if self.plot_editor is not None and self.plot_editor.isVisible() and not self._applying_presentation_change:
+            self.plot_editor.refresh()
+
+    def _save_presentation_defaults(self) -> None:
+        self.presentation_defaults = self.presentation_state.clone()
+        self.settings.setValue("presentation/defaults_v1", self.presentation_defaults.to_json())
+        self.statusBar().showMessage("Plot presentation saved as the default", 4000)
+
+    def _reset_presentation_current(self) -> None:
+        self.presentation_state = self.presentation_defaults.clone()
+        self._on_presentation_changed()
+        if self.plot_editor is not None:
+            self.plot_editor.refresh()
+
+    def _restore_presentation_factory(self) -> None:
+        self.settings.remove("presentation/defaults_v1")
+        for key in (
+            "plot/show_legend",
+            "plot/legend_loc",
+            "plot/legend_font_size",
+            "plot/legend_compact_labels",
+            "plot/annotation_mode",
+            "plot/annotation_loc",
+            "plot/annotation_font_size",
+            "plot/annotation_file_model",
+            "plot/annotation_fit_metrics",
+            "plot/annotation_t2rho",
+            "plot/annotation_nv_metrics",
+            "plot/annotation_params",
+        ):
+            self.settings.remove(key)
+        self.presentation_defaults = self.presentation_factory.clone()
+        self.presentation_state = self.presentation_factory.clone()
+        self._on_presentation_changed()
+        if self.plot_editor is not None:
+            self.plot_editor.refresh()
+        self.statusBar().showMessage("Factory plot presentation restored", 4000)
+
+    def _reset_presentation_for_source(self, source_path: str) -> None:
+        resolved = str(Path(source_path).resolve())
+        if self._presentation_source is not None and self._presentation_source != resolved:
+            self.presentation_state = self.presentation_defaults.clone()
+            self._comparison_plot_data = None
+            if self.plot_editor is not None:
+                self.plot_editor.refresh()
+        self._presentation_source = resolved
+
+    def _active_presentation_axis_roles(self) -> list[str]:
+        roles = ["main"]
+        if self._ax_secondary is not None and self._ax_secondary.get_visible():
+            roles.append("secondary")
+        if self.ax_res.get_visible():
+            roles.append(self._detail_axis_role)
+        if self._scan_colorbar_ax is not None and self._scan_colorbar_ax.get_visible():
+            roles.append("colorbar")
+        return list(dict.fromkeys(roles))
+
     def _save_preferences(self):
         self._apply_plot_controls_to_state()
         if self.main_splitter is not None:
@@ -3999,21 +4179,33 @@ class SmartFitterMainWindow(QMainWindow):
         if rows:
             self.summary_text.setPlainText("Comparison\n" + "\n".join(rows))
         if vals:
-            self.ax_res.clear()
-            self.ax_res.plot(np.arange(len(vals)), vals, "o-")
-            self.ax_res.set_xticks(np.arange(len(vals)))
-            self.ax_res.set_xticklabels([f"{i+1}" for i in range(len(vals))], rotation=0)
-            self.ax_res.set_ylabel(metric)
-            self.ax_res.set_xlabel("Trace index")
-            self.ax_res.grid(True, alpha=0.3)
-            self.ax_res.set_title("Comparison plot (see summary for filename map)")
+            self._comparison_plot_data = (list(vals), list(labels), metric)
+            self._draw_comparison_panel()
+            self._apply_axes_visual_style()
+            self._apply_all_axis_presentation()
             self.canvas.draw_idle()
+
+    def _draw_comparison_panel(self) -> None:
+        if self._comparison_plot_data is None:
+            return
+        vals, _labels, metric = self._comparison_plot_data
+        self._detail_axis_role = "comparison"
+        self.ax_res.clear()
+        self.ax_res.set_visible(True)
+        self.ax_res.plot(np.arange(len(vals)), vals, "o-")
+        self.ax_res.set_xticks(np.arange(len(vals)))
+        self.ax_res.set_xticklabels([f"{i+1}" for i in range(len(vals))], rotation=0)
+        self.ax_res.set_ylabel(metric)
+        self.ax_res.set_xlabel("Trace index")
+        self.ax_res.grid(True, alpha=0.3)
+        self.ax_res.set_title("Comparison plot (see summary for filename map)")
 
     def on_overlay_set_primary(self, item: QListWidgetItem):
         nm = item.text()
         if not self.ctx.loaded_traces or nm not in self.ctx.loaded_traces:
             return
         self.ctx.trace = self.ctx.loaded_traces[nm]
+        self._reset_presentation_for_source(self.ctx.trace.source_path)
         self.ctx.fit_result = None
         self.ctx.fit_target = None
         self.ctx.odmr_peaks = None
@@ -4129,6 +4321,12 @@ class SmartFitterMainWindow(QMainWindow):
         return x[keep], y[keep]
 
     def _on_plot_click(self, event):
+        if bool(getattr(event, "dblclick", False)):
+            target = self._editable_plot_target(event)
+            if target is not None:
+                section, role, dimension = target
+                self._open_plot_editor(section=section, axis_role=role, dimension=dimension)
+                return
         if str(getattr(self.toolbar, "mode", "")):
             return
         if event.inaxes not in self._inspectable_axes():
@@ -4138,6 +4336,40 @@ class SmartFitterMainWindow(QMainWindow):
             return
         if mode == "Inspect point":
             self._select_point_from_plot(float(event.xdata), float(event.ydata) if event.ydata is not None else None)
+
+    def _editable_plot_target(self, event) -> tuple[str, str | None, str | None] | None:
+        if self._active_legend is not None:
+            try:
+                if self._active_legend.contains(event)[0]:
+                    return "series", None, None
+            except Exception:
+                pass
+        if self._plot_annotation_artist is not None:
+            try:
+                if self._plot_annotation_artist.contains(event)[0]:
+                    return "annotation", None, None
+            except Exception:
+                pass
+        for role, ax in self._presentation_axis_map().items():
+            for artist, field in ((ax.title, "title"), (ax.xaxis.label, "xlabel"), (ax.yaxis.label, "ylabel")):
+                try:
+                    if artist.get_visible() and artist.contains(event)[0]:
+                        return "axes", role, field
+                except Exception:
+                    continue
+            for label in ax.get_xticklabels():
+                try:
+                    if label.get_visible() and label.contains(event)[0]:
+                        return "axes", role, "x"
+                except Exception:
+                    continue
+            for label in ax.get_yticklabels():
+                try:
+                    if label.get_visible() and label.contains(event)[0]:
+                        return "axes", role, "y"
+                except Exception:
+                    continue
+        return None
 
     def on_save_preset(self):
         out, _ = QFileDialog.getSaveFileName(self, "Save analysis preset", "", "Preset JSON (*.json)")
@@ -4275,6 +4507,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.annotation_loc_combo.setCurrentText(str(self.plot_opts.annotation_loc))
         self.annotation_font_spin.setValue(int(self.plot_opts.annotation_font_size))
         self.plot_style_combo.setCurrentText(str(self.plot_opts.plot_style))
+        if hasattr(self, "presentation_state"):
+            self._sync_presentation_from_legacy_options()
 
     def on_save_session(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save analysis session", "", "SmartFitter session (*.nvfit-session.json)")
@@ -4544,6 +4778,7 @@ class SmartFitterMainWindow(QMainWindow):
             self._is_loading = False
             self._message("Load error", f"Loaded trace is empty after applying observable mode '{self._friendly_mode_name(mode)}'.")
             return False
+        self._reset_presentation_for_source(trace.source_path)
         self.ctx.trace = trace
         if hasattr(self, "plot_stack"):
             self.plot_stack.setCurrentIndex(1)
@@ -4756,13 +4991,14 @@ class SmartFitterMainWindow(QMainWindow):
                 secondary_layers.append((lx, ly, label, color))
             else:
                 primary_series.append(np.asarray(ly, dtype=float))
-                self._plot_series(self.ax_main, lx, ly, self._legend_label(label, mode.title()), role="overlay", color=color, alpha=0.65)
+                self._plot_series(self.ax_main, lx, ly, self._legend_label(label, mode.title()), role="overlay", series_id=f"observable:{mode}", color=color, alpha=0.65)
         if secondary_layers:
             if self._ax_secondary is None:
                 self._ax_secondary = self.ax_main.twinx()
             for lx, ly, label, color in secondary_layers:
                 self._secondary_series.append(np.asarray(ly, dtype=float))
-                self._plot_series(self._ax_secondary, lx, ly, self._legend_label(label, label.split()[0]), role="overlay", color=color, alpha=0.7)
+                mode_key = "signal" if "signal" in label.lower() else ("reference" if "reference" in label.lower() else "difference")
+                self._plot_series(self._ax_secondary, lx, ly, self._legend_label(label, label.split()[0]), role="overlay", series_id=f"observable:{mode_key}", color=color, alpha=0.7)
             labels = [label for _, _, label, _ in secondary_layers]
             ylabel = "Counts" if any("counts" in label.lower() for label in labels) else labels[0]
             self._ax_secondary.set_ylabel(ylabel)
@@ -4791,6 +5027,7 @@ class SmartFitterMainWindow(QMainWindow):
                     iy,
                     self._legend_label(label_text, short_text),
                     role="overlay",
+                    series_id=f"iteration:{iter_idx}",
                     color="#c678dd",
                     alpha=0.32,
                 )
@@ -4807,6 +5044,7 @@ class SmartFitterMainWindow(QMainWindow):
                     mean,
                     self._legend_label("Iteration mean", "Iter mean"),
                     role="overlay",
+                    series_id="iteration:mean",
                     color="#e0af68",
                     alpha=0.9,
                 )
@@ -4815,7 +5053,7 @@ class SmartFitterMainWindow(QMainWindow):
                     std = np.nanstd(matrix, axis=1, ddof=1 if matrix.shape[1] > 1 else 0)
                 std[finite_counts == 0] = np.nan
                 if self.plot_opts.iteration_std_mode == "Error bars":
-                    self.ax_main.errorbar(
+                    container = self.ax_main.errorbar(
                         ix,
                         mean,
                         yerr=std,
@@ -4826,17 +5064,39 @@ class SmartFitterMainWindow(QMainWindow):
                         alpha=0.45,
                         label=self._legend_label("Iteration std", "Iter std"),
                     )
+                    artists = [artist for group in container.lines for artist in ((group if isinstance(group, tuple) else (group,)) if group is not None else ())]
+                    self._register_series(
+                        "iteration:std",
+                        self._legend_label("Iteration std", "Iter std"),
+                        artists,
+                        handle=container,
+                        axis=self.ax_main,
+                        supports_marker=False,
+                        x_values=[ix],
+                        y_values=[mean - std, mean + std],
+                    )
                 else:
                     lo = mean - std
                     hi = mean + std
                     primary_series.extend([np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)])
-                    self.ax_main.fill_between(
+                    band = self.ax_main.fill_between(
                         ix,
                         lo,
                         hi,
                         color="#c678dd",
                         alpha=0.16,
                         label=self._legend_label("Iteration +/- std", "Iter +/- std"),
+                    )
+                    self._register_series(
+                        "iteration:std",
+                        self._legend_label("Iteration +/- std", "Iter +/- std"),
+                        [band],
+                        handle=band,
+                        axis=self.ax_main,
+                        supports_line=False,
+                        supports_marker=False,
+                        x_values=[ix],
+                        y_values=[lo, hi],
                     )
 
     def _friendly_axis_label(self, axis_label: str | None) -> str:
@@ -4927,10 +5187,127 @@ class SmartFitterMainWindow(QMainWindow):
             return "-", {"lw": 1.8, "alpha": 0.9}
         return "o-", {"ms": 3.6, "lw": 1.2, "alpha": 0.78}
 
-    def _plot_series(self, ax, x: np.ndarray, y: np.ndarray, label: str, role: str = "data", **kwargs):
+    def _start_series_registry(self) -> None:
+        self._series_registry = []
+        self._active_legend = None
+
+    def _axis_role_for(self, ax) -> str:
+        if ax is self.ax_main:
+            return "main"
+        if ax is self._ax_secondary:
+            return "secondary"
+        if ax is self.ax_res:
+            return self._detail_axis_role
+        if ax is self._scan_colorbar_ax:
+            return "colorbar"
+        return "main"
+
+    def _register_series(
+        self,
+        series_id: str,
+        default_label: str,
+        artists: list[Any],
+        *,
+        handle=None,
+        axis=None,
+        supports_line: bool = True,
+        supports_marker: bool = True,
+        x_values: list[np.ndarray] | None = None,
+        y_values: list[np.ndarray] | None = None,
+    ) -> SeriesDescriptor:
+        artist = handle or (artists[0] if artists else None)
+        axis = axis or getattr(artist, "axes", self.ax_main)
+        def _read(method: str, default=None):
+            try:
+                return getattr(artist, method)()
+            except Exception:
+                return default
+        raw_color = _read("get_color", None)
+        if raw_color is None:
+            raw_color = _read("get_edgecolor", None)
+        try:
+            color = to_hex(raw_color, keep_alpha=False)
+        except Exception:
+            color = str(raw_color) if raw_color is not None else None
+        marker = _read("get_marker", None) if supports_marker else None
+        if marker in {"", " ", "none"}:
+            marker = "None"
+        descriptor = SeriesDescriptor(
+            series_id=series_id,
+            default_label=default_label,
+            artists=artists,
+            handle=artist,
+            axis=axis,
+            axis_role=self._axis_role_for(axis),
+            default_color=color,
+            default_linestyle=_read("get_linestyle", None) if supports_line else None,
+            default_marker=marker,
+            default_linewidth=_read("get_linewidth", None),
+            default_alpha=_read("get_alpha", None),
+            supports_line=supports_line,
+            supports_marker=supports_marker,
+            x_values=list(x_values or []),
+            y_values=list(y_values or []),
+            creation_order=len(self._series_registry),
+        )
+        self._series_registry.append(descriptor)
+        apply_series_override(descriptor, self.presentation_state.series.get(series_id))
+        return descriptor
+
+    def _presentation_series_descriptors(self) -> list[SeriesDescriptor]:
+        return list(self._series_registry)
+
+    def _style_external_series(
+        self,
+        series_id: str,
+        default_label: str,
+        artists: list[Any],
+        *,
+        handle=None,
+        axis=None,
+        supports_line: bool = True,
+        supports_marker: bool = True,
+    ) -> dict[str, Any]:
+        artist = handle or artists[0]
+        try:
+            color = to_hex(artist.get_color(), keep_alpha=False)
+        except Exception:
+            color = None
+        descriptor = SeriesDescriptor(
+            series_id=series_id,
+            default_label=default_label,
+            artists=artists,
+            handle=artist,
+            axis=axis,
+            axis_role="main",
+            default_color=color,
+            default_linestyle=getattr(artist, "get_linestyle", lambda: None)(),
+            default_marker=getattr(artist, "get_marker", lambda: None)(),
+            default_linewidth=getattr(artist, "get_linewidth", lambda: None)(),
+            default_alpha=getattr(artist, "get_alpha", lambda: None)(),
+            supports_line=supports_line,
+            supports_marker=supports_marker,
+        )
+        values = apply_series_override(descriptor, self.presentation_state.series.get(series_id))
+        try:
+            artist.set_label(values["label"] if values["show_series"] and values["show_legend"] else "_nolegend_")
+            artist.set_gid(series_id)
+        except Exception:
+            pass
+        return values
+
+    def _series_visible(self, series_id: str) -> bool:
+        override = self.presentation_state.series.get(series_id)
+        return True if override is None else bool(override.show_series)
+
+    def _plot_series(self, ax, x: np.ndarray, y: np.ndarray, label: str, role: str = "data", *, series_id: str | None = None, **kwargs):
         fmt, defaults = self._plot_style_for(role)
         plot_kwargs = {**defaults, **kwargs}
-        ax.plot(x, y, fmt, label=label, **plot_kwargs)
+        line = ax.plot(x, y, fmt, label=label, **plot_kwargs)[0]
+        if label != "_nolegend_":
+            sid = series_id or f"{role}:{re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')}"
+            self._register_series(sid, label, [line], handle=line, axis=ax, x_values=[np.asarray(x, dtype=float)], y_values=[np.asarray(y, dtype=float)])
+        return line
 
     def _plot_rabi_envelope(self, ax, x: np.ndarray, fit_result: FitResult, primary_series: list[np.ndarray] | None = None):
         if not self.plot_opts.show_rabi_envelope or not self.plot_opts.show_fit:
@@ -4945,10 +5322,26 @@ class SmartFitterMainWindow(QMainWindow):
         lower_disp, _ = self._display_y(np.asarray(lower, dtype=float))
         if primary_series is not None:
             primary_series.extend([np.asarray(upper_disp, dtype=float), np.asarray(lower_disp, dtype=float)])
-        ax.plot(x, upper_disp, "--", lw=1.5, color="#b57edc", alpha=0.95, label=self._legend_label("Rabi envelope", "Envelope"))
-        ax.plot(x, lower_disp, "--", lw=1.5, color="#b57edc", alpha=0.95, label="_nolegend_")
+        upper_line = ax.plot(x, upper_disp, "--", lw=1.5, color="#b57edc", alpha=0.95, label=self._legend_label("Rabi envelope", "Envelope"))[0]
+        lower_line = ax.plot(x, lower_disp, "--", lw=1.5, color="#b57edc", alpha=0.95, label="_nolegend_")[0]
+        self._register_series(
+            "rabi:envelope",
+            self._legend_label("Rabi envelope", "Envelope"),
+            [upper_line, lower_line],
+            handle=upper_line,
+            axis=ax,
+            x_values=[x],
+            y_values=[upper_disp, lower_disp],
+        )
+
+    def _split_label_units(self, label: str) -> tuple[str, str]:
+        match = re.search(r"\s*\[([^\]]+)\]\s*$", label)
+        if match is None:
+            return label, ""
+        return label[: match.start()].strip(), match.group(1).strip()
 
     def _annotation_lines_for_result(self, fit_result: FitResult) -> list[str]:
+        """Legacy text view retained for callers while the editor uses structured rows."""
         lines: list[str] = []
         if self.plot_opts.annotation_show_file_model and self.ctx.trace is not None:
             lines.append(self.ctx.trace.file_name)
@@ -4970,8 +5363,7 @@ class SmartFitterMainWindow(QMainWindow):
                 "rabi_envelope_beta": 6,
                 "rabi_envelope_r2": 7,
             }
-            separate_t2rho_keys = {"T2rho_ns", "rabi_envelope_decay_ns"}
-            items = [(key, value) for key, value in nv.items() if key not in separate_t2rho_keys]
+            items = [(key, value) for key, value in nv.items() if key not in {"T2rho_ns", "rabi_envelope_decay_ns"}]
             items.sort(key=lambda item: priority.get(item[0], 99))
             for key, value in items[: (4 if self.plot_opts.annotation_mode == "Compact" else 8)]:
                 lines.append(f"{self._metric_display_label(key)}: {self._format_value_with_units(key, value)}")
@@ -4985,6 +5377,99 @@ class SmartFitterMainWindow(QMainWindow):
         if fit_result.selection_note and self.plot_opts.annotation_mode == "Detailed":
             lines.append(f"Selection: {fit_result.selection_note}")
         return lines
+
+    def _presentation_annotation_descriptors(self) -> list[AnnotationDescriptor]:
+        result = self.ctx.fit_result
+        mode = self.presentation_state.annotation_style.mode
+        compact = mode == "Compact"
+        descriptors: list[AnnotationDescriptor] = []
+
+        def add(key: str, label: str, value: Any, *, units: str = "", plot: bool = True, report: bool = True, numeric: bool = False):
+            descriptors.append(
+                AnnotationDescriptor(
+                    key=key,
+                    default_label=label,
+                    value=value,
+                    default_units=units,
+                    default_show_plot=plot,
+                    default_show_report=report,
+                    numeric=numeric,
+                    creation_order=len(descriptors),
+                )
+            )
+
+        trace = self.ctx.trace
+        if trace is not None:
+            add("file", "", trace.file_name, plot=self.plot_opts.annotation_show_file_model, report=True)
+            add("profile", "Profile", self._active_profile().name, plot=False, report=True)
+            add("status", "Status", self.ctx.status, plot=False, report=True)
+        if result is None:
+            return descriptors
+        add("model", "Analysis mode", result.model_name, plot=self.plot_opts.annotation_show_file_model, report=True)
+        add("metric:r2", "R^2", result.r2, plot=self.plot_opts.annotation_show_fit_metrics, report=self.report_metric_checks["r2"].isChecked(), numeric=True)
+        add("metric:rmse", "RMSE", result.rmse, plot=self.plot_opts.annotation_show_fit_metrics, report=self.report_metric_checks["rmse"].isChecked(), numeric=True)
+        add("metric:durbin_watson", "Durbin-Watson", result.durbin_watson, plot=self.plot_opts.annotation_show_fit_metrics, report=False, numeric=True)
+
+        nv = _nv_metrics(self._active_profile().name, result, self._effective_trace_metadata())
+        priority = {
+            "T2rho_ns": 0,
+            "rabi_freq_MHz": 1,
+            "pi_time_ns": 2,
+            "pi_over_2_time_ns": 3,
+            "first_peak_ns": 4,
+            "delay_ns": 5,
+            "rabi_envelope_beta": 6,
+            "rabi_envelope_r2": 7,
+        }
+        nv_items = sorted(nv.items(), key=lambda item: priority.get(item[0], 99))
+        visible_nv = 4 if compact else 8
+        nv_visible_index = 0
+        for key, value in nv_items:
+            raw_label = self._metric_display_label(key)
+            label, units = self._split_label_units(raw_label)
+            allowed = self.plot_opts.annotation_show_t2rho if key == "T2rho_ns" else self.plot_opts.annotation_show_nv_metrics
+            show = bool(allowed and nv_visible_index < visible_nv)
+            if allowed:
+                nv_visible_index += 1
+            report_default = self.report_metric_checks.get(key).isChecked() if key in self.report_metric_checks else False
+            add(f"nv:{key}", label, value, units=units, plot=show, report=report_default, numeric=True)
+
+        pairs = list(zip(result.param_names, result.params))
+        param_priority = {"t0": 0, "f": 1, "tau": 2, "A": 3, "x0": 4, "w": 5}
+        pairs.sort(key=lambda item: param_priority.get(item[0], 99))
+        max_params = 3 if compact else 6
+        for index, (name, value) in enumerate(pairs):
+            meta = PARAM_METADATA.get(name)
+            units = "" if meta is None or meta.units in {"-", "arb."} else meta.units
+            add(f"param:{name}", self._friendly_param_name(name), float(value), units=units, plot=self.plot_opts.annotation_show_params and index < max_params, report=index < 6, numeric=True)
+        if result.selection_note:
+            add("selection", "Selection", result.selection_note, plot=mode == "Detailed", report=False)
+        return descriptors
+
+    def _annotation_lines(self, *, context: str) -> list[str]:
+        descriptors = self._presentation_annotation_descriptors()
+        known = {descriptor.key for descriptor in descriptors}
+        rows: list[tuple[int, str]] = []
+        for descriptor in descriptors:
+            override = self.presentation_state.annotations.get(descriptor.key) or AnnotationOverride()
+            visible = override.show_plot if context == "plot" else override.show_report
+            if visible is None:
+                visible = descriptor.default_show_plot if context == "plot" else descriptor.default_show_report
+            if not visible:
+                continue
+            label = descriptor.default_label if override.label is None else override.label
+            value = format_annotation_value(descriptor, override)
+            line = value if not label else f"{label}: {value}"
+            order = descriptor.creation_order if override.order is None else override.order
+            rows.append((order, line))
+        for key, override in self.presentation_state.annotations.items():
+            if key in known or override.static_text is None:
+                continue
+            visible = override.show_plot if context == "plot" else override.show_report
+            if visible is not False:
+                rows.append((10_000 if override.order is None else override.order, override.static_text))
+        rows.sort(key=lambda item: item[0])
+        return [line for _, line in rows if line]
 
     def _update_point_readout(self, text: str):
         if hasattr(self, "point_readout_lbl"):
@@ -5271,7 +5756,10 @@ class SmartFitterMainWindow(QMainWindow):
         return default_label
 
     def _annotation_anchor(self) -> tuple[float, float, str, str]:
-        loc = self.plot_opts.annotation_loc
+        style = self.presentation_state.annotation_style
+        if style.custom_anchor:
+            return style.anchor_x, style.anchor_y, style.horizontal_alignment, style.vertical_alignment
+        loc = style.location
         mapping = {
             "upper right": (0.98, 0.98, "right", "top"),
             "upper left": (0.02, 0.98, "left", "top"),
@@ -5280,23 +5768,30 @@ class SmartFitterMainWindow(QMainWindow):
         }
         return mapping.get(loc, mapping["upper right"])
 
-    def _draw_plot_annotation(self, fit_result: FitResult):
-        if self.plot_opts.annotation_mode == "Off":
+    def _draw_plot_annotation(self, fit_result: FitResult | None):
+        style = self.presentation_state.annotation_style
+        self._plot_annotation_artist = None
+        if not style.visible or style.mode == "Off":
             return
-        lines = self._annotation_lines_for_result(fit_result)
+        lines = self._annotation_lines(context="plot")
         if not lines:
             return
         x, y, ha, va = self._annotation_anchor()
-        self.ax_main.text(
+        self._plot_annotation_artist = self.ax_main.text(
             x,
             y,
             "\n".join(lines),
             transform=self.ax_main.transAxes,
-            fontsize=self.plot_opts.annotation_font_size,
+            fontsize=style.font_size,
             ha=ha,
             va=va,
-            color="#f5fbff",
-            bbox={"boxstyle": "round,pad=0.35", "facecolor": (0.08, 0.10, 0.15, 0.82), "edgecolor": "#93c5fd"},
+            color=style.text_color,
+            bbox={
+                "boxstyle": f"round,pad={style.padding}",
+                "facecolor": style.background_color,
+                "edgecolor": style.edge_color,
+                "alpha": style.background_alpha,
+            },
         )
 
     def _clear_secondary_axis(self):
@@ -5438,7 +5933,16 @@ class SmartFitterMainWindow(QMainWindow):
         _, sec_label = self._series_for_mode(self.ctx.trace, secondary)
         if self._ax_secondary is None:
             self._ax_secondary = self.ax_main.twinx()
-        self._plot_series(self._ax_secondary, sec_x, sec_y, self._legend_label(f"{secondary.title()} axis", secondary.title()), role="overlay", color="#ff8a65", alpha=0.75)
+        self._plot_series(
+            self._ax_secondary,
+            sec_x,
+            sec_y,
+            self._legend_label(f"{secondary.title()} axis", secondary.title()),
+            role="overlay",
+            series_id=f"secondary:{secondary}",
+            color="#ff8a65",
+            alpha=0.75,
+        )
         existing_label = self._ax_secondary.get_ylabel()
         if existing_label and existing_label != sec_label:
             self._ax_secondary.set_ylabel(f"{existing_label} / {sec_label}")
@@ -5452,25 +5956,47 @@ class SmartFitterMainWindow(QMainWindow):
         self._secondary_plot_data = (np.asarray(sec_x, dtype=float), np.asarray(sec_y, dtype=float), sec_label)
 
     def _apply_combined_legend(self):
-        if not self.plot_opts.show_legend:
+        style = self.presentation_state.legend
+        self._active_legend = None
+        if not style.visible:
             return
-        handles, labels = self.ax_main.get_legend_handles_labels()
-        if self._ax_secondary is not None:
-            h2, l2 = self._ax_secondary.get_legend_handles_labels()
-            handles += h2
-            labels += l2
-        if handles:
+        entries: list[tuple[int, Any, str]] = []
+        for descriptor in self._series_registry:
+            values = resolved_series(descriptor, self.presentation_state.series.get(descriptor.series_id))
+            if values["show_series"] and values["show_legend"] and descriptor.handle is not None:
+                entries.append((int(values["order"]), descriptor.handle, str(values["label"])))
+        entries.sort(key=lambda item: item[0])
+        if entries:
+            handles = [item[1] for item in entries]
+            labels = [item[2] for item in entries]
+            legend_kwargs: dict[str, Any] = {
+                "loc": style.location,
+                "fontsize": style.font_size,
+                "ncol": style.columns,
+                "frameon": style.frame_visible,
+                "fancybox": True,
+                "framealpha": style.frame_alpha,
+                "borderpad": style.border_pad,
+                "labelspacing": style.label_spacing,
+            }
+            if style.title:
+                legend_kwargs["title"] = style.title
+            if style.custom_anchor:
+                legend_kwargs["bbox_to_anchor"] = (style.anchor_x, style.anchor_y)
             legend = self.ax_main.legend(
                 handles,
                 labels,
-                loc=self.plot_opts.legend_loc,
-                fontsize=self.plot_opts.legend_font_size,
-                frameon=True,
-                fancybox=True,
-                framealpha=0.94,
+                **legend_kwargs,
             )
-            legend.get_frame().set_facecolor("#ffffff")
-            legend.get_frame().set_edgecolor("#c8d2cc")
+            self._active_legend = legend
+            if style.frame_visible:
+                legend.get_frame().set_facecolor(style.frame_color)
+                legend.get_frame().set_edgecolor(style.edge_color)
+                legend.get_frame().set_alpha(style.frame_alpha)
+            for text_item in legend.get_texts():
+                text_item.set_color(style.text_color)
+            if legend.get_title() is not None:
+                legend.get_title().set_color(style.text_color)
 
     def _apply_axes_visual_style(self):
         """Keep the scientific plot bright, quiet, and readable inside the dark workbench."""
@@ -5492,6 +6018,68 @@ class SmartFitterMainWindow(QMainWindow):
             self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=8)
             self._scan_colorbar.ax.yaxis.label.set_color("#26332d")
 
+    def _presentation_axis_map(self) -> dict[str, Any]:
+        axes: dict[str, Any] = {"main": self.ax_main}
+        if self._ax_secondary is not None and self._ax_secondary.get_visible():
+            axes["secondary"] = self._ax_secondary
+        if self.ax_res.get_visible():
+            axes[self._detail_axis_role] = self.ax_res
+        if self._scan_colorbar_ax is not None and self._scan_colorbar_ax.get_visible():
+            axes["colorbar"] = self._scan_colorbar_ax
+        return axes
+
+    def _presentation_axis_text(self, role: str, key: str) -> str:
+        """Return the text currently generated for an active presentation axis."""
+        ax = self._presentation_axis_map().get(role)
+        if ax is None:
+            return ""
+        getter = {
+            "title": ax.get_title,
+            "xlabel": ax.get_xlabel,
+            "ylabel": ax.get_ylabel,
+        }.get(key)
+        return str(getter()) if getter is not None else ""
+
+    def _apply_axis_presentation(self, ax, role: str) -> None:
+        style = self.presentation_state.axis(role)
+        generated_title = ax.get_title()
+        generated_xlabel = ax.get_xlabel()
+        generated_ylabel = ax.get_ylabel()
+        title_text = generated_title if style.title.mode == "Auto" else style.title.text
+        xlabel_text = generated_xlabel if style.xlabel.mode == "Auto" else style.xlabel.text
+        ylabel_text = generated_ylabel if style.ylabel.mode == "Auto" else style.ylabel.text
+        ax.set_title(
+            title_text if style.title.visible else "",
+            fontsize=style.title.font_size,
+            fontweight=style.title.font_weight,
+            color=style.title.color,
+            pad=style.title.padding,
+        )
+        ax.set_xlabel(
+            xlabel_text if style.xlabel.visible else "",
+            fontsize=style.xlabel.font_size,
+            fontweight=style.xlabel.font_weight,
+            color=style.xlabel.color,
+            labelpad=style.xlabel.padding,
+        )
+        ax.set_ylabel(
+            ylabel_text if style.ylabel.visible else "",
+            fontsize=style.ylabel.font_size,
+            fontweight=style.ylabel.font_weight,
+            color=style.ylabel.color,
+            labelpad=style.ylabel.padding,
+        )
+        apply_tick_style(ax, "x", style.x_ticks)
+        apply_tick_style(ax, "y", style.y_ticks)
+        x_on_top = style.x_ticks.label_top or (style.x_ticks.top and not style.x_ticks.bottom)
+        y_on_right = style.y_ticks.label_right or (style.y_ticks.right and not style.y_ticks.left)
+        ax.xaxis.set_label_position("top" if x_on_top and not style.x_ticks.label_bottom else "bottom")
+        ax.yaxis.set_label_position("right" if y_on_right and not style.y_ticks.label_left else "left")
+
+    def _apply_all_axis_presentation(self) -> None:
+        for role, ax in self._presentation_axis_map().items():
+            self._apply_axis_presentation(ax, role)
+
     def _autoscale_current_axes(self):
         if self._ax_secondary is not None:
             try:
@@ -5500,6 +6088,33 @@ class SmartFitterMainWindow(QMainWindow):
                 pass
 
     def _set_axis_ylim_from_series(self, ax, series_list: list[np.ndarray]):
+        registered: list[np.ndarray] = []
+        registered_x: list[np.ndarray] = []
+        has_registered = False
+        for descriptor in self._series_registry:
+            if descriptor.axis is not ax:
+                continue
+            has_registered = True
+            values = resolved_series(descriptor, self.presentation_state.series.get(descriptor.series_id))
+            if not values["show_series"]:
+                continue
+            registered_x.extend([np.asarray(arr, dtype=float) for arr in descriptor.x_values])
+            registered.extend([np.asarray(arr, dtype=float) for arr in descriptor.y_values])
+        if has_registered:
+            series_list = registered
+            finite_x_parts: list[np.ndarray] = []
+            for arr in registered_x:
+                vals_x = np.asarray(arr, dtype=float).ravel()
+                vals_x = vals_x[np.isfinite(vals_x)]
+                if vals_x.size:
+                    finite_x_parts.append(vals_x)
+            if finite_x_parts:
+                all_x = np.concatenate(finite_x_parts)
+                xmin, xmax = float(np.min(all_x)), float(np.max(all_x))
+                pad_x = max(0.05 * (xmax - xmin), 0.5 if np.isclose(xmin, xmax) else 0.0)
+                ax.set_xlim(xmin - pad_x, xmax + pad_x)
+            elif self._series_registry:
+                ax.set_xlim(0.0, 1.0)
         finite_parts = []
         for arr in series_list:
             vals = np.asarray(arr, dtype=float).ravel()
@@ -5593,6 +6208,9 @@ class SmartFitterMainWindow(QMainWindow):
     def _plot_raw(self):
         if self.ctx.x is None or self.ctx.y is None:
             return
+        self._start_series_registry()
+        self._plot_annotation_artist = None
+        self._detail_axis_role = "residual"
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
         view_state = self._capture_view_state() if (not self._is_loading and not is_scan2d) else None
         self._apply_plot_controls_to_state()
@@ -5612,6 +6230,8 @@ class SmartFitterMainWindow(QMainWindow):
             x_edges, y_edges, extent = scan_extent
             xmin, xmax, ymin, ymax = extent
             linecut = self._extract_scan_linecut()
+            if linecut is not None:
+                self._detail_axis_role = "linecut"
             self._configure_scan2d_layout(show_linecut=linecut is not None, extent=extent)
             low, high = self._scan_color_limits(self.ctx.trace.z2d)
             mesh = self.ax_main.pcolormesh(
@@ -5646,7 +6266,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.ax_res.set_visible(linecut is not None)
             if linecut is not None:
                 lx, ly, title = linecut
-                self._plot_series(self.ax_res, lx, ly, "Linecut", role="linecut", color="#4fc3f7")
+                self._plot_series(self.ax_res, lx, ly, "Linecut", role="linecut", series_id="linecut", color="#4fc3f7")
                 self.ax_res.set_title(title)
                 self.ax_res.set_xlabel(self._friendly_axis_label(self.ctx.trace.scan_axes[0] if "horizontal" in title.lower() else self.ctx.trace.scan_axes[1]))
                 self.ax_res.set_ylabel(self._current_observable_label())
@@ -5657,7 +6277,7 @@ class SmartFitterMainWindow(QMainWindow):
             y_disp, y_lab = self._display_y(plot_y)
             primary_series.append(np.asarray(y_disp, dtype=float))
             if self.plot_opts.show_data:
-                self._plot_series(self.ax_main, plot_x, y_disp, self._legend_label("Data", "Data"), role="data")
+                self._plot_series(self.ax_main, plot_x, y_disp, self._legend_label("Data", "Data"), role="data", series_id="data")
             if not self.ctx.analysis_steps:
                 self._add_observable_layers(primary_series)
                 self._add_iteration_layer(primary_series)
@@ -5666,7 +6286,8 @@ class SmartFitterMainWindow(QMainWindow):
                 if indices:
                     excluded_x = self.ctx.trace.x_ns[indices]
                     excluded_y, _ = self._display_y(self.ctx.trace.y[indices])
-                    self.ax_main.plot(excluded_x, excluded_y, "x", color="#e0a458", ms=6, mew=1.5, label=self._legend_label("Excluded", "Excluded"))
+                    excluded_line = self.ax_main.plot(excluded_x, excluded_y, "x", color="#e0a458", ms=6, mew=1.5, label=self._legend_label("Excluded", "Excluded"))[0]
+                    self._register_series("excluded", self._legend_label("Excluded", "Excluded"), [excluded_line], handle=excluded_line, axis=self.ax_main, x_values=[excluded_x], y_values=[excluded_y])
             # Overlay selected traces.
             if self.ctx.loaded_traces:
                 for i in range(self.overlay_list.count()):
@@ -5683,7 +6304,8 @@ class SmartFitterMainWindow(QMainWindow):
                     tx, ty = overlay_processed.fit_x, overlay_processed.fit_y
                     ty_disp, _ = self._display_y(ty)
                     primary_series.append(np.asarray(ty_disp, dtype=float))
-                    self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", alpha=0.5)
+                    overlay_id = f"overlay:{Path(tr.source_path).resolve()}"
+                    self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", series_id=overlay_id, alpha=0.5)
             if (
                 not self.ctx.analysis_steps
                 and
@@ -5694,7 +6316,7 @@ class SmartFitterMainWindow(QMainWindow):
             ):
                 ysm_disp, _ = self._display_y(self.ctx.y_smooth)
                 primary_series.append(np.asarray(ysm_disp, dtype=float))
-                self._plot_series(self.ax_main, self.ctx.x, ysm_disp, self._legend_label("Smoothed", "Smooth"), role="smoothed")
+                self._plot_series(self.ax_main, self.ctx.x, ysm_disp, self._legend_label("Smoothed", "Smooth"), role="smoothed", series_id="smoothed")
             if self._selected_plot_point is not None and "x" in self._selected_plot_point and "y" in self._selected_plot_point:
                 py_disp, _ = self._display_y(np.asarray([self._selected_plot_point["y"]], dtype=float))
                 primary_series.append(np.asarray(py_disp, dtype=float))
@@ -5732,6 +6354,7 @@ class SmartFitterMainWindow(QMainWindow):
             is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
             self.ax_res.set_visible(self.plot_opts.show_fft_panel and not is_scan1d)
             if self.plot_opts.show_fft_panel:
+                self._detail_axis_role = "fft"
                 y_fft = (
                     self.ctx.y_smooth
                     if (self.ctx.y_smooth is not None and self.smooth_spin.value() > 1 and len(self.ctx.y_smooth) == len(self.ctx.x))
@@ -5745,11 +6368,17 @@ class SmartFitterMainWindow(QMainWindow):
                     self.ax_res.set_xlabel("Frequency (MHz)")
                     self.ax_res.set_ylabel("FFT amplitude")
                     self.ax_res.grid(True, alpha=0.3)
+        self._apply_combined_legend()
+        self._draw_plot_annotation(self.ctx.fit_result)
+        if self._comparison_plot_data is not None:
+            self._draw_comparison_panel()
         self._autoscale_current_axes()
         self._restore_view_state(view_state)
         self._apply_axes_visual_style()
+        self._apply_all_axis_presentation()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
+        self._refresh_open_plot_editor()
 
     def on_fft(self):
         if self.ctx.x is None or self.ctx.y is None:
@@ -5952,9 +6581,9 @@ class SmartFitterMainWindow(QMainWindow):
                 if len(peaks):
                     y_disp, _ = self._display_y(y_target)
                     if self.plot_opts.show_peaks:
-                        self.ax_main.plot(x[peaks], y_disp[peaks], "rx", ms=8, mew=2, label="Detected peaks")
-                    if self.plot_opts.show_legend:
-                        self.ax_main.legend(loc=self.plot_opts.legend_loc, fontsize=self.plot_opts.legend_font_size)
+                        peaks_line = self.ax_main.plot(x[peaks], y_disp[peaks], "rx", ms=8, mew=2, label="Detected peaks")[0]
+                        self._register_series("odmr:peaks", "Detected peaks", [peaks_line], handle=peaks_line, axis=self.ax_main, x_values=[x[peaks]], y_values=[y_disp[peaks]])
+                    self._apply_combined_legend()
                     self.canvas.draw_idle()
                 self._set_status("PASS", f"ODMR peak-pick mode, {len(peak_x)} peaks")
                 self.summary_text.setPlainText(
@@ -6470,6 +7099,9 @@ class SmartFitterMainWindow(QMainWindow):
 
 
     def _plot_fit(self, fit_result: FitResult, y_raw: np.ndarray):
+        self._start_series_registry()
+        self._plot_annotation_artist = None
+        self._detail_axis_role = "fft" if self.plot_opts.show_fft_panel else "residual"
         x = self.ctx.x
         if x is None:
             return
@@ -6498,7 +7130,7 @@ class SmartFitterMainWindow(QMainWindow):
             yfit_disp, _ = self._display_y(fit_for_display)
         primary_series.append(np.asarray(y_disp, dtype=float))
         if self.plot_opts.show_data:
-            self._plot_series(self.ax_main, x, y_disp, self._legend_label("Data", "Data"), role="data")
+            self._plot_series(self.ax_main, x, y_disp, self._legend_label("Data", "Data"), role="data", series_id="data")
         if not self.ctx.analysis_steps:
             self._add_observable_layers(primary_series)
             self._add_iteration_layer(primary_series)
@@ -6517,10 +7149,11 @@ class SmartFitterMainWindow(QMainWindow):
                 tx, ty = overlay_processed.fit_x, overlay_processed.fit_y
                 ty_disp, _ = self._display_y(ty)
                 primary_series.append(np.asarray(ty_disp, dtype=float))
-                self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", alpha=0.5)
+                overlay_id = f"overlay:{Path(tr.source_path).resolve()}"
+                self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", series_id=overlay_id, alpha=0.5)
         if self.plot_opts.show_fit:
             primary_series.append(np.asarray(yfit_disp, dtype=float))
-            self._plot_series(self.ax_main, x, yfit_disp, self._legend_label(f"Fit: {fit_result.model_name}", fit_result.model_name), role="fit")
+            self._plot_series(self.ax_main, x, yfit_disp, self._legend_label(f"Fit: {fit_result.model_name}", fit_result.model_name), role="fit", series_id="fit")
             self._plot_rabi_envelope(self.ax_main, x, fit_result, primary_series)
             # Confidence band (±1σ from parameter errors)
             if self.plot_opts.show_confidence and fit_result.errors is not None:
@@ -6540,9 +7173,20 @@ class SmartFitterMainWindow(QMainWindow):
                         band_lo = np.minimum(yu_disp, yl_disp)
                         band_hi = np.maximum(yu_disp, yl_disp)
                         primary_series.extend([np.asarray(band_lo, dtype=float), np.asarray(band_hi, dtype=float)])
-                        self.ax_main.fill_between(
+                        band = self.ax_main.fill_between(
                             x, band_lo, band_hi,
                             alpha=0.2, color="#42a5f5", label="±1σ confidence"
+                        )
+                        self._register_series(
+                            "confidence",
+                            "±1σ confidence",
+                            [band],
+                            handle=band,
+                            axis=self.ax_main,
+                            supports_line=False,
+                            supports_marker=False,
+                            x_values=[x],
+                            y_values=[band_lo, band_hi],
                         )
                     except Exception:
                         pass  # Gracefully skip if model evaluation fails
@@ -6550,7 +7194,8 @@ class SmartFitterMainWindow(QMainWindow):
             peak_indices = [int(np.argmin(np.abs(x - px))) for px in self.ctx.odmr_peaks]
             peak_indices = [idx for idx in peak_indices if 0 <= idx < len(x)]
             if peak_indices:
-                self.ax_main.plot(x[peak_indices], y_disp[peak_indices], "rx", ms=8, mew=1.8, label=self._legend_label("Detected peaks", "Peaks"))
+                peaks_line = self.ax_main.plot(x[peak_indices], y_disp[peak_indices], "rx", ms=8, mew=1.8, label=self._legend_label("Detected peaks", "Peaks"))[0]
+                self._register_series("odmr:peaks", self._legend_label("Detected peaks", "Peaks"), [peaks_line], handle=peaks_line, axis=self.ax_main, x_values=[x[peak_indices]], y_values=[y_disp[peak_indices]])
         if self._selected_plot_point is not None and "x" in self._selected_plot_point and "y" in self._selected_plot_point:
             py_disp, _ = self._display_y(np.asarray([self._selected_plot_point["y"]], dtype=float))
             primary_series.append(np.asarray(py_disp, dtype=float))
@@ -6584,11 +7229,15 @@ class SmartFitterMainWindow(QMainWindow):
             self.ax_res.set_xlabel(self.ctx.trace.x_label if self.ctx.trace else "X")
             self.ax_res.set_ylabel("Residual")
             self.ax_res.grid(True, alpha=0.3)
+        if self._comparison_plot_data is not None:
+            self._draw_comparison_panel()
         self._autoscale_current_axes()
         self._restore_view_state(view_state)
         self._apply_axes_visual_style()
+        self._apply_all_axis_presentation()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
+        self._refresh_open_plot_editor()
 
     def on_save_results(self):
         if self.ctx.trace is None or self.ctx.x is None or self.ctx.y is None:
@@ -6716,7 +7365,6 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace.fit_allowed and (self.exp_report_png_chk.isChecked() or self.exp_report_pdf_chk.isChecked()):
             report_png = out / f"{stem}_gui_report.png"
             fig = Figure(figsize=(self.plot_opts.fig_width, self.plot_opts.fig_height))
-            selected_report = self._selected_report_metrics()
             if self.plot_opts.show_residual:
                 gs = fig.add_gridspec(2, 2, width_ratios=[4.5, 1.7], height_ratios=[3.0, 1.4])
                 ax = fig.add_subplot(gs[0, 0])
@@ -6736,7 +7384,8 @@ class SmartFitterMainWindow(QMainWindow):
             else:
                 y_disp, y_lab = self._display_y(y)
             if self.plot_opts.show_data:
-                ax.plot(x, y_disp, "o", ms=4, alpha=0.65, label="Data")
+                data_line = ax.plot(x, y_disp, "o", ms=4, alpha=0.65, label="Data")[0]
+                self._style_external_series("data", "Data", [data_line], handle=data_line, axis=ax)
             if result is not None:
                 if transformed:
                     fit_x, fit_series, _ = apply_steps(self.ctx.x, result.y_fit, self.ctx.analysis_steps)
@@ -6748,15 +7397,17 @@ class SmartFitterMainWindow(QMainWindow):
                     fit_x = self.ctx.x
                     yf_disp, _ = self._display_y(result.y_fit)
                 if self.plot_opts.show_fit:
-                    ax.plot(fit_x, yf_disp, "-", lw=2, label=f"Fit: {result.model_name}")
+                    fit_line = ax.plot(fit_x, yf_disp, "-", lw=2, label=f"Fit: {result.model_name}")[0]
+                    self._style_external_series("fit", f"Fit: {result.model_name}", [fit_line], handle=fit_line, axis=ax)
                     if self.plot_opts.show_rabi_envelope and isinstance(result.extras, dict):
                         bounds = rabi_envelope_bounds(x, result.extras.get("rabi_envelope"))
                         if bounds is not None:
                             upper, lower = bounds
                             upper_disp, _ = self._display_y(np.asarray(upper, dtype=float))
                             lower_disp, _ = self._display_y(np.asarray(lower, dtype=float))
-                            ax.plot(x, upper_disp, "--", lw=1.4, color="#b57edc", label="Rabi envelope")
-                            ax.plot(x, lower_disp, "--", lw=1.4, color="#b57edc", label="_nolegend_")
+                            upper_line = ax.plot(x, upper_disp, "--", lw=1.4, color="#b57edc", label="Rabi envelope")[0]
+                            lower_line = ax.plot(x, lower_disp, "--", lw=1.4, color="#b57edc", label="_nolegend_")[0]
+                            self._style_external_series("rabi:envelope", "Rabi envelope", [upper_line, lower_line], handle=upper_line, axis=ax)
                 if self.plot_opts.show_residual and axr is not None:
                     fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else self.ctx.y
                     res = np.asarray(fit_target, dtype=float) - result.y_fit
@@ -6767,22 +7418,44 @@ class SmartFitterMainWindow(QMainWindow):
             ax.set_xlabel(self.ctx.trace.x_label)
             ax.set_ylabel(y_lab)
             ax.grid(True, alpha=0.3)
-            if self.plot_opts.show_legend:
-                ax.legend(loc=self.plot_opts.legend_loc, fontsize=self.plot_opts.legend_font_size)
-            key_lines = [f"Profile: {profile.name}", f"Status: {self.ctx.status}"]
-            if result is not None:
-                if "r2" in selected_report:
-                    key_lines.append(f"{self._report_label('r2')}: {result.r2:.4f}")
-                if "rmse" in selected_report:
-                    key_lines.append(f"{self._report_label('rmse')}: {result.rmse:.4g}")
-                for n, v, e in zip(result.param_names[:6], result.params[:6], result.errors[:6]):
-                    key_lines.append(f"{self._friendly_param_name(n)}: {self._format_value_with_units(n, float(v))} +/- {e:.2g}")
-            for k, v in nv.items():
-                if k in selected_report:
-                    key_lines.append(f"{self._report_label(k)}: {v:.6g}")
+            ax.relim(visible_only=True)
+            ax.autoscale_view()
+            legend_style = self.presentation_state.legend
+            handles, labels = ax.get_legend_handles_labels()
+            ordered_entries = []
+            for index, (handle, label) in enumerate(zip(handles, labels)):
+                series_id = getattr(handle, "get_gid", lambda: None)()
+                override = self.presentation_state.series.get(str(series_id)) if series_id else None
+                order = index if override is None or override.order is None else override.order
+                ordered_entries.append((order, handle, label))
+            ordered_entries.sort(key=lambda item: item[0])
+            handles = [item[1] for item in ordered_entries]
+            labels = [item[2] for item in ordered_entries]
+            if legend_style.visible and handles:
+                legend_kwargs: dict[str, Any] = {
+                    "loc": legend_style.location,
+                    "fontsize": legend_style.font_size,
+                    "ncol": legend_style.columns,
+                    "frameon": legend_style.frame_visible,
+                    "framealpha": legend_style.frame_alpha,
+                    "borderpad": legend_style.border_pad,
+                    "labelspacing": legend_style.label_spacing,
+                }
+                if legend_style.title:
+                    legend_kwargs["title"] = legend_style.title
+                if legend_style.custom_anchor:
+                    legend_kwargs["bbox_to_anchor"] = (legend_style.anchor_x, legend_style.anchor_y)
+                report_legend = ax.legend(handles, labels, **legend_kwargs)
+                if legend_style.frame_visible:
+                    report_legend.get_frame().set_facecolor(legend_style.frame_color)
+                    report_legend.get_frame().set_edgecolor(legend_style.edge_color)
+                for text_item in report_legend.get_texts():
+                    text_item.set_color(legend_style.text_color)
+            key_lines = self._annotation_lines(context="report")
             if self.ctx.odmr_peaks is not None and len(self.ctx.odmr_peaks):
                 key_lines.append("ODMR peaks: " + ", ".join([f"{p:.6g}" for p in self.ctx.odmr_peaks[:8]]))
             ax_stats.axis("off")
+            annotation_style = self.presentation_state.annotation_style
             ax_stats.text(
                 0.01,
                 0.99,
@@ -6790,8 +7463,18 @@ class SmartFitterMainWindow(QMainWindow):
                 transform=ax_stats.transAxes,
                 va="top",
                 ha="left",
-                fontsize=9,
+                fontsize=annotation_style.font_size,
+                color=annotation_style.text_color,
+                bbox={
+                    "boxstyle": f"round,pad={annotation_style.padding}",
+                    "facecolor": annotation_style.background_color,
+                    "edgecolor": annotation_style.edge_color,
+                    "alpha": annotation_style.background_alpha,
+                },
             )
+            self._apply_axis_presentation(ax, "main")
+            if axr is not None:
+                self._apply_axis_presentation(axr, "residual")
             fig.tight_layout(pad=0.5)
             if self.exp_report_png_chk.isChecked():
                 FigureCanvas(fig).print_figure(report_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
