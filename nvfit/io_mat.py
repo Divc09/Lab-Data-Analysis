@@ -90,6 +90,12 @@ def infer_experiment_type(
     identifier_l = identifier.lower()
     combined = " ".join([fn, notes_l, parameter_l, identifier_l, *scan_types_l])
     dd_keywords = ("xy8", "cpmg", "dynamic decoupling", "dynamical decoupling")
+    stage_keywords = ("stage x", "stage y", "stage z", "stage_x", "stage_y", "stage_z")
+
+    # Prefer explicit sequence metadata and physical scan axes over generic
+    # words such as "duration" or "frequency".  Those generic axis names are
+    # useful fallbacks, but on their own they are not as strong as a sequence
+    # name in the filename/notes or a stage-axis declaration.
 
     if "deer" in combined:
         if "position" in combined:
@@ -102,38 +108,29 @@ def infer_experiment_type(
             return "DEERFrequency"
         return "DEERFrequency"
 
+    if any(_keyword_match(value, stage_keywords) for value in (*scan_types_l, parameter_l, identifier_l)):
+        return "LineScan"
+
     if _keyword_match(combined, dd_keywords):
         return "DynamicDecoupling"
+
+    if "ramsey" in combined:
+        return "Ramsey"
+    if re.search(r"(?:^|[^a-z0-9])t\s*1(?:[^a-z0-9]|$)", combined) or "longitudinal relaxation" in combined:
+        return "T1"
+    if _keyword_match(combined, ("spin echo", "spinecho", "hahn echo", "t2 decay")):
+        return "SpinEcho"
+    if "rabi" in combined:
+        return "Rabi"
+    if "odmr" in combined:
+        return "ODMR"
 
     if any("rf frequency" in s or "frequency" in s for s in scan_types_l) or "frequency" in parameter_l:
         return "ODMR"
     if any("pulse duration" in s or "duration" in s for s in scan_types_l) or "duration" in parameter_l:
-        if "ramsey" in fn or "ramsey" in notes_l:
-            return "Ramsey"
-        if "rabi" in fn or "rabi" in notes_l:
-            return "Rabi"
-        if "t1" in fn or "t1" in notes_l:
-            return "T1"
-        if "echo" in fn or "echo" in notes_l or "t2" in fn or "t2" in notes_l:
-            return "SpinEcho"
         return "Rabi"
-    if any("stage x" in s or "stage y" in s or "stage z" in s for s in scan_types_l):
-        return "LineScan"
-    if _keyword_match(parameter_l, ("stage x", "stage y", "stage z")) or _keyword_match(identifier_l, ("stage",)):
-        return "LineScan"
-
-    if "odmr" in fn:
-        return "ODMR"
-    if "rabi" in fn:
-        return "Rabi"
-    if "ramsey" in fn:
-        return "Ramsey"
-    if "t1" in fn:
-        return "T1"
-    if "echo" in fn:
+    if "echo" in combined or re.search(r"(?:^|[^a-z0-9])t\s*2(?:[^a-z0-9]|$)", combined):
         return "SpinEcho"
-    if _keyword_match(fn, dd_keywords):
-        return "DynamicDecoupling"
     return "LineScan"
 
 
@@ -214,7 +211,7 @@ def _stage_axis_count(scan_axes: tuple[str, ...]) -> int:
 
 
 def _plot_only_scan_type(experiment_type: str) -> bool:
-    return experiment_type in {"LineScan", "DEERPosition"}
+    return experiment_type in {"LineScan", "Scan2D", "DEERPosition"}
 
 
 def _finalize_trace(
@@ -341,6 +338,9 @@ def _finalize_trace(
             signal_iters_use = None
             reference_iters_use = None
             valid_iters_use = None
+
+    if scan_dim == "scan2d" and experiment_type == "LineScan":
+        experiment_type = "Scan2D"
 
     metadata_out = dict(metadata or {})
     metadata_out.setdefault("x_min_ns", float(np.min(x_ns)))

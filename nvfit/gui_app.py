@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSpinBox,
     QTableWidget,
@@ -155,7 +156,7 @@ class PlotOptions:
     show_confidence: bool = False
     legend_loc: str = "best"
     legend_font_size: int = 9
-    annotation_mode: str = "Compact"
+    annotation_mode: str = "Off"
     annotation_loc: str = "upper right"
     annotation_font_size: int = 9
     annotation_show_file_model: bool = True
@@ -481,7 +482,12 @@ class SmartFitterMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SmartFitter")
-        self.resize(1366, 820)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        target_width = min(1366, int(available.width() * 0.94)) if available is not None else 1366
+        target_height = min(820, int(available.height() * 0.92)) if available is not None else 820
+        self.resize(max(760, target_width), max(520, target_height))
+        self.setMinimumSize(720, 480)
         self.ctx = FitContext()
         self.ctx.excluded_points = set()
         self.ctx.exclusion_ranges = []
@@ -507,8 +513,19 @@ class SmartFitterMainWindow(QMainWindow):
         self._is_loading = False
         self._mode_override_active = False
         self._syncing_plot_controls = False
+        self._ui_scale = 1.0
+        self._plot_scale = 1.0
+        self._responsive_band: tuple[int, bool] | None = None
+        self._responsive_timer = QTimer(self)
+        self._responsive_timer.setSingleShot(True)
+        self._responsive_timer.timeout.connect(self._apply_responsive_scaling)
         self._selected_plot_point: dict[str, float] | None = None
         self._selected_iteration_indices: set[int] = set()
+        self._iteration_selection_source: str | None = None
+        self._annotation_enabled_mode = "Compact"
+        self._overlay_visible_names: set[str] = set()
+        self._updating_overlay_list = False
+        self._overlay_view_dirty = False
         self._scan_cursor: tuple[float, float] | None = None
         self._ax_secondary = None
         self._secondary_series: list[np.ndarray] = []
@@ -554,8 +571,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._load_preferences()
         self._apply_plot_controls_to_state()
         self._initialize_presentation_state()
+        self._sync_quick_toolbar_from_state()
         self._apply_figure_size()
         self._apply_theme()
+        self._apply_responsive_scaling(force=True)
         self._update_trace_mode_visibility()
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
@@ -857,7 +876,89 @@ class SmartFitterMainWindow(QMainWindow):
         QStatusBar { background: #0b100d; color: #96a49c; border-top: 1px solid #253029; padding-left: 6px; }
         QToolTip { background: #202923; color: #f2f7f4; border: 1px solid #566a60; border-radius: 5px; padding: 6px; }
         """
-        self.setStyleSheet(dark_qss)
+        scale = float(getattr(self, "_ui_scale", 1.0))
+        responsive_qss = f"""
+        QMainWindow, QWidget {{ font-size: {max(8.0, 10.0 * scale):.2f}pt; }}
+        QGroupBox {{
+            border-radius: {max(6, round(10 * scale))}px;
+            margin-top: {max(10, round(14 * scale))}px;
+            padding: {max(9, round(15 * scale))}px {max(6, round(9 * scale))}px {max(6, round(9 * scale))}px {max(6, round(9 * scale))}px;
+        }}
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {{
+            border-radius: {max(5, round(7 * scale))}px;
+            padding: {max(3, round(6 * scale))}px {max(5, round(8 * scale))}px;
+            min-height: {max(16, round(20 * scale))}px;
+        }}
+        QPushButton {{
+            border-radius: {max(5, round(7 * scale))}px;
+            padding: {max(4, round(7 * scale))}px {max(7, round(12 * scale))}px;
+            min-height: {max(16, round(20 * scale))}px;
+        }}
+        QToolButton {{
+            border-radius: {max(5, round(7 * scale))}px;
+            padding: {max(3, round(6 * scale))}px {max(6, round(10 * scale))}px;
+        }}
+        QLabel#AppTitle, QLabel#PaneTitle {{ font-size: {max(11.0, 15.0 * scale):.2f}pt; }}
+        QLabel#EmptyStateTitle {{ font-size: {max(12.0, 17.0 * scale):.2f}pt; }}
+        QLabel#EmptyStateText {{ font-size: {max(8.0, 11.0 * scale):.2f}pt; }}
+        QHeaderView::section {{ padding: {max(4, round(7 * scale))}px; }}
+        """
+        self.setStyleSheet(dark_qss + responsive_qss)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_responsive_timer"):
+            self._responsive_timer.start(60)
+
+    def _apply_responsive_scaling(self, force: bool = False) -> None:
+        if not hasattr(self, "left_panel"):
+            return
+        width = max(1, self.width())
+        height = max(1, self.height())
+        scale = float(np.clip(min(width / 1366.0, height / 820.0), 0.72, 1.08))
+        plot_scale = float(np.clip(scale, 0.72, 1.0))
+        center_width = self.plot_column.width() if self.plot_column.width() > 0 else width
+        toolbar_columns = 10 if center_width >= 920 else (5 if center_width >= 560 else (3 if center_width >= 360 else 2))
+        compact_header = width < 1050
+        band = (toolbar_columns, compact_header)
+        if not force and abs(scale - self._ui_scale) < 0.025 and band == self._responsive_band:
+            return
+
+        plot_scale_changed = abs(plot_scale - self._plot_scale) >= 0.025
+        self._ui_scale = scale
+        self._plot_scale = plot_scale
+        self._responsive_band = band
+        self.left_panel.setMinimumWidth(max(160, round(240 * scale)))
+        responsive_right = round(width * 0.32) if compact_header else 0
+        self.right_panel.setMinimumWidth(max(220, round(360 * scale), responsive_right))
+        self.plot_column.setMinimumWidth(max(240, round(380 * scale)))
+        self.main_splitter.setHandleWidth(max(3, round(5 * scale)))
+        margin = max(5, round(10 * scale))
+        self.single_layout.setContentsMargins(margin, margin, margin, margin)
+        self.single_layout.setSpacing(max(4, round(8 * scale)))
+        self.workspace_layout.setContentsMargins(max(6, round(14 * scale)), max(4, round(9 * scale)), max(6, round(14 * scale)), max(4, round(9 * scale)))
+        self.workspace_layout.setSpacing(max(4, round(8 * scale)))
+        self.app_title.setVisible(width >= 820)
+        self.command_session_btn.setVisible(width >= 1040)
+        self.command_file_lbl.setVisible(width >= 900)
+        self.quick_iteration_select_btn.setText("Select…" if compact_header else "Choose iterations…")
+        self.eq_preview_canvas.setMaximumHeight(max(34, round(50 * scale)))
+        self.summary_text.setMinimumHeight(max(120, round(200 * scale)))
+        wrap_policy = QFormLayout.RowWrapPolicy.WrapLongRows if width < 1120 else QFormLayout.RowWrapPolicy.DontWrapRows
+        for form_layout in self.findChildren(QFormLayout):
+            form_layout.setRowWrapPolicy(wrap_policy)
+        for label in self.findChildren(QLabel):
+            if label.wordWrap():
+                label.setMinimumWidth(0)
+                label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        for combo in self.findChildren(QComboBox):
+            combo.setMinimumWidth(0)
+            combo.setMinimumContentsLength(8 if compact_header else 12)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._relayout_plot_quick_toolbar()
+        self._apply_theme()
+        if plot_scale_changed and self.ctx.trace is not None:
+            self._refresh_plot_only()
 
     def _build_ui(self):
         root = QWidget()
@@ -878,11 +979,14 @@ class SmartFitterMainWindow(QMainWindow):
 
         workspace_bar = QWidget()
         workspace_bar.setObjectName("WorkspaceBar")
+        self.workspace_bar = workspace_bar
         workspace_layout = QHBoxLayout(workspace_bar)
+        self.workspace_layout = workspace_layout
         workspace_layout.setContentsMargins(14, 9, 14, 9)
         workspace_layout.setSpacing(8)
         app_title = QLabel("SmartFitter")
         app_title.setObjectName("AppTitle")
+        self.app_title = app_title
         workspace_layout.addWidget(app_title)
         self.mode_button_group = QButtonGroup(self)
         self.mode_button_group.setExclusive(True)
@@ -938,6 +1042,7 @@ class SmartFitterMainWindow(QMainWindow):
 
         single_page = QWidget()
         single_layout = QVBoxLayout(single_page)
+        self.single_layout = single_layout
         single_layout.setContentsMargins(10, 10, 10, 10)
         single_layout.setSpacing(8)
         self.mode_stack.addWidget(single_page)
@@ -956,6 +1061,7 @@ class SmartFitterMainWindow(QMainWindow):
         left = QWidget()
         left.setObjectName("SidePanel")
         left.setMinimumWidth(240)
+        self.left_panel = left
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_scroll = SmoothScrollArea()
@@ -965,10 +1071,12 @@ class SmartFitterMainWindow(QMainWindow):
         left_inner = QWidget()
         left_scroll.setWidget(left_inner)
         left_inner_layout = QVBoxLayout(left_inner)
+        self.left_inner_layout = left_inner_layout
         splitter.addWidget(left)
 
         center = QWidget()
         center.setObjectName("PlotColumn")
+        self.plot_column = center
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         self._build_plot_quick_toolbar(center_layout)
@@ -1036,6 +1144,7 @@ class SmartFitterMainWindow(QMainWindow):
         right = QWidget()
         right.setObjectName("SidePanel")
         right.setMinimumWidth(360)
+        self.right_panel = right
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         splitter.addWidget(right)
@@ -1050,6 +1159,7 @@ class SmartFitterMainWindow(QMainWindow):
         right_inner = QWidget()
         scroll.setWidget(right_inner)
         right_inner_layout = QVBoxLayout(right_inner)
+        self.right_inner_layout = right_inner_layout
 
         data_box = QGroupBox("Data")
         self.data_box = data_box
@@ -1068,7 +1178,7 @@ class SmartFitterMainWindow(QMainWindow):
         data_gl.addWidget(self.load_help_lbl, 1, 0, 1, 2)
 
         self.profile_combo = NoScrollComboBox()
-        self.profile_combo.addItems(["Auto", "Ramsey", "Rabi", "SpinEcho", "DynamicDecoupling", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "LineScan"])
+        self.profile_combo.addItems(["Auto", "Ramsey", "Rabi", "SpinEcho", "DynamicDecoupling", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "LineScan", "Scan2D"])
         self.profile_combo.setToolTip("Choose the experiment family. Auto follows the detected type from the file.")
         self.profile_combo.currentTextChanged.connect(self.apply_profile_defaults)
         data_gl.addWidget(QLabel("Experiment type"), 2, 0)
@@ -1089,37 +1199,50 @@ class SmartFitterMainWindow(QMainWindow):
         overlay_box = QGroupBox("Overlays")
         self.overlay_box = overlay_box
         ov_gl = QGridLayout(overlay_box)
-        btn_add_overlay = QPushButton("Add Overlay Files")
-        btn_add_overlay.setToolTip("Add additional traces to overlay and compare.")
+        overlay_help = QLabel("Check the files to draw together. Double-click a file to make it the primary trace.")
+        overlay_help.setWordWrap(True)
+        overlay_help.setObjectName("MutedLabel")
+        ov_gl.addWidget(overlay_help, 0, 0, 1, 2)
+        btn_add_overlay = QPushButton("Add files")
+        btn_add_overlay.setToolTip("Add traces and show the newly added files with the current primary trace.")
         btn_add_overlay.clicked.connect(self.on_add_overlays)
-        ov_gl.addWidget(btn_add_overlay, 0, 0)
-        btn_remove_overlay = QPushButton("Remove Selected")
+        ov_gl.addWidget(btn_add_overlay, 1, 0)
+        btn_remove_overlay = QPushButton("Remove selected")
         btn_remove_overlay.setToolTip("Remove selected overlay traces from registry.")
         btn_remove_overlay.clicked.connect(self.on_remove_overlays)
-        ov_gl.addWidget(btn_remove_overlay, 0, 1)
-        btn_clear_overlay = QPushButton("Clear Overlays")
-        btn_clear_overlay.setToolTip("Clear all overlays except currently loaded trace.")
+        ov_gl.addWidget(btn_remove_overlay, 1, 1)
+        btn_show_all_overlays = QPushButton("Show all")
+        btn_show_all_overlays.setToolTip("Check every loaded non-primary trace and fit the view to the combined data range.")
+        btn_show_all_overlays.clicked.connect(self.on_show_all_overlays)
+        ov_gl.addWidget(btn_show_all_overlays, 2, 0)
+        btn_primary_only = QPushButton("Primary only")
+        btn_primary_only.setToolTip("Hide every overlay without unloading any files.")
+        btn_primary_only.clicked.connect(self.on_show_primary_only)
+        ov_gl.addWidget(btn_primary_only, 2, 1)
+        btn_clear_overlay = QPushButton("Unload non-primary files")
+        btn_clear_overlay.setToolTip("Remove all loaded files except the current primary trace.")
         btn_clear_overlay.clicked.connect(self.on_clear_overlays)
-        ov_gl.addWidget(btn_clear_overlay, 1, 0, 1, 2)
+        ov_gl.addWidget(btn_clear_overlay, 3, 0, 1, 2)
         self.overlay_list = QListWidget()
         self.overlay_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.overlay_list.setToolTip("Loaded traces. Selected traces are shown in overlay.")
+        self.overlay_list.setToolTip("Checked traces are drawn. Highlighted rows are used only by Remove selected. Double-click changes the primary trace.")
+        self.overlay_list.itemChanged.connect(self._on_overlay_item_changed)
         self.overlay_list.itemDoubleClicked.connect(self.on_overlay_set_primary)
-        ov_gl.addWidget(self.overlay_list, 2, 0, 1, 2)
+        ov_gl.addWidget(self.overlay_list, 4, 0, 1, 2)
         self.baseline_combo = NoScrollComboBox()
         self.baseline_combo.addItem("None")
         self.baseline_combo.setToolTip("Optional baseline trace to subtract before fitting.")
         self.baseline_combo.currentTextChanged.connect(self._refresh_processed)
-        ov_gl.addWidget(QLabel("Baseline subtract"), 3, 0)
-        ov_gl.addWidget(self.baseline_combo, 3, 1)
+        ov_gl.addWidget(QLabel("Baseline subtract"), 5, 0)
+        ov_gl.addWidget(self.baseline_combo, 5, 1)
         self.compare_metric_combo = NoScrollComboBox()
         self.compare_metric_combo.addItems(["r2", "T2_star_ns", "T2_dd_ns", "T1_ns", "pi_time_ns", "pi_time_ns_nominal", "first_peak_ns", "delay_ns", "rabi_freq_MHz", "center_freq", "fwhm"])
         self.compare_metric_combo.setToolTip("Metric used in overlay comparison table.")
-        ov_gl.addWidget(QLabel("Compare metric"), 4, 0)
-        ov_gl.addWidget(self.compare_metric_combo, 4, 1)
+        ov_gl.addWidget(QLabel("Compare metric"), 6, 0)
+        ov_gl.addWidget(self.compare_metric_combo, 6, 1)
         btn_compare = QPushButton("Build Comparison")
         btn_compare.clicked.connect(self.on_compare_traces)
-        ov_gl.addWidget(btn_compare, 5, 0, 1, 2)
+        ov_gl.addWidget(btn_compare, 7, 0, 1, 2)
         left_inner_layout.addWidget(overlay_box)
 
         prep_box = QGroupBox("Preprocess")
@@ -1169,6 +1292,7 @@ class SmartFitterMainWindow(QMainWindow):
         
         self.model_combo = NoScrollComboBox()
         self.model_combo.addItems(["RamseyAuto", "RamseySimple", "RamseyHyperfine", "Rabi", "SpinEcho", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "LineScan", "CustomModel"])
+        self.model_combo.setCurrentText("LineScan")
         self.model_combo.setToolTip("Analysis mode used for fitting.")
         self.model_combo.currentTextChanged.connect(self._update_contextual_visibility)
         common_form.addRow("Analysis mode", self.model_combo)
@@ -1231,7 +1355,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.rabi_dead_time_ns.setToolTip("Optional manual timing-offset override used when locking pi or pi/2. Reported delay on fitted Rabi traces is derived from the first fitted peak.")
         self.rabi_dead_time_ns.valueChanged.connect(self._on_rabi_dead_time_changed)
         rabi_layout.addRow("Delay override (ns)", self.rabi_dead_time_ns)
-        self.rabi_sem_weight_chk = QCheckBox("Use iteration SEM weighting when available")
+        self.rabi_sem_weight_chk = QCheckBox("Use iteration SEM weights")
         self.rabi_sem_weight_chk.setChecked(True)
         self.rabi_sem_weight_chk.setToolTip("When full per-iteration contrast data are available, weight the fit by the SEM of each programmed pulse point.")
         rabi_layout.addRow(self.rabi_sem_weight_chk)
@@ -1500,7 +1624,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.show_legend_chk = QCheckBox("Legend")
         self.show_legend_chk.setChecked(True)
         self.show_legend_chk.setToolTip("Show/hide legend on the main plot.")
-        self.show_legend_chk.toggled.connect(self._refresh_plot_only)
+        self.show_legend_chk.toggled.connect(self._on_legend_visibility_changed)
         plot_gl.addWidget(self.show_data_chk, 0, 0)
         plot_gl.addWidget(self.show_smoothed_chk, 0, 1)
         plot_gl.addWidget(self.show_fit_chk, 1, 0)
@@ -1651,8 +1775,9 @@ class SmartFitterMainWindow(QMainWindow):
         ann_gl.addWidget(ann_help, 0, 0, 1, 2)
         self.annotation_mode_combo = NoScrollComboBox()
         self.annotation_mode_combo.addItems(["Off", "Compact", "Detailed"])
-        self.annotation_mode_combo.setCurrentText("Compact")
-        self.annotation_mode_combo.currentTextChanged.connect(self._refresh_plot_only)
+        self.annotation_mode_combo.setCurrentText("Off")
+        self.annotation_mode_combo.setToolTip("Show no annotation before fitting, or choose the fit-summary detail level.")
+        self.annotation_mode_combo.currentTextChanged.connect(self._on_annotation_mode_changed)
         ann_gl.addWidget(QLabel("Annotation mode"), 1, 0)
         ann_gl.addWidget(self.annotation_mode_combo, 1, 1)
         self.annotation_loc_combo = NoScrollComboBox()
@@ -1946,13 +2071,20 @@ class SmartFitterMainWindow(QMainWindow):
         return btn
 
     def _build_plot_quick_toolbar(self, layout: QVBoxLayout):
-        row = QHBoxLayout()
-        row.setContentsMargins(4, 2, 4, 6)
-        row.setSpacing(6)
+        bar = QWidget()
+        bar.setObjectName("PlotQuickBar")
+        self.plot_quick_bar = bar
+        grid = QGridLayout(bar)
+        grid.setContentsMargins(4, 2, 4, 6)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        self.plot_quick_grid = grid
 
         self.quick_data_btn = self._make_quick_toggle("Data", "Show measured data points.", self._on_quick_data_toggled)
         self.quick_fit_btn = self._make_quick_toggle("Fit", "Show fitted model curve.", self._on_quick_fit_toggled)
         self.quick_smooth_btn = self._make_quick_toggle("Smooth", "Show smoothed trace.", self._on_quick_smooth_toggled)
+        self.quick_legend_btn = self._make_quick_toggle("Legend", "Show the combined plot legend.", self._on_quick_legend_toggled)
+        self.quick_annotation_btn = self._make_quick_toggle("Annotations", "Show the fit-summary annotation. It stays off until a fit succeeds.", self._on_quick_annotation_toggled)
         self.quick_signal_btn = self._make_quick_toggle("Signal", "Overlay signal counts on the right axis.", self._on_quick_signal_toggled)
         self.quick_reference_btn = self._make_quick_toggle("Reference", "Overlay reference counts on the right axis.", self._on_quick_reference_toggled)
         self.quick_difference_btn = self._make_quick_toggle("Diff", "Overlay reference-signal.", self._on_quick_difference_toggled)
@@ -1960,10 +2092,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_mean_btn = self._make_quick_toggle("Mean", "Show mean of selected iterations.", self._on_quick_mean_toggled)
         self.quick_std_btn = self._make_quick_toggle("Std", "Show standard deviation of selected iterations.", self._on_quick_std_toggled)
 
-        for btn in (self.quick_data_btn, self.quick_fit_btn, self.quick_smooth_btn):
-            row.addWidget(btn)
-
-        self.quick_iteration_select_btn = QPushButton("Iterations...")
+        self.quick_iteration_select_btn = QPushButton("Choose iterations…")
         self.quick_iteration_select_btn.setToolTip("Choose multiple complete iterations to plot.")
         self.quick_iteration_select_btn.clicked.connect(self._open_iteration_dialog)
 
@@ -1971,14 +2100,44 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_std_mode_combo.addItems(["Band", "Error bars"])
         self.quick_std_mode_combo.setToolTip("Choose how standard deviation is displayed.")
         self.quick_std_mode_combo.currentTextChanged.connect(self._on_quick_std_mode_changed)
-        row.addStretch(1)
         self.copy_figure_btn = QPushButton("Copy figure")
         self._set_button_icon(self.copy_figure_btn, "fa5s.copy")
         self.copy_figure_btn.setToolTip("Copy the current export figure to the clipboard (Ctrl+Shift+C).")
         self.copy_figure_btn.clicked.connect(self.copy_export_figure)
         self.copy_figure_btn.setEnabled(False)
-        row.addWidget(self.copy_figure_btn)
-        layout.addLayout(row)
+        self._plot_quick_widgets = [
+            self.quick_data_btn,
+            self.quick_fit_btn,
+            self.quick_smooth_btn,
+            self.quick_legend_btn,
+            self.quick_annotation_btn,
+            self.quick_signal_btn,
+            self.quick_reference_btn,
+            self.quick_iterations_btn,
+            self.quick_iteration_select_btn,
+            self.copy_figure_btn,
+        ]
+        # Difference/mean/std remain available in the Plot drawer. Keep these
+        # legacy quick-control objects alive without crowding the primary bar.
+        for extra in (self.quick_difference_btn, self.quick_mean_btn, self.quick_std_btn, self.quick_std_mode_combo):
+            extra.setParent(bar)
+            extra.setVisible(False)
+        self._relayout_plot_quick_toolbar()
+        layout.addWidget(bar)
+
+    def _relayout_plot_quick_toolbar(self) -> None:
+        if not hasattr(self, "plot_quick_grid"):
+            return
+        grid = self.plot_quick_grid
+        while grid.count():
+            grid.takeAt(0)
+        available = self.plot_column.width() if hasattr(self, "plot_column") and self.plot_column.width() > 0 else self.width()
+        columns = 10 if available >= 920 else (5 if available >= 560 else (3 if available >= 360 else 2))
+        for index, widget in enumerate(self._plot_quick_widgets):
+            row, column = divmod(index, columns)
+            grid.addWidget(widget, row, column)
+        for column in range(columns):
+            grid.setColumnStretch(column, 1 if column == columns - 1 else 0)
 
     def _build_scan_quick_toolbar(self, layout: QVBoxLayout):
         self.scan_quick_bar = QGroupBox("Map controls")
@@ -2054,11 +2213,16 @@ class SmartFitterMainWindow(QMainWindow):
         outer.addWidget(apply_view, 11, 1, 1, 2)
         outer.addWidget(self.scan_pan_btn, 12, 0)
         outer.addWidget(self.scan_zoom_btn, 12, 1, 1, 2)
+        self.scan_swap_axes_chk = QCheckBox("Swap X/Y axes")
+        self.scan_swap_axes_chk.setChecked(True)
+        self.scan_swap_axes_chk.setToolTip("Transpose the displayed map and exchange its X/Y labels. This is the default view.")
+        self.scan_swap_axes_chk.toggled.connect(self._on_scan_axis_swap_changed)
+        outer.addWidget(self.scan_swap_axes_chk, 13, 0, 1, 3)
         self.scan_equal_aspect_chk = QCheckBox("Equal physical axes")
         self.scan_equal_aspect_chk.setChecked(False)
         self.scan_equal_aspect_chk.setToolTip("Show equal physical distances at equal screen scale.")
         self.scan_equal_aspect_chk.toggled.connect(self._on_scan_style_changed)
-        outer.addWidget(self.scan_equal_aspect_chk, 13, 0, 1, 3)
+        outer.addWidget(self.scan_equal_aspect_chk, 14, 0, 1, 3)
 
         self.scan_quick_bar.setVisible(False)
         layout.addWidget(self.scan_quick_bar)
@@ -2440,6 +2604,18 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
             self._refresh_plot_only()
 
+    def _on_scan_axis_swap_changed(self, _checked: bool):
+        if self._syncing_scan_controls:
+            return
+        self._scan_view_limits = None
+        self._scan_cursor = None
+        self._selected_plot_point = None
+        if hasattr(self, "clear_marker_btn"):
+            self.clear_marker_btn.setVisible(False)
+        self._update_point_readout("Point readout: click the map to pin a cell")
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            self._refresh_plot_only()
+
     def _apply_manual_scan_color_limits(self):
         if self.scan_scale_combo.currentText() != "Manual":
             return
@@ -2814,11 +2990,15 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _select_point_from_plot(self, xdata: float, ydata: float | None = None, *, refresh: bool = True):
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None and ydata is not None:
-            row = int(np.argmin(np.abs(self.ctx.trace.y2d[:, 0] - ydata)))
-            col = int(np.argmin(np.abs(self.ctx.trace.x2d[0, :] - xdata)))
-            px = float(self.ctx.trace.x2d[row, col])
-            py = float(self.ctx.trace.y2d[row, col])
-            z = float(self.ctx.trace.z2d[row, col])
+            display = self._scan2d_display_data(self.ctx.trace)
+            if display is None:
+                return
+            x_centers, y_centers, z2d, _x_label, _y_label = display
+            row = int(np.argmin(np.abs(y_centers - ydata)))
+            col = int(np.argmin(np.abs(x_centers - xdata)))
+            px = float(x_centers[col])
+            py = float(y_centers[row])
+            z = float(z2d[row, col])
             if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px) and np.isclose(float(self._selected_plot_point.get("y", np.nan)), py):
                 self.clear_selected_marker(refresh=refresh)
                 return
@@ -3097,6 +3277,11 @@ class SmartFitterMainWindow(QMainWindow):
                 (self.quick_data_btn, self.show_data_chk.isChecked()),
                 (self.quick_fit_btn, self.show_fit_chk.isChecked()),
                 (self.quick_smooth_btn, self.show_smoothed_chk.isChecked()),
+                (self.quick_legend_btn, bool(self.presentation_state.legend.visible)),
+                (
+                    self.quick_annotation_btn,
+                    bool(self.presentation_state.annotation_style.visible and self.presentation_state.annotation_style.mode != "Off"),
+                ),
                 (self.quick_signal_btn, self.show_signal_layer_chk.isChecked()),
                 (self.quick_reference_btn, self.show_reference_layer_chk.isChecked()),
                 (self.quick_difference_btn, self.show_difference_layer_chk.isChecked()),
@@ -3131,6 +3316,14 @@ class SmartFitterMainWindow(QMainWindow):
         if not self._syncing_plot_controls:
             self.show_smoothed_chk.setChecked(checked)
 
+    def _on_quick_legend_toggled(self, checked: bool):
+        if not self._syncing_plot_controls:
+            self.show_legend_chk.setChecked(checked)
+
+    def _on_quick_annotation_toggled(self, checked: bool):
+        if not self._syncing_plot_controls:
+            self._set_annotation_visible(checked)
+
     def _on_quick_signal_toggled(self, checked: bool):
         if not self._syncing_plot_controls:
             self.show_signal_layer_chk.setChecked(checked)
@@ -3158,6 +3351,41 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_quick_std_mode_changed(self, text: str):
         if not self._syncing_plot_controls:
             self.iteration_std_mode_combo.setCurrentText(text)
+
+    def _on_legend_visibility_changed(self, checked: bool):
+        self.plot_opts.show_legend = bool(checked)
+        self.presentation_state.legend.visible = bool(checked)
+        self._sync_quick_toolbar_from_state()
+        if not self._syncing_plot_controls:
+            self._refresh_plot_only()
+
+    def _on_annotation_mode_changed(self, mode: str):
+        mode = str(mode or "Off")
+        if mode != "Off":
+            self._annotation_enabled_mode = mode
+        self.plot_opts.annotation_mode = mode
+        self.presentation_state.annotation_style.mode = mode
+        self.presentation_state.annotation_style.visible = mode != "Off"
+        self._sync_quick_toolbar_from_state()
+        if not self._syncing_plot_controls:
+            self._refresh_plot_only()
+
+    def _set_annotation_visible(self, visible: bool, *, refresh: bool = True) -> None:
+        current = self.presentation_state.annotation_style.mode
+        if current != "Off":
+            self._annotation_enabled_mode = current
+        mode = self._annotation_enabled_mode if visible else "Off"
+        if visible and mode == "Off":
+            mode = "Compact"
+        self.annotation_mode_combo.blockSignals(True)
+        self.annotation_mode_combo.setCurrentText(mode)
+        self.annotation_mode_combo.blockSignals(False)
+        self.plot_opts.annotation_mode = mode
+        self.presentation_state.annotation_style.mode = mode
+        self.presentation_state.annotation_style.visible = bool(visible)
+        self._sync_quick_toolbar_from_state()
+        if refresh and self.ctx.trace is not None:
+            self._refresh_plot_only()
 
     def _selected_report_metrics(self) -> set[str]:
         if not hasattr(self, "report_metric_checks"):
@@ -3258,7 +3486,7 @@ class SmartFitterMainWindow(QMainWindow):
         warnings = metadata.get("warnings")
         lines = [
             trace.file_name,
-            f"Detected experiment: {trace.experiment_type}",
+            f"Detected experiment: {self._experiment_display_name(trace.experiment_type)}",
             f"Scan type: {trace.scan_dim}",
             f"Axes: {', '.join(trace.scan_axes) if trace.scan_axes else trace.x_label}",
             f"Fit allowed: {'yes' if trace.fit_allowed else 'no'}",
@@ -3307,7 +3535,7 @@ class SmartFitterMainWindow(QMainWindow):
         save_type = str(metadata.get("save_type", "unknown"))
         scan_state = "fit" if trace.fit_allowed else "plot-only"
         bits = [
-            f"{trace.experiment_type} | {trace.scan_dim} | {scan_state}",
+            f"{self._experiment_display_name(trace.experiment_type)} | {trace.scan_dim} | {scan_state}",
             f"run={run_status}",
             f"save={save_type}",
         ]
@@ -3336,6 +3564,9 @@ class SmartFitterMainWindow(QMainWindow):
     def _friendly_mode_name(self, mode: str) -> str:
         return "signal" if mode == "raw_signal" else mode
 
+    def _experiment_display_name(self, experiment_type: str) -> str:
+        return {"Scan2D": "2D Scan", "LineScan": "1D Scan"}.get(experiment_type, experiment_type)
+
     def _update_profile_hint(self):
         if self.ctx.trace is None:
             self.profile_hint_lbl.setText("No file loaded.")
@@ -3345,7 +3576,7 @@ class SmartFitterMainWindow(QMainWindow):
         recommended_model = profile.candidate_models[0] if profile.candidate_models else "n/a"
         current_mode = self._friendly_mode_name(self._current_data_mode())
         override_note = "manual override" if self._mode_override_active else "profile default"
-        self.profile_hint_lbl.setText(f"Detected {self.ctx.trace.experiment_type} • {current_mode} • {recommended_model}")
+        self.profile_hint_lbl.setText(f"Detected {self._experiment_display_name(self.ctx.trace.experiment_type)} • {current_mode} • {recommended_model}")
         self.profile_hint_lbl.setToolTip(
             f"Recommended mode: {recommended_mode}. Recommended model: {recommended_model}. Current mode uses {override_note}."
         )
@@ -3375,12 +3606,15 @@ class SmartFitterMainWindow(QMainWindow):
         if not hasattr(self, "iteration_select_btn"):
             return
         count = self._iteration_count()
+        source = str(Path(self.ctx.trace.source_path).resolve()) if self.ctx.trace is not None else None
         if count <= 0:
             self._selected_iteration_indices.clear()
+            self._iteration_selection_source = source
+        elif source != self._iteration_selection_source:
+            self._selected_iteration_indices = set(range(count))
+            self._iteration_selection_source = source
         else:
             self._selected_iteration_indices = {idx for idx in self._selected_iteration_indices if 0 <= idx < count}
-            if not self._selected_iteration_indices:
-                self._selected_iteration_indices = {0}
         for widget in (
             self.iteration_select_btn,
             self.show_iteration_layer_chk,
@@ -3432,7 +3666,7 @@ class SmartFitterMainWindow(QMainWindow):
         is_scan = self._trace_is_scan()
         is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
-        is_fit_trace = bool(self.ctx.trace is None or self.ctx.trace.fit_allowed)
+        is_fit_trace = bool(self.ctx.trace is not None and self.ctx.trace.fit_allowed)
         fit_enabled = bool(is_fit_trace and self.ctx.trace is not None and self._active_fit_request is None)
         self.strategy_box.setVisible(is_fit_trace)
         self.command_fit_btn.setVisible(is_fit_trace)
@@ -3479,7 +3713,7 @@ class SmartFitterMainWindow(QMainWindow):
             self._show_loaded_trace_summary()
 
     def _refresh_plot_only(self):
-        view_state = self._capture_view_state()
+        view_state = None if self._overlay_view_dirty else self._capture_view_state()
         self._apply_plot_controls_to_state()
         if self.ctx.fit_result is not None and self.ctx.y is not None:
             plot_y = self.ctx.fit_target if self.ctx.fit_target is not None else self.ctx.y
@@ -3552,6 +3786,10 @@ class SmartFitterMainWindow(QMainWindow):
             defaults = self._legacy_presentation_state()
         self.presentation_defaults = defaults
         self.presentation_state = defaults.clone()
+        if self.presentation_state.annotation_style.mode != "Off":
+            self._annotation_enabled_mode = self.presentation_state.annotation_style.mode
+        self.presentation_state.annotation_style.mode = "Off"
+        self.presentation_state.annotation_style.visible = False
 
     def _sync_presentation_from_legacy_options(self) -> None:
         """Keep old session/preset payloads meaningful without serializing new overrides."""
@@ -3572,6 +3810,16 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_presentation_changed(self) -> None:
         self._applying_presentation_change = True
         try:
+            self.show_legend_chk.blockSignals(True)
+            self.show_legend_chk.setChecked(bool(self.presentation_state.legend.visible))
+            self.show_legend_chk.blockSignals(False)
+            annotation_mode = self.presentation_state.annotation_style.mode if self.presentation_state.annotation_style.visible else "Off"
+            if annotation_mode != "Off":
+                self._annotation_enabled_mode = annotation_mode
+            self.annotation_mode_combo.blockSignals(True)
+            self.annotation_mode_combo.setCurrentText(annotation_mode)
+            self.annotation_mode_combo.blockSignals(False)
+            self._sync_quick_toolbar_from_state()
             if self.ctx.trace is not None:
                 self._refresh_plot_only()
             else:
@@ -3642,7 +3890,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.main_splitter is not None:
             self.settings.setValue("layout/main_splitter_sizes", self.main_splitter.sizes())
         s = self.settings
-        s.setValue("ui/version", 3)
+        s.setValue("ui/version", 4)
         s.setValue("plot/fig_width", self.plot_opts.fig_width)
         s.setValue("plot/fig_height", self.plot_opts.fig_height)
         s.setValue("plot/save_dpi", self.plot_opts.save_dpi)
@@ -3677,6 +3925,7 @@ class SmartFitterMainWindow(QMainWindow):
         s.setValue("scan/colormap", self.scan_colormap_combo.currentText())
         s.setValue("scan/color_scale", self.scan_scale_combo.currentText())
         s.setValue("scan/reverse_colormap", self.scan_reverse_chk.isChecked())
+        s.setValue("scan/swap_axes", self.scan_swap_axes_chk.isChecked())
         s.setValue("scan/equal_aspect", self.scan_equal_aspect_chk.isChecked())
         s.setValue("scan/color_min", self.scan_vmin_edit.text())
         s.setValue("scan/color_max", self.scan_vmax_edit.text())
@@ -3718,7 +3967,12 @@ class SmartFitterMainWindow(QMainWindow):
         self.legend_loc_combo.setCurrentText(str(s.value("plot/legend_loc", self.plot_opts.legend_loc)))
         self.legend_font_spin.setValue(int(s.value("plot/legend_font_size", self.plot_opts.legend_font_size)))
         self.legend_compact_chk.setChecked(str(s.value("plot/legend_compact_labels", "true")).lower() != "false")
-        self.annotation_mode_combo.setCurrentText(str(s.value("plot/annotation_mode", "Compact")))
+        # Raw data opens without a large annotation box. A successful fit
+        # enables the last non-Off annotation mode automatically.
+        saved_annotation_mode = str(s.value("plot/annotation_mode", "Off"))
+        if saved_annotation_mode != "Off":
+            self._annotation_enabled_mode = saved_annotation_mode
+        self.annotation_mode_combo.setCurrentText("Off")
         self.annotation_loc_combo.setCurrentText(str(s.value("plot/annotation_loc", "upper right")))
         self.annotation_font_spin.setValue(int(s.value("plot/annotation_font_size", 9)))
         self.ann_file_model_chk.setChecked(True)
@@ -3732,15 +3986,19 @@ class SmartFitterMainWindow(QMainWindow):
         if scan_scale == "Robust 2–98%":
             scan_scale = "Robust percentiles"
         scan_reverse = str(s.value("scan/reverse_colormap", "false")).lower() == "true"
+        scan_swap = str(s.value("scan/swap_axes", "true")).lower() != "false" if ui_version >= 4 else True
         scan_equal = str(s.value("scan/equal_aspect", "false")).lower() == "true" if ui_version >= 3 else False
+        if ui_version < 4:
+            s.setValue("ui/version", 4)
+            s.setValue("scan/swap_axes", True)
         if ui_version < 3:
-            s.setValue("ui/version", 3)
             s.setValue("scan/equal_aspect", False)
         self._syncing_scan_controls = True
         try:
             self.scan_colormap_combo.setCurrentText(scan_cmap)
             self.scan_scale_combo.setCurrentText(scan_scale)
             self.scan_reverse_chk.setChecked(scan_reverse)
+            self.scan_swap_axes_chk.setChecked(scan_swap)
             self.scan_equal_aspect_chk.setChecked(scan_equal)
             self.scan_vmin_edit.setText(str(s.value("scan/color_min", "")))
             self.scan_vmax_edit.setText(str(s.value("scan/color_max", "")))
@@ -4072,7 +4330,28 @@ class SmartFitterMainWindow(QMainWindow):
         if p:
             self._load_file(p)
 
-    def _update_overlay_widgets(self):
+    def _overlay_item_name(self, item: QListWidgetItem) -> str:
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return str(value) if value is not None else item.text()
+
+    def _checked_overlay_names(self) -> set[str]:
+        if not hasattr(self, "overlay_list"):
+            return set(self._overlay_visible_names)
+        current = self.ctx.trace.file_name if self.ctx.trace is not None else None
+        return {
+            self._overlay_item_name(self.overlay_list.item(index))
+            for index in range(self.overlay_list.count())
+            if self.overlay_list.item(index).checkState() == Qt.Checked
+            and self._overlay_item_name(self.overlay_list.item(index)) != current
+        }
+
+    def _update_overlay_widgets(self, checked_names: set[str] | None = None):
+        checked_names = set(self._overlay_visible_names if checked_names is None else checked_names)
+        current = self.ctx.trace.file_name if self.ctx.trace is not None else None
+        checked_names.discard(current)
+        baseline_name = self.baseline_combo.currentText() if hasattr(self, "baseline_combo") else "None"
+        self._updating_overlay_list = True
+        self.overlay_list.blockSignals(True)
         self.overlay_list.clear()
         self.baseline_combo.blockSignals(True)
         self.baseline_combo.clear()
@@ -4080,11 +4359,45 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
         for name in sorted(self.ctx.loaded_traces.keys()):
-            item = QListWidgetItem(name)
-            item.setCheckState(Qt.Checked)
+            is_primary = name == current
+            item = QListWidgetItem(f"{name}  • PRIMARY" if is_primary else name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setCheckState(Qt.Checked if (is_primary or name in checked_names) else Qt.Unchecked)
+            if is_primary:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
             self.overlay_list.addItem(item)
             self.baseline_combo.addItem(name)
+        if self.baseline_combo.findText(baseline_name) >= 0:
+            self.baseline_combo.setCurrentText(baseline_name)
         self.baseline_combo.blockSignals(False)
+        self.overlay_list.blockSignals(False)
+        self._updating_overlay_list = False
+        self._overlay_visible_names = checked_names & set(self.ctx.loaded_traces.keys())
+
+    def _on_overlay_item_changed(self, _item: QListWidgetItem):
+        if self._updating_overlay_list:
+            return
+        self._overlay_visible_names = self._checked_overlay_names()
+        self._overlay_view_dirty = True
+        self._refresh_plot_only()
+
+    def on_show_all_overlays(self):
+        if not self.ctx.loaded_traces:
+            return
+        current = self.ctx.trace.file_name if self.ctx.trace is not None else None
+        self._overlay_visible_names = {name for name in self.ctx.loaded_traces if name != current}
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(self._overlay_visible_names)
+        self._refresh_plot_only()
+
+    def on_show_primary_only(self):
+        self._overlay_visible_names.clear()
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(set())
+        self._refresh_plot_only()
 
     def on_add_overlays(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Select overlay MAT files", "", "MAT files (*.mat)")
@@ -4093,20 +4406,24 @@ class SmartFitterMainWindow(QMainWindow):
         mode: DataMode = self._current_data_mode()  # type: ignore[assignment]
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
+        checked = self._checked_overlay_names()
         for p in paths:
             try:
                 tr = load_saved_data_mat(p, mode=mode)
             except Exception:
                 continue
             self.ctx.loaded_traces[tr.file_name] = tr
+            if self.ctx.trace is None or tr.file_name != self.ctx.trace.file_name:
+                checked.add(tr.file_name)
             self._update_recent_files(str(Path(p).resolve()))
-        self._update_overlay_widgets()
-        self._plot_raw()
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(checked)
+        self._refresh_plot_only()
 
     def on_remove_overlays(self):
         if not self.ctx.loaded_traces:
             return
-        selected = [it.text() for it in self.overlay_list.selectedItems()]
+        selected = [self._overlay_item_name(it) for it in self.overlay_list.selectedItems()]
         if not selected:
             return
         current_name = self.ctx.trace.file_name if self.ctx.trace is not None else ""
@@ -4114,8 +4431,10 @@ class SmartFitterMainWindow(QMainWindow):
             if nm == current_name:
                 continue
             self.ctx.loaded_traces.pop(nm, None)
-        self._update_overlay_widgets()
-        self._plot_raw()
+            self._overlay_visible_names.discard(nm)
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(self._overlay_visible_names)
+        self._refresh_plot_only()
 
     def on_clear_overlays(self):
         if self.ctx.loaded_traces is None:
@@ -4125,8 +4444,10 @@ class SmartFitterMainWindow(QMainWindow):
         if current and current in self.ctx.loaded_traces:
             keep[current] = self.ctx.loaded_traces[current]
         self.ctx.loaded_traces = keep
-        self._update_overlay_widgets()
-        self._plot_raw()
+        self._overlay_visible_names.clear()
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(set())
+        self._refresh_plot_only()
 
     def on_compare_traces(self):
         metric = self.compare_metric_combo.currentText()
@@ -4135,7 +4456,12 @@ class SmartFitterMainWindow(QMainWindow):
         labels: list[str] = []
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
+        included = self._checked_overlay_names()
+        if self.ctx.trace is not None:
+            included.add(self.ctx.trace.file_name)
         for name, tr in self.ctx.loaded_traces.items():
+            if name not in included:
+                continue
             x = tr.x_ns.copy()
             y = tr.y.copy()
             x, y = bin_trace(x, y, max(1, self.bin_spin.value()))
@@ -4201,14 +4527,28 @@ class SmartFitterMainWindow(QMainWindow):
         self.ax_res.set_title("Comparison plot (see summary for filename map)")
 
     def on_overlay_set_primary(self, item: QListWidgetItem):
-        nm = item.text()
+        nm = self._overlay_item_name(item)
         if not self.ctx.loaded_traces or nm not in self.ctx.loaded_traces:
             return
+        previous_primary = self.ctx.trace.file_name if self.ctx.trace is not None else None
+        if previous_primary == nm:
+            return
+        checked = self._checked_overlay_names()
+        if previous_primary and previous_primary != nm:
+            checked.add(previous_primary)
+        checked.discard(nm)
         self.ctx.trace = self.ctx.loaded_traces[nm]
+        self.command_file_lbl.setText(self.ctx.trace.file_name)
+        self.command_file_lbl.setToolTip(str(Path(self.ctx.trace.source_path).resolve()))
         self._reset_presentation_for_source(self.ctx.trace.source_path)
+        self._set_annotation_visible(False, refresh=False)
         self.ctx.fit_result = None
         self.ctx.fit_target = None
         self.ctx.odmr_peaks = None
+        self._selected_plot_point = None
+        self._scan_cursor = None
+        self._scan_view_limits = None
+        self.clear_marker_btn.setVisible(False)
         tr = self.ctx.trace
         if len(tr.x_ns) == 0:
             self._message("Overlay", "Selected overlay trace is empty in the current observable mode.")
@@ -4216,7 +4556,11 @@ class SmartFitterMainWindow(QMainWindow):
         self.roi_min.setText(f"{np.min(tr.x_ns):.6g}")
         self.roi_max.setText(f"{np.max(tr.x_ns):.6g}")
         self.rabi_dead_time_ns.setValue(float((tr.metadata or {}).get("rabi_dead_time_ns", 0.0) or 0.0))
-        self._update_contextual_visibility()
+        self._iteration_selection_source = None
+        self.apply_profile_defaults(reload_data=False)
+        self._update_iteration_controls()
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(checked)
         self._refresh_processed()
         self._show_loaded_trace_summary()
 
@@ -4430,7 +4774,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is None:
             raise ValueError("Load data before saving a session.")
         trace = self.ctx.trace
-        checked = {self.overlay_list.item(index).text() for index in range(self.overlay_list.count()) if self.overlay_list.item(index).checkState() == Qt.Checked}
+        checked = self._checked_overlay_names()
         overlays = [
             {
                 "name": name,
@@ -4458,6 +4802,7 @@ class SmartFitterMainWindow(QMainWindow):
                 "upper_percentile": self.scan_high_percentile_spin.value(),
                 "color_min": self.scan_vmin_edit.text(),
                 "color_max": self.scan_vmax_edit.text(),
+                "swap_axes": self.scan_swap_axes_chk.isChecked(),
                 "equal_aspect": self.scan_equal_aspect_chk.isChecked(),
                 "linecut": self.scan_linecut_combo.currentText(),
                 "secondary": self.scan_secondary_combo.currentText(),
@@ -4576,11 +4921,7 @@ class SmartFitterMainWindow(QMainWindow):
             except Exception as exc:
                 overlay_warnings.append(f"Could not load {overlay_path.name}: {exc}")
                 continue
-        self._update_overlay_widgets()
-        for index in range(self.overlay_list.count()):
-            item = self.overlay_list.item(index)
-            if item.text() in overlay_states:
-                item.setCheckState(Qt.Checked if overlay_states[item.text()] else Qt.Unchecked)
+        self._update_overlay_widgets({name for name, checked in overlay_states.items() if checked})
         self.profile_combo.setCurrentText(str(document.get("profile", "Auto")))
         self.model_combo.setCurrentText(str(document.get("model", self.model_combo.currentText())))
         roi = document.get("roi") or ["", ""]
@@ -4603,6 +4944,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.scan_high_percentile_spin.setValue(float(map_options.get("upper_percentile", 98.0)))
             self.scan_vmin_edit.setText(str(map_options.get("color_min", "")))
             self.scan_vmax_edit.setText(str(map_options.get("color_max", "")))
+            self.scan_swap_axes_chk.setChecked(bool(map_options.get("swap_axes", True)))
             self.scan_equal_aspect_chk.setChecked(bool(map_options.get("equal_aspect", self.scan_equal_aspect_chk.isChecked())))
             self.scan_linecut_combo.setCurrentText(str(map_options.get("linecut", "None")))
             self.scan_secondary_combo.setCurrentText(str(map_options.get("secondary", "None")))
@@ -4727,8 +5069,6 @@ class SmartFitterMainWindow(QMainWindow):
             if self.ctx.trace is None:
                 return PROFILES["LineScan"]
             exp = self.ctx.trace.experiment_type
-            if exp == "LineScan" and "t1" in self.ctx.trace.file_name.lower():
-                exp = "T1"
             return PROFILES.get(exp if exp in PROFILES else "LineScan")
         return PROFILES.get(p if p in PROFILES else "LineScan")
 
@@ -4766,6 +5106,8 @@ class SmartFitterMainWindow(QMainWindow):
         if self._is_loading:
             return False
         preserve_mode_override = self._mode_override_active
+        checked_overlays = self._checked_overlay_names() if preserve_analysis else set()
+        prior_overlays = list((self.ctx.loaded_traces or {}).items()) if preserve_analysis else []
         self._is_loading = True
         try:
             mode: DataMode = self._current_data_mode()  # type: ignore[assignment]
@@ -4780,6 +5122,7 @@ class SmartFitterMainWindow(QMainWindow):
             return False
         self._reset_presentation_for_source(trace.source_path)
         self.ctx.trace = trace
+        self._set_annotation_visible(False, refresh=False)
         if hasattr(self, "plot_stack"):
             self.plot_stack.setCurrentIndex(1)
         if hasattr(self, "copy_figure_btn"):
@@ -4801,27 +5144,35 @@ class SmartFitterMainWindow(QMainWindow):
             self.ctx.analysis_steps = []
             self.ctx.pending_locks = {}
             self._history.clear()
+            self._iteration_selection_source = None
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
         self.ctx.loaded_traces[trace.file_name] = trace
-        self._update_overlay_widgets()
+        if preserve_analysis:
+            for name, prior in prior_overlays:
+                if Path(prior.source_path).resolve() == Path(trace.source_path).resolve():
+                    continue
+                try:
+                    self.ctx.loaded_traces[name] = load_saved_data_mat(prior.source_path, mode=mode)
+                except Exception:
+                    self.ctx.loaded_traces[name] = prior
+        else:
+            self._overlay_visible_names.clear()
+        self._overlay_view_dirty = not preserve_analysis
+        self._update_overlay_widgets(checked_overlays)
         self._update_recent_files(str(Path(file_path).resolve()))
         self.roi_min.setText(f"{np.min(trace.x_ns):.6g}")
         self.roi_max.setText(f"{np.max(trace.x_ns):.6g}")
 
-        exp_guess = trace.experiment_type
-        if exp_guess == "LineScan" and "t1" in trace.file_name.lower():
-            exp_guess = "T1"
-        if self.profile_combo.currentText() == "Auto":
-            self.profile_combo.blockSignals(True)
-            self.profile_combo.setCurrentText(exp_guess if exp_guess in PROFILES else "LineScan")
-            self.profile_combo.blockSignals(False)
+        # Keep Auto selected across files. The old behavior replaced Auto with
+        # the first detected family, which made later files inherit the wrong
+        # analysis mode (often Ramsey) until the user noticed the stale choice.
         self._mode_override_active = preserve_mode_override
         self.apply_profile_defaults(reload_data=False)
+        self._update_iteration_controls()
         self._update_contextual_visibility()
         self._refresh_processed()
         self.rabi_dead_time_ns.setValue(float((trace.metadata or {}).get("rabi_dead_time_ns", 0.0) or 0.0))
-        self._update_iteration_controls()
         self._update_profile_hint()
         self._show_loaded_trace_summary()
         self._is_loading = False
@@ -5179,13 +5530,14 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _plot_style_for(self, role: str) -> tuple[str, dict[str, object]]:
         style = self.plot_opts.plot_style
+        scale = float(getattr(self, "_plot_scale", 1.0))
         if role in {"fit", "smoothed", "overlay", "linecut"}:
-            return "-", {"lw": 2.0}
+            return "-", {"lw": 2.0 * scale}
         if style == "Scatter":
-            return "o", {"ms": 4, "linestyle": "None", "alpha": 0.65}
+            return "o", {"ms": 4 * scale, "linestyle": "None", "alpha": 0.65}
         if style == "Line":
-            return "-", {"lw": 1.8, "alpha": 0.9}
-        return "o-", {"ms": 3.6, "lw": 1.2, "alpha": 0.78}
+            return "-", {"lw": 1.8 * scale, "alpha": 0.9}
+        return "o-", {"ms": 3.6 * scale, "lw": 1.2 * scale, "alpha": 0.78}
 
     def _start_series_registry(self) -> None:
         self._series_registry = []
@@ -5609,12 +5961,15 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is None:
             return {}
         if self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None:
-            z = np.asarray(self.ctx.trace.z2d, dtype=float)
+            display = self._scan2d_display_data(self.ctx.trace)
+            if display is None:
+                return {}
+            x_centers, y_centers, z, _x_label, _y_label = display
             max_idx = np.unravel_index(int(np.nanargmax(z)), z.shape)
             min_idx = np.unravel_index(int(np.nanargmin(z)), z.shape)
             return {
-                "max": (float(self.ctx.trace.x2d[max_idx]), float(self.ctx.trace.y2d[max_idx]), float(z[max_idx])),
-                "min": (float(self.ctx.trace.x2d[min_idx]), float(self.ctx.trace.y2d[min_idx]), float(z[min_idx])),
+                "max": (float(x_centers[max_idx[1]]), float(y_centers[max_idx[0]]), float(z[max_idx])),
+                "min": (float(x_centers[min_idx[1]]), float(y_centers[min_idx[0]]), float(z[min_idx])),
             }
         if self.ctx.trace.scan_dim == "scan1d" and self.ctx.x is not None and self.ctx.y is not None and len(self.ctx.x):
             max_idx = int(np.nanargmax(self.ctx.y))
@@ -5688,9 +6043,10 @@ class SmartFitterMainWindow(QMainWindow):
     def _extract_scan_linecut(self) -> tuple[np.ndarray, np.ndarray, str] | None:
         if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or self.ctx.trace.z2d is None:
             return None
-        x2d = np.asarray(self.ctx.trace.x2d, dtype=float)
-        y2d = np.asarray(self.ctx.trace.y2d, dtype=float)
-        z2d = np.asarray(self.ctx.trace.z2d, dtype=float)
+        display = self._scan2d_display_data(self.ctx.trace)
+        if display is None:
+            return None
+        x_centers, y_centers, z2d, _x_label, _y_label = display
         mode = self.scan_linecut_combo.currentText()
         if mode.strip().lower() == "none":
             return None
@@ -5701,11 +6057,11 @@ class SmartFitterMainWindow(QMainWindow):
             cx, cy = self._scan_cursor
         else:
             return None
-        row = int(np.argmin(np.abs(y2d[:, 0] - cy)))
-        col = int(np.argmin(np.abs(x2d[0, :] - cx)))
+        row = int(np.argmin(np.abs(y_centers - cy)))
+        col = int(np.argmin(np.abs(x_centers - cx)))
         if "horizontal" in mode.lower():
-            return x2d[row, :], z2d[row, :], f"Horizontal linecut @ y={y2d[row, 0]:.6g}"
-        return y2d[:, col], z2d[:, col], f"Vertical linecut @ x={x2d[0, col]:.6g}"
+            return x_centers, z2d[row, :], f"Horizontal linecut @ y={y_centers[row]:.6g}"
+        return y_centers, z2d[:, col], f"Vertical linecut @ x={x_centers[col]:.6g}"
 
     def _on_plot_motion(self, event):
         if self.mask_mode_combo.currentText() != "Inspect point" or event.inaxes not in self._inspectable_axes():
@@ -5718,7 +6074,13 @@ class SmartFitterMainWindow(QMainWindow):
             self._crosshair_h.set_ydata([event.ydata, event.ydata])
             self._crosshair_v.set_visible(True)
             self._crosshair_h.set_visible(True)
-            z = float(self.ctx.trace.z2d[int(np.argmin(np.abs(self.ctx.trace.y2d[:, 0] - event.ydata))), int(np.argmin(np.abs(self.ctx.trace.x2d[0, :] - event.xdata)))])
+            display = self._scan2d_display_data(self.ctx.trace)
+            if display is None:
+                return
+            x_centers, y_centers, z2d, _x_label, _y_label = display
+            row = int(np.argmin(np.abs(y_centers - event.ydata)))
+            col = int(np.argmin(np.abs(x_centers - event.xdata)))
+            z = float(z2d[row, col])
             self._update_point_readout(
                 f"Point readout: x={self._format_inspect_value(float(event.xdata))}, "
                 f"y={self._format_inspect_value(float(event.ydata))}, "
@@ -5782,7 +6144,7 @@ class SmartFitterMainWindow(QMainWindow):
             y,
             "\n".join(lines),
             transform=self.ax_main.transAxes,
-            fontsize=style.font_size,
+            fontsize=max(6.0, style.font_size * float(getattr(self, "_plot_scale", 1.0))),
             ha=ha,
             va=va,
             color=style.text_color,
@@ -5827,6 +6189,16 @@ class SmartFitterMainWindow(QMainWindow):
             pass
         self.ax_res.set_position(self._ax_res_default_pos)
 
+    def _configure_1d_layout(self, show_detail: bool) -> None:
+        if show_detail:
+            self.ax_main.set_position(self._ax_main_default_pos)
+            self.ax_res.set_position(self._ax_res_default_pos)
+            return
+        rect = [0.10, 0.13, 0.82, 0.76]
+        self.ax_main.set_position(rect)
+        if self._ax_secondary is not None:
+            self._ax_secondary.set_position(rect)
+
     def _scan2d_axis_edges(self, centers: np.ndarray) -> np.ndarray:
         values = np.asarray(centers, dtype=float).ravel()
         if values.size == 0:
@@ -5840,15 +6212,29 @@ class SmartFitterMainWindow(QMainWindow):
         last = values[-1] + 0.5 * deltas[-1]
         return np.concatenate([[first], mids, [last]]).astype(float)
 
-    def _scan2d_extent(self, trace: ExperimentTrace) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]] | None:
+    def _scan2d_display_data(self, trace: ExperimentTrace) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str] | None:
         if trace.x2d is None or trace.y2d is None or trace.z2d is None:
             return None
         x2d = np.asarray(trace.x2d, dtype=float)
         y2d = np.asarray(trace.y2d, dtype=float)
-        if x2d.ndim != 2 or y2d.ndim != 2 or x2d.size == 0 or y2d.size == 0:
+        z2d = np.asarray(trace.z2d, dtype=float)
+        if x2d.ndim != 2 or y2d.ndim != 2 or z2d.ndim != 2 or x2d.size == 0 or y2d.size == 0:
             return None
-        x_edges = self._scan2d_axis_edges(x2d[0, :])
-        y_edges = self._scan2d_axis_edges(y2d[:, 0])
+        x_centers = np.asarray(x2d[0, :], dtype=float)
+        y_centers = np.asarray(y2d[:, 0], dtype=float)
+        x_label = trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"
+        y_label = trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"
+        if self.scan_swap_axes_chk.isChecked():
+            return y_centers, x_centers, z2d.T, y_label, x_label
+        return x_centers, y_centers, z2d, x_label, y_label
+
+    def _scan2d_extent(self, trace: ExperimentTrace) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]] | None:
+        display = self._scan2d_display_data(trace)
+        if display is None:
+            return None
+        x_centers, y_centers, _z2d, _x_label, _y_label = display
+        x_edges = self._scan2d_axis_edges(x_centers)
+        y_edges = self._scan2d_axis_edges(y_centers)
         if len(x_edges) < 2 or len(y_edges) < 2:
             return None
         xmin, xmax = float(np.nanmin(x_edges)), float(np.nanmax(x_edges))
@@ -5971,7 +6357,7 @@ class SmartFitterMainWindow(QMainWindow):
             labels = [item[2] for item in entries]
             legend_kwargs: dict[str, Any] = {
                 "loc": style.location,
-                "fontsize": style.font_size,
+                "fontsize": max(6.0, style.font_size * float(getattr(self, "_plot_scale", 1.0))),
                 "ncol": style.columns,
                 "frameon": style.frame_visible,
                 "fancybox": True,
@@ -6007,7 +6393,7 @@ class SmartFitterMainWindow(QMainWindow):
                 continue
             ax.set_facecolor("#ffffff")
             ax.set_axisbelow(True)
-            ax.tick_params(axis="both", colors="#526159", labelsize=9, width=0.8)
+            ax.tick_params(axis="both", colors="#526159", labelsize=max(6.0, 9 * self._plot_scale), width=max(0.6, 0.8 * self._plot_scale))
             ax.xaxis.label.set_color("#26332d")
             ax.yaxis.label.set_color("#26332d")
             ax.title.set_color("#1d2923")
@@ -6015,7 +6401,7 @@ class SmartFitterMainWindow(QMainWindow):
                 spine.set_color("#c8d2cc")
                 spine.set_linewidth(0.8)
         if self._scan_colorbar is not None:
-            self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=8)
+            self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=max(6.0, 8 * self._plot_scale))
             self._scan_colorbar.ax.yaxis.label.set_color("#26332d")
 
     def _presentation_axis_map(self) -> dict[str, Any]:
@@ -6042,6 +6428,7 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _apply_axis_presentation(self, ax, role: str) -> None:
         style = self.presentation_state.axis(role)
+        scale = float(getattr(self, "_plot_scale", 1.0))
         generated_title = ax.get_title()
         generated_xlabel = ax.get_xlabel()
         generated_ylabel = ax.get_ylabel()
@@ -6050,27 +6437,29 @@ class SmartFitterMainWindow(QMainWindow):
         ylabel_text = generated_ylabel if style.ylabel.mode == "Auto" else style.ylabel.text
         ax.set_title(
             title_text if style.title.visible else "",
-            fontsize=style.title.font_size,
+            fontsize=max(7.0, style.title.font_size * scale),
             fontweight=style.title.font_weight,
             color=style.title.color,
-            pad=style.title.padding,
+            pad=style.title.padding * scale,
         )
         ax.set_xlabel(
             xlabel_text if style.xlabel.visible else "",
-            fontsize=style.xlabel.font_size,
+            fontsize=max(7.0, style.xlabel.font_size * scale),
             fontweight=style.xlabel.font_weight,
             color=style.xlabel.color,
-            labelpad=style.xlabel.padding,
+            labelpad=style.xlabel.padding * scale,
         )
         ax.set_ylabel(
             ylabel_text if style.ylabel.visible else "",
-            fontsize=style.ylabel.font_size,
+            fontsize=max(7.0, style.ylabel.font_size * scale),
             fontweight=style.ylabel.font_weight,
             color=style.ylabel.color,
-            labelpad=style.ylabel.padding,
+            labelpad=style.ylabel.padding * scale,
         )
         apply_tick_style(ax, "x", style.x_ticks)
         apply_tick_style(ax, "y", style.y_ticks)
+        for label in (*ax.xaxis.get_ticklabels(), *ax.yaxis.get_ticklabels()):
+            label.set_fontsize(max(6.0, label.get_fontsize() * scale))
         x_on_top = style.x_ticks.label_top or (style.x_ticks.top and not style.x_ticks.bottom)
         y_on_right = style.y_ticks.label_right or (style.y_ticks.right and not style.y_ticks.left)
         ax.xaxis.set_label_position("top" if x_on_top and not style.x_ticks.label_bottom else "bottom")
@@ -6212,7 +6601,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._plot_annotation_artist = None
         self._detail_axis_role = "residual"
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
-        view_state = self._capture_view_state() if (not self._is_loading and not is_scan2d) else None
+        view_state = self._capture_view_state() if (not self._is_loading and not is_scan2d and not self._overlay_view_dirty) else None
         self._apply_plot_controls_to_state()
         self._clear_secondary_axis()
         self._clear_scan_colorbar()
@@ -6223,19 +6612,21 @@ class SmartFitterMainWindow(QMainWindow):
         self._crosshair_h = None
         primary_series: list[np.ndarray] = []
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None:
+            display = self._scan2d_display_data(self.ctx.trace)
             scan_extent = self._scan2d_extent(self.ctx.trace)
-            if scan_extent is None:
+            if display is None or scan_extent is None:
                 self.summary_text.setPlainText("2D scan map is unavailable because scan axes are malformed.")
                 return
+            _x_centers, _y_centers, display_z, display_x_label, display_y_label = display
             x_edges, y_edges, extent = scan_extent
             xmin, xmax, ymin, ymax = extent
             linecut = self._extract_scan_linecut()
             if linecut is not None:
                 self._detail_axis_role = "linecut"
             self._configure_scan2d_layout(show_linecut=linecut is not None, extent=extent)
-            low, high = self._scan_color_limits(self.ctx.trace.z2d)
+            low, high = self._scan_color_limits(display_z)
             mesh = self.ax_main.pcolormesh(
-                x_edges, y_edges, self.ctx.trace.z2d, shading="flat",
+                x_edges, y_edges, display_z, shading="flat",
                 cmap=self._scan_colormap_name(), vmin=low, vmax=high,
             )
             # The axes box is already fitted to the scan's physical aspect by
@@ -6245,8 +6636,8 @@ class SmartFitterMainWindow(QMainWindow):
                 self.ax_main.set_aspect("equal", adjustable="datalim")
             else:
                 self.ax_main.set_aspect("auto", adjustable="datalim")
-            self.ax_main.set_xlabel(self._friendly_axis_label(self.ctx.trace.scan_axes[0] if len(self.ctx.trace.scan_axes) > 0 else "X"))
-            self.ax_main.set_ylabel(self._friendly_axis_label(self.ctx.trace.scan_axes[1] if len(self.ctx.trace.scan_axes) > 1 else "Y"))
+            self.ax_main.set_xlabel(self._friendly_axis_label(display_x_label))
+            self.ax_main.set_ylabel(self._friendly_axis_label(display_y_label))
             self.ax_main.set_title(f"{self.ctx.trace.file_name} | 2D scan map")
             self._scan_colorbar = self.fig.colorbar(mesh, cax=self._scan_colorbar_ax)
             self._scan_colorbar.set_label(self._current_observable_label())
@@ -6268,7 +6659,7 @@ class SmartFitterMainWindow(QMainWindow):
                 lx, ly, title = linecut
                 self._plot_series(self.ax_res, lx, ly, "Linecut", role="linecut", series_id="linecut", color="#4fc3f7")
                 self.ax_res.set_title(title)
-                self.ax_res.set_xlabel(self._friendly_axis_label(self.ctx.trace.scan_axes[0] if "horizontal" in title.lower() else self.ctx.trace.scan_axes[1]))
+                self.ax_res.set_xlabel(self._friendly_axis_label(display_x_label if "horizontal" in title.lower() else display_y_label))
                 self.ax_res.set_ylabel(self._current_observable_label())
                 self.ax_res.grid(True, alpha=0.3)
         else:
@@ -6294,13 +6685,17 @@ class SmartFitterMainWindow(QMainWindow):
                     item = self.overlay_list.item(i)
                     if item.checkState() != Qt.Checked:
                         continue
-                    nm = item.text()
+                    nm = self._overlay_item_name(item)
                     if self.ctx.trace is not None and nm == self.ctx.trace.file_name:
                         continue
                     tr = self.ctx.loaded_traces.get(nm)
                     if tr is None:
                         continue
-                    overlay_processed = process_series(tr.x_ns, tr.y, bin_size=self.bin_spin.value(), roi=self._parse_roi())
+                    # The primary ROI is a fit/preprocessing choice for the
+                    # primary trace. Applying it to overlays silently clipped
+                    # them to the newest file's axis, making longer selected
+                    # traces appear missing.
+                    overlay_processed = process_series(tr.x_ns, tr.y, bin_size=self.bin_spin.value())
                     tx, ty = overlay_processed.fit_x, overlay_processed.fit_y
                     ty_disp, _ = self._display_y(ty)
                     primary_series.append(np.asarray(ty_disp, dtype=float))
@@ -6352,8 +6747,10 @@ class SmartFitterMainWindow(QMainWindow):
             self._apply_combined_legend()
             self._update_scan_summary()
             is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
-            self.ax_res.set_visible(self.plot_opts.show_fft_panel and not is_scan1d)
-            if self.plot_opts.show_fft_panel:
+            show_detail = bool(self.plot_opts.show_fft_panel and not is_scan1d)
+            self.ax_res.set_visible(show_detail)
+            self._configure_1d_layout(show_detail)
+            if show_detail:
                 self._detail_axis_role = "fft"
                 y_fft = (
                     self.ctx.y_smooth
@@ -6378,6 +6775,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._apply_all_axis_presentation()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
+        self._overlay_view_dirty = False
         self._refresh_open_plot_editor()
 
     def on_fft(self):
@@ -6771,14 +7169,18 @@ class SmartFitterMainWindow(QMainWindow):
         if not extras:
             return
         added = 0
+        checked: set[str] = set()
         for extra in extras:
             try:
                 trace = load_saved_data_mat(extra, mode=self._current_data_mode())
             except Exception:
                 continue
             self.ctx.loaded_traces[trace.file_name] = trace
+            checked.add(trace.file_name)
             added += 1
-        self._update_overlay_widgets()
+        self._overlay_view_dirty = True
+        self._update_overlay_widgets(checked)
+        self._refresh_plot_only()
         if added:
             self._message("Overlay files added", f"Loaded {Path(primary).name} and added {added} extra dropped file(s) as overlays.")
 
@@ -6887,6 +7289,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.fit_target = display_y
 
         self._populate_param_table(result.param_names, result.params)
+        self._set_annotation_visible(True, refresh=False)
         self._plot_fit(result, display_y)
 
         profile = self._active_profile()
@@ -7111,7 +7514,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.analysis_steps:
             x, y_raw, _ = apply_steps(raw_x, raw_y, self.ctx.analysis_steps)
             _fit_x, fit_for_display, _ = apply_steps(raw_x, fit_for_display, self.ctx.analysis_steps)
-        view_state = self._capture_view_state() if not self._is_loading else None
+        view_state = self._capture_view_state() if (not self._is_loading and not self._overlay_view_dirty) else None
         self._apply_plot_controls_to_state()
         self._clear_secondary_axis()
         self._clear_scan_colorbar()
@@ -7139,13 +7542,13 @@ class SmartFitterMainWindow(QMainWindow):
                 item = self.overlay_list.item(i)
                 if item.checkState() != Qt.Checked:
                     continue
-                nm = item.text()
+                nm = self._overlay_item_name(item)
                 if self.ctx.trace is not None and nm == self.ctx.trace.file_name:
                     continue
                 tr = self.ctx.loaded_traces.get(nm)
                 if tr is None:
                     continue
-                overlay_processed = process_series(tr.x_ns, tr.y, bin_size=self.bin_spin.value(), roi=self._parse_roi())
+                overlay_processed = process_series(tr.x_ns, tr.y, bin_size=self.bin_spin.value())
                 tx, ty = overlay_processed.fit_x, overlay_processed.fit_y
                 ty_disp, _ = self._display_y(ty)
                 primary_series.append(np.asarray(ty_disp, dtype=float))
@@ -7212,8 +7615,10 @@ class SmartFitterMainWindow(QMainWindow):
 
         fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else raw_y
         residual = fit_target - fit_result.y_fit
-        self.ax_res.set_visible((self.plot_opts.show_residual or self.plot_opts.show_fft_panel) and not self.ctx.analysis_steps)
-        if self.plot_opts.show_fft_panel:
+        show_detail = bool((self.plot_opts.show_residual or self.plot_opts.show_fft_panel) and not self.ctx.analysis_steps)
+        self.ax_res.set_visible(show_detail)
+        self._configure_1d_layout(show_detail)
+        if show_detail and self.plot_opts.show_fft_panel:
             y_fft = y_raw
             if len(x) > 3:
                 dt = float(np.median(np.diff(x)))
@@ -7223,7 +7628,7 @@ class SmartFitterMainWindow(QMainWindow):
                 self.ax_res.set_xlabel("Frequency (MHz)")
                 self.ax_res.set_ylabel("FFT amplitude")
                 self.ax_res.grid(True, alpha=0.3)
-        elif self.plot_opts.show_residual:
+        elif show_detail and self.plot_opts.show_residual:
             self.ax_res.plot(raw_x, residual, ".", ms=3)
             self.ax_res.axhline(0.0, ls="--", lw=1, color="k")
             self.ax_res.set_xlabel(self.ctx.trace.x_label if self.ctx.trace else "X")
@@ -7237,6 +7642,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._apply_all_axis_presentation()
         self._reset_export_navigation_history()
         self.canvas.draw_idle()
+        self._overlay_view_dirty = False
         self._refresh_open_plot_editor()
 
     def on_save_results(self):

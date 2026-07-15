@@ -40,6 +40,9 @@ def test_startup_empty_state_and_loaded_action_availability():
     assert not win.btn_fit.isEnabled()
     assert not win.btn_save.isEnabled()
     assert not win.copy_figure_btn.isEnabled()
+    assert win.profile_combo.currentText() == "Auto"
+    assert win.model_combo.currentText() == "LineScan"
+    assert win.strategy_box.isHidden()
 
     assert win._load_file(str(_fixture("TestData", "Rabi_2206GHz4ns.mat")))
     assert win.plot_stack.currentIndex() == 1
@@ -204,6 +207,17 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+    assert win.ctx.trace.experiment_type == "Scan2D"
+    assert win.scan_swap_axes_chk.isChecked()
+    assert "Stage Z" in win.ax_main.get_xlabel()
+    assert "Stage X" in win.ax_main.get_ylabel()
+    swapped_extent = win._scan2d_extent(win.ctx.trace)[2]
+    win.scan_swap_axes_chk.setChecked(False)
+    assert "Stage X" in win.ax_main.get_xlabel()
+    assert "Stage Z" in win.ax_main.get_ylabel()
+    unswapped_extent = win._scan2d_extent(win.ctx.trace)[2]
+    assert swapped_extent == pytest.approx((unswapped_extent[2], unswapped_extent[3], unswapped_extent[0], unswapped_extent[1]))
+    win.scan_swap_axes_chk.setChecked(True)
     win.scan_equal_aspect_chk.setChecked(True)
     win._refresh_plot_only()
 
@@ -312,12 +326,12 @@ def test_gui_scan_click_selection_updates_cursor_on_wysiwyg_plot():
     x0 = float(win.ctx.trace.x2d[0, 0])
     y0 = float(win.ctx.trace.y2d[0, 0])
     z0 = float(win.ctx.trace.z2d[0, 0])
-    win._select_point_from_plot(x0, y0, refresh=True)
+    win._select_point_from_plot(y0, x0, refresh=True)
 
-    assert win._scan_cursor == (x0, y0)
+    assert win._scan_cursor == (y0, x0)
     assert win._selected_plot_point["z"] == z0
     assert "z=" in win.live_readout_lbl.text()
-    assert any(np.allclose(line.get_xdata(), [x0, x0]) for line in win.ax_main.lines)
+    assert any(np.allclose(line.get_xdata(), [y0, y0]) for line in win.ax_main.lines)
 
 
 def test_gui_cursor_linecuts_leave_navigation_mode_and_follow_selected_cell():
@@ -337,17 +351,17 @@ def test_gui_cursor_linecuts_leave_navigation_mode_and_follow_selected_cell():
     row, col = 3, 7
     x0 = float(win.ctx.trace.x2d[row, col])
     y0 = float(win.ctx.trace.y2d[row, col])
-    win._on_plot_click(SimpleNamespace(dblclick=False, inaxes=win.ax_main, xdata=x0, ydata=y0))
+    win._on_plot_click(SimpleNamespace(dblclick=False, inaxes=win.ax_main, xdata=y0, ydata=x0))
 
-    assert win._scan_cursor == (x0, y0)
-    assert win.ax_res.get_visible()
-    assert np.allclose(win.ax_res.lines[0].get_xdata(), win.ctx.trace.x2d[row, :])
-    assert np.allclose(win.ax_res.lines[0].get_ydata(), win.ctx.trace.z2d[row, :])
-
-    win.scan_linecut_combo.setCurrentText("Cursor vertical")
+    assert win._scan_cursor == (y0, x0)
     assert win.ax_res.get_visible()
     assert np.allclose(win.ax_res.lines[0].get_xdata(), win.ctx.trace.y2d[:, col])
     assert np.allclose(win.ax_res.lines[0].get_ydata(), win.ctx.trace.z2d[:, col])
+
+    win.scan_linecut_combo.setCurrentText("Cursor vertical")
+    assert win.ax_res.get_visible()
+    assert np.allclose(win.ax_res.lines[0].get_xdata(), win.ctx.trace.x2d[row, :])
+    assert np.allclose(win.ax_res.lines[0].get_ydata(), win.ctx.trace.z2d[row, :])
 
 
 def test_gui_exclusion_workflow_uses_selected_point_and_ranges():
@@ -709,11 +723,87 @@ def test_gui_metadata_panel_and_observable_layers_do_not_change_mode():
     assert max(line.get_ydata().max() for line in win.ax_main.lines if len(line.get_ydata())) < 2.0
 
 
+def test_gui_auto_detection_updates_each_new_primary_instead_of_sticking_on_ramsey():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    win._load_file(str(_fixture("TestData", "RamseyAtResonance2203.mat")))
+    assert win.profile_combo.currentText() == "Auto"
+    assert win.model_combo.currentText() == "RamseyAuto"
+
+    win._load_file(str(_fixture("TestData", "Rabi_2206GHz4ns.mat")))
+    assert win.profile_combo.currentText() == "Auto"
+    assert win.model_combo.currentText() == "Rabi"
+
+
+def test_gui_overlay_registry_starts_primary_only_and_explicit_selection_fits_combined_range():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    long_path = _fixture("TestData", "Rabi10us.mat")
+    short_path = _fixture("TestData", "Rabi_2206GHz4ns.mat")
+
+    win._load_file(str(long_path))
+    win._load_file(str(short_path))
+
+    assert {long_path.name, short_path.name} <= set(win.ctx.loaded_traces)
+    assert win.ctx.trace.file_name == short_path.name
+    assert win._checked_overlay_names() == set()
+    assert not any(descriptor.series_id.startswith("overlay:") for descriptor in win._series_registry)
+
+    win.on_show_all_overlays()
+    assert win._checked_overlay_names() == {long_path.name}
+    assert any(descriptor.series_id.startswith("overlay:") for descriptor in win._series_registry)
+    assert win.ax_main.get_xlim()[1] > 4500.0
+
+    win.on_show_primary_only()
+    assert win._checked_overlay_names() == set()
+    assert win.ax_main.get_xlim()[1] < 500.0
+
+
+def test_gui_responsive_scaling_reflows_toolbar_and_scales_plot_text():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi_2206GHz4ns.mat")))
+    win.presentation_state.annotation_style.font_size = 14
+    win._set_annotation_visible(True, refresh=True)
+
+    win.resize(900, 560)
+    win._apply_responsive_scaling(force=True)
+
+    assert win._ui_scale < 1.0
+    assert win.left_panel.minimumWidth() < 240
+    assert win.right_panel.minimumWidth() < 360
+    rows = [win.plot_quick_grid.getItemPosition(i)[0] for i in range(win.plot_quick_grid.count())]
+    assert max(rows) >= 1
+    assert win._plot_annotation_artist is not None
+    assert win._plot_annotation_artist.get_fontsize() < 14
+    assert win.ax_main.get_position().height > win._ax_main_default_pos.height
+
+
 def test_gui_plot_toolbar_syncs_with_drawer_controls():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "NewCodebaseTests", "323RabiFullRun__checkpoint.mat")))
+
+    for button in (
+        win.quick_data_btn,
+        win.quick_fit_btn,
+        win.quick_smooth_btn,
+        win.quick_legend_btn,
+        win.quick_annotation_btn,
+        win.quick_signal_btn,
+        win.quick_reference_btn,
+        win.quick_iterations_btn,
+    ):
+        assert win.plot_quick_grid.indexOf(button) >= 0
+
+    win.quick_legend_btn.setChecked(False)
+    assert not win.show_legend_chk.isChecked()
+    assert not win.presentation_state.legend.visible
 
     win.quick_signal_btn.setChecked(True)
     win.quick_reference_btn.setChecked(True)
@@ -737,6 +827,9 @@ def test_gui_rabi_envelope_control_plot_and_annotation():
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "NewCodebaseTests", "323RabiFullRun__checkpoint.mat")))
+    assert win.annotation_mode_combo.currentText() == "Off"
+    assert not win.quick_annotation_btn.isChecked()
+    assert win._plot_annotation_artist is None
 
     fake_result = FitResult(
         model_name="RabiCosine",
@@ -768,6 +861,9 @@ def test_gui_rabi_envelope_control_plot_and_annotation():
     )
 
     win.on_fit_finished(fake_result)
+    assert win.annotation_mode_combo.currentText() != "Off"
+    assert win.quick_annotation_btn.isChecked()
+    assert win._plot_annotation_artist is not None
     win._apply_plot_controls_to_state()
     assert win.plot_opts.show_rabi_envelope
     assert any(line.get_label() in {"Envelope", "Rabi envelope"} for line in win.ax_main.lines)
@@ -796,6 +892,8 @@ def test_gui_multi_iteration_overlay_and_point_readout():
     win._load_file(str(_fixture("TestData", "NewCodebaseTests", "323RabiFullRun__checkpoint.mat")))
 
     assert win._iteration_count() > 1
+    assert win._selected_iteration_indices == set(range(win._iteration_count()))
+    assert win.iteration_summary_lbl.text() == f"All {win._iteration_count()}"
     win._selected_iteration_indices = {0, 1}
     win.show_iteration_layer_chk.setChecked(True)
     win.show_iteration_mean_chk.setChecked(False)

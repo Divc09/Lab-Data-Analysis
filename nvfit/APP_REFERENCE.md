@@ -152,7 +152,7 @@ Main class: `SmartFitterMainWindow` in `gui_app.py`.
 - **Batch**: folder setup, progress/cancellation, searchable results, a run log, and selected-result details.
 - Reversible fit exclusions and transforms remain available under the collapsed **Advanced** section without plot interaction modes.
 
-Analyze side panes are scrollable with collapsible section groups and no horizontal scrolling at the supported 1366x768 minimum layout.
+Analyze side panes are scrollable with collapsible section groups and no horizontal scrolling. UI spacing, side-panel minima, toolbar wrapping, and Matplotlib text/marker sizes scale with the available display and current window size.
 Mouse-wheel safety is enforced for combo/spin controls: wheel changes are ignored unless the widget has focus.
 
 ### 8.2 Plot controls
@@ -169,6 +169,7 @@ Edits update the WYSIWYG figure immediately. Current-file overrides survive redr
 
 Base plot toggles/settings include:
 
+- The always-visible quick bar exposes Data, Fit, Smooth, Legend, Annotations, Signal, Reference, Iterations, and iteration selection
 - Show data/smoothed/fit/ODMR peaks
 - Show residual subplot
 - Observable and iteration layers
@@ -273,7 +274,7 @@ For spatial scans, batch writes plot-only results with explicit no-fit status.
 
 From `profiles.py`:
 
-- Profiles: Ramsey, Rabi, SpinEcho, DynamicDecoupling, T1, ODMR, LineScan
+- Profiles: Ramsey, Rabi, SpinEcho, DynamicDecoupling, T1, ODMR, LineScan, Scan2D
 - Each profile defines:
   - default observable mode
   - preprocessing defaults
@@ -364,7 +365,8 @@ If an AI agent modifies this project, it should:
 This release adds the following production features:
 
 - Overlay and comparison:
-  - multi-file overlay registry in GUI
+  - multi-file overlay registry with an explicit primary trace, per-file checkboxes, Show all, and Primary only controls
+  - newly opened primary files start without implicit overlays; explicitly added/checked overlays autoscale to their combined full axis range
   - baseline subtraction against selected overlay trace (interpolated x-alignment)
   - comparison summary and quick comparison plot for selected metric.
 
@@ -411,7 +413,7 @@ This release adds the following production features:
 - Plot clicks create a temporary yellow inspection marker that is excluded from the legend. Clicking the same point again, pressing `Escape`, or using `Clear` removes it without changing or excluding measured data.
 - Double-clicking presentation objects takes priority over point inspection and opens the Plot Editor at the matching series, annotation, title/label, or tick section.
 - `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
-- A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, optional equal-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
+- A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, default-on X/Y swapping, optional equal-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
 
 ## 17) Plugin spec for custom model
 

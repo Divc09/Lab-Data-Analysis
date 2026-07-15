@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nvfit.io_mat import load_saved_data_mat
+from nvfit.io_mat import infer_experiment_type, load_saved_data_mat
 
 
 TDD_ROOT = Path(r"D:\BacklundLabResearch\Data\Experiments\429_TDD")
@@ -179,12 +179,19 @@ def test_load_param_grid_stage_scan_fallback_2d():
     for name in ("14102DScan.mat", "13382DScan.mat"):
         p = root / "TestData" / "NewCodebaseTests" / name
         tr = load_saved_data_mat(p, mode="contrast")
-        assert tr.experiment_type == "LineScan"
+        assert tr.experiment_type == "Scan2D"
         assert tr.scan_dim == "scan2d"
         assert not tr.fit_allowed
         assert tr.z2d is not None
         assert tr.x2d is not None and tr.y2d is not None
         assert tr.z2d.shape == tr.x2d.shape == tr.y2d.shape
+
+
+def test_experiment_detection_prefers_explicit_sequence_and_stage_metadata():
+    assert infer_experiment_type("unknown.mat", ("duration",), notes="Ramsey free precession") == "Ramsey"
+    assert infer_experiment_type("unknown.mat", ("duration",), notes="T1 relaxation") == "T1"
+    assert infer_experiment_type("rabi_alignment.mat", ("Stage X", "Stage Y"), notes="Rabi alignment map") == "LineScan"
+    assert infer_experiment_type("spectrum.mat", ("RF frequency",)) == "ODMR"
 
 
 @pytest.mark.skipif(not TDD_ROOT.exists(), reason="429_TDD data directory is not available")

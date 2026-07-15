@@ -101,8 +101,8 @@ class AnnotationOverride:
 
 @dataclass
 class AnnotationStyle:
-    mode: str = "Compact"
-    visible: bool = True
+    mode: str = "Off"
+    visible: bool = False
     location: str = "upper right"
     custom_anchor: bool = False
     anchor_x: float = 0.98

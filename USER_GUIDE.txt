@@ -94,9 +94,11 @@ Basic GUI workflow:
 - Click fit controls to run the fit
 - Use `Save Results` to export plots and JSON/CSV outputs
 - Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
+- Use the quick toggles above the plot for Data, Fit, Smooth, Legend, Annotations, Signal, Reference, and Iterations. Annotations start off for raw data and turn on after a successful fit
+- In Overlays, checked non-primary files are drawn together. `Show all` fits the view to every checked file, `Primary only` hides overlays without unloading them, and double-clicking a row makes it primary
 - Clicking a point pins a temporary yellow marker without adding it to the legend. Click it again, press `Escape`, or use `Clear` to remove it; the data itself is never changed
 - Use `File > Save Analysis Session...` to resume a named analysis later, including overlays, masks, transforms, locks, plot/map state, and a still-valid fit result
-- For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, or toggle equal physical axis scaling
+- For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, swap X/Y (on by default), or toggle equal physical axis scaling
 
 The GUI has two workspaces:
 - `Analyze`: load one MAT file, prepare it, fit it, inspect the WYSIWYG plot, and export results
