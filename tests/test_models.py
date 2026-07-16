@@ -4,6 +4,7 @@ import pytest
 from nvfit.models import (
     build_custom_expression_model,
     odmr_multi_lorentzian,
+    rabi_adaptive_pulse_area_model,
     rabi_dual_model,
     ramsey_extended,
     ramsey_hyperfine_n14,
@@ -27,6 +28,14 @@ def test_rabi_dual_model_return_finite():
     y = rabi_dual_model(t, 0.01, 0.0, 0.03, 0.015, 0.002, 0.0025, 0.0, 0.4, 1800.0)
     assert np.isfinite(y).all()
     assert y.shape == t.shape
+
+
+def test_rabi_adaptive_model_is_delay_anchored_and_finite():
+    t = np.linspace(0.0, 400.0, 201)
+    y = rabi_adaptive_pulse_area_model(t, 0.01, 0.02, 350.0, 1.0, 0.05, 4e-5, -6e-8, 12.0)
+    assert np.isfinite(y).all()
+    assert y.shape == t.shape
+    assert np.allclose(y[t <= 12.0], -0.01)
 
 
 def test_odmr_multi_and_custom_model_finite():

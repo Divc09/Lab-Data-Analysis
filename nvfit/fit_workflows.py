@@ -11,6 +11,7 @@ from .models import (
     build_custom_expression_model,
     odmr_lorentzian,
     odmr_multi_lorentzian,
+    rabi_adaptive_pulse_area_model,
     rabi_chirp_model,
     rabi_cosine_decay_model,
     rabi_dual_model,
@@ -24,7 +25,7 @@ from .models import (
     t1_rise_stretched_model,
 )
 from .ramsey import estimate_ramsey_frequency
-from .rabi_utils import fit_rabi_envelope
+from .rabi_utils import extract_rabi_dead_time_ns, fit_rabi_envelope
 
 if TYPE_CHECKING:
     from .io_mat import ExperimentTrace
@@ -41,7 +42,7 @@ class FitWorkflowConfig:
     rabi_pi_ns: float = 200.0
     rabi_pi2_ns: float = 100.0
     rabi_dead_time_ns: float = 0.0
-    rabi_mode: str = "Phase-ramp (recommended physical fit)"
+    rabi_mode: str = "Adaptive pulse-area (recommended)"
     odmr_multipeak: bool = False
     odmr_peak_count: int = 2
     odmr_auto_peak: bool = True
@@ -303,6 +304,14 @@ def _rabi_fit_weights(trace: "ExperimentTrace | None", x: np.ndarray, *, enabled
         return None
     weights = 1.0 / np.square(sem)
     weights = weights / float(np.median(weights))
+    # Pointwise SEM from only a few iterations is itself noisy.  Unlimited
+    # inverse-variance weights let one accidentally small SEM dominate the
+    # waveform.  Winsorize and shrink the precision toward equal weighting;
+    # the shrinkage vanishes gradually as complete iterations accumulate.
+    weights = np.clip(weights, 0.25, 4.0)
+    n_iter = float((trace.metadata or {}).get("complete_iterations", 0.0) or 0.0)
+    shrink = n_iter / (n_iter + 8.0) if n_iter > 0.0 else 0.5
+    weights = 1.0 + shrink * (weights - 1.0)
     return weights
 
 
@@ -426,16 +435,26 @@ def _fit_rabi_long_damped(x: np.ndarray, y: np.ndarray, weights: np.ndarray | No
 
 def _fit_rabi_phase_ramp(x: np.ndarray, y: np.ndarray, weights: np.ndarray | None, n_starts: int) -> FitResult:
     rng = np.random.default_rng(73)
-    x_fit = _rabi_fit_axis(x)
+    # The transient begins at the physical start of every programmed pulse,
+    # not at the minimum value chosen for a scan.  Using x-min(x) biases the
+    # fitted turn-on time whenever a Rabi scan starts above zero.
+    x_fit = np.asarray(x, dtype=float)
     c0 = float(np.median(y))
     a0 = float(0.5 * (np.percentile(y, 95) - np.percentile(y, 5)))
     f0 = _rabi_frequency_seed(x, y)
-    names = ["y0", "A", "f", "tau_ramp", "phi"]
-    lower = [-1.0, 0.0, 1.0 / 100.0, 0.01, -10.0 * np.pi]
-    upper = [1.0, 1.0, 1.0 / 5.0, 100.0, 10.0 * np.pi]
-    seed0 = np.array([c0, max(a0, 1e-4), f0, 15.0, 0.0])
-    scale = _scaled_perturbation(lower, upper)
-    seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
+    span = max(float(np.ptp(x)), 1.0)
+    names = ["y0", "A", "T", "beta", "f", "tau_ramp", "phi"]
+    lower = [-1.0, 0.0, 1.0, 0.1, 1.0 / 1000.0, 0.01, -10.0 * np.pi]
+    upper = [1.0, 1.0, 1e6, 4.0, 1.0 / 3.0, max(200.0, span), 10.0 * np.pi]
+    seed0 = np.array([c0, max(a0, 1e-4), max(span, 100.0), 1.0, f0, min(15.0, 0.1 * span), 0.0])
+    scale = np.array([0.01, 0.25 * max(a0, 1e-4), 0.35 * span, 0.25, 0.08 * max(f0, 1e-4), 0.08 * span, 0.7])
+    seeds = []
+    for i in range(max(8, n_starts)):
+        seed = seed0.copy()
+        seed[2] = [max(40.0, 0.5 * span), max(80.0, span), max(120.0, 2.0 * span)][i % 3]
+        seed[3] = [0.7, 1.0, 1.6][(i // 3) % 3]
+        seed[5] = [max(0.5, 0.03 * span), max(1.0, 0.08 * span), max(2.0, 0.15 * span)][i % 3]
+        seeds.append(seed + rng.normal(0, scale))
     result = fit_model_multistart(
         model_name="RabiPhaseRamp",
         model_func=rabi_phase_ramp_model,
@@ -446,10 +465,113 @@ def _fit_rabi_phase_ramp(x: np.ndarray, y: np.ndarray, weights: np.ndarray | Non
         upper=upper,
         seeds=seeds,
         weights=weights,
+        x_scale="jac",
         selection_note="selected phase-ramp Rabi model",
     )
-    result.extras.update({"x_offset_ns": float(np.min(x)), "rabi_model_family": "phase_ramp"})
+    result.extras.update({"rabi_model_family": "phase_ramp"})
     return result
+
+
+def _fit_rabi_adaptive(
+    x: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray | None,
+    n_starts: int,
+    *,
+    metadata: Mapping[str, object] | None = None,
+    chirped_reference: FitResult | None = None,
+) -> FitResult:
+    """Fit a delay-anchored smooth pulse-area model.
+
+    This is the calibration model for scans whose apparent Rabi rate changes
+    smoothly with programmed duration.  The polynomial is applied to pulse
+    area (rotation phase), so its coefficients must not be interpreted as a
+    microwave-carrier chirp.
+    """
+    rng = np.random.default_rng(97)
+    x_fit = np.asarray(x, dtype=float)
+    span = max(float(np.ptp(x_fit)), 1.0)
+    dx = max(float(np.median(np.diff(np.sort(x_fit)))) if len(x_fit) > 1 else 1.0, 1e-6)
+    c0 = float(np.median(y))
+    a0 = max(float(0.5 * (np.percentile(y, 95) - np.percentile(y, 5))), 1e-5)
+    f_seed = _rabi_frequency_seed(x_fit, y)
+    alpha_seed = 0.0
+    if chirped_reference is not None:
+        cp = {name: float(value) for name, value in zip(chirped_reference.param_names, chirped_reference.params)}
+        f_seed = float(cp.get("f", f_seed))
+        alpha_seed = float(cp.get("alpha", 0.0))
+    first_peak = _first_peak_from_series(x_fit, y)
+    saved_delay = extract_rabi_dead_time_ns(metadata)
+    derived_delay = first_peak - 0.5 / max(f_seed, 1e-9)
+    delay_seed = saved_delay if saved_delay > 0.0 else derived_delay
+    delay_upper = max(first_peak, float(np.min(x_fit)) + 1.0 / max(f_seed, 1e-9), 30.0)
+    delay_seed = float(np.clip(delay_seed, 0.0, delay_upper))
+
+    f_lo = max(5e-4, 0.55 * f_seed)
+    f_hi = min(0.333, max(1.65 * f_seed, f_lo + 5e-4))
+    chirp1_bound = max(5e-6, 1.5 * max(f_seed, 1e-4) / span)
+    chirp2_bound = max(5e-9, 2.0 * max(f_seed, 1e-4) / (span * span))
+    amp_bound = max(0.2, 6.0 * a0)
+    names = ["y0", "A", "T", "beta", "f0", "chirp1", "chirp2", "delay"]
+    lower = [-1.0, 0.0, dx, 0.1, f_lo, -chirp1_bound, -chirp2_bound, 0.0]
+    upper = [1.0, amp_bound, max(1e6, 20.0 * span), 4.0, f_hi, chirp1_bound, chirp2_bound, delay_upper]
+
+    base = np.array([c0, a0, max(span, 100.0), 1.0, f_seed, alpha_seed, 0.0, delay_seed], dtype=float)
+    structured: list[np.ndarray] = []
+    count = max(14, int(n_starts))
+    for i in range(count):
+        seed = base.copy()
+        seed[2] = [max(40.0, 0.6 * span), max(80.0, span), max(120.0, 2.0 * span)][i % 3]
+        seed[3] = [0.65, 1.0, 1.5][(i // 3) % 3]
+        seed[4] = np.clip(f_seed * [0.92, 1.0, 1.08][i % 3], f_lo, f_hi)
+        seed[5] = np.clip([0.0, alpha_seed, 0.5 * f_seed / span, -0.25 * f_seed / span][i % 4], -chirp1_bound, chirp1_bound)
+        seed[6] = np.clip([0.0, -0.22 * f_seed / (span * span), 0.15 * f_seed / (span * span)][i % 3], -chirp2_bound, chirp2_bound)
+        seed[7] = np.clip([delay_seed, max(0.0, derived_delay), max(0.0, saved_delay)][i % 3], 0.0, delay_upper)
+        jitter = np.array([0.004, 0.15 * a0, 0.18 * span, 0.15, 0.025 * f_seed, 0.08 * chirp1_bound, 0.08 * chirp2_bound, max(0.5, 0.04 * delay_upper)])
+        structured.append(seed + rng.normal(0.0, jitter))
+
+    result = fit_model_multistart(
+        model_name="RabiAdaptive",
+        model_func=rabi_adaptive_pulse_area_model,
+        x=x_fit,
+        y=y,
+        param_names=names,
+        lower=lower,
+        upper=upper,
+        seeds=structured,
+        weights=weights,
+        loss="linear",
+        max_nfev=10000,
+        x_scale="jac",
+        selection_note="selected adaptive pulse-area Rabi model",
+    )
+    result.extras.update(
+        {
+            "rabi_model_family": "adaptive_pulse_area",
+            "rabi_delay_seed_ns": float(delay_seed),
+            "rabi_saved_ramp_time_ns": float(saved_delay),
+            "pulse_area_interpretation": "chirp coefficients describe effective rotation rate versus programmed duration, not microwave carrier chirp",
+        }
+    )
+    return result
+
+
+def _rabi_adaptive_pathology(result: FitResult, x: np.ndarray) -> str:
+    p = {name: float(value) for name, value in zip(result.param_names, result.params)}
+    required = {"f0", "chirp1", "chirp2", "delay"}
+    if not required <= set(p):
+        return "adaptive candidate rejected: missing pulse-area parameters"
+    u_max = max(float(np.max(x) - p["delay"]), 0.0)
+    u = np.linspace(0.0, u_max, 256)
+    freq = p["f0"] + p["chirp1"] * u + p["chirp2"] * u * u
+    if not np.all(np.isfinite(freq)) or float(np.min(freq)) <= 0.0:
+        return "adaptive candidate rejected: non-positive effective Rabi rate"
+    ratio = float(np.max(freq) / max(np.min(freq), 1e-12))
+    if ratio > 3.0:
+        return "adaptive candidate rejected: implausibly large pulse-area rate variation"
+    if sum(bool(v) for v in result.bound_hits) >= 3:
+        return "adaptive candidate rejected: multiple parameters hit bounds"
+    return ""
 
 
 def _fit_rabi_chirp(x: np.ndarray, y: np.ndarray, weights: np.ndarray | None, n_starts: int) -> FitResult:
@@ -495,23 +617,34 @@ def _choose_rabi_model(
     phase_ramp: FitResult,
     constant: FitResult,
     chirped: FitResult | None,
+    adaptive: FitResult | None = None,
     long_damped: FitResult | None = None,
 ) -> FitResult:
+    if adaptive is not None:
+        adaptive_reason = _rabi_adaptive_pathology(adaptive, x)
+        alternatives = [phase_ramp, constant] + ([chirped] if chirped is not None else []) + ([long_damped] if long_damped is not None else [])
+        best_alt = min(alternatives, key=lambda item: item.bic)
+        if not adaptive_reason and (
+            adaptive.bic <= best_alt.bic - 4.0
+            or adaptive.r2 >= best_alt.r2 + 0.015
+        ):
+            adaptive.extras["rabi_reference_model"] = best_alt.model_name
+            adaptive.extras["rabi_reference_bic"] = float(best_alt.bic)
+            return _with_selection(adaptive, "selected adaptive pulse-area Rabi model by BIC and residual improvement")
+        if adaptive_reason:
+            adaptive.extras["rabi_rejection_reason"] = adaptive_reason
+
     if long_damped is not None and bool(long_damped.extras.get("rabi_long_scan", False)):
         long_features = dict(long_damped.extras.get("rabi_long_features", {}))
-        long_wr2 = float(long_damped.extras.get("rabi_calibration_weighted_r2", long_damped.r2))
-        phase_wr2 = _weighted_fit_quality(y, phase_ramp.y_fit, _rabi_calibration_weights(x, y))[0]
-        constant_wr2 = _weighted_fit_quality(y, constant.y_fit, _rabi_calibration_weights(x, y))[0]
-        best_existing_wr2 = max(float(phase_wr2), float(constant_wr2), float(chirped.r2 if chirped is not None else -np.inf))
-        if long_wr2 >= best_existing_wr2 + 0.05 or long_damped.rmse <= min(phase_ramp.rmse, constant.rmse) * 1.15:
+        alternatives = [phase_ramp, constant] + ([chirped] if chirped is not None else [])
+        best_alt = min(alternatives, key=lambda item: item.bic)
+        if long_damped.bic <= best_alt.bic - 4.0 and long_damped.rmse < best_alt.rmse:
             note = (
                 "auto-selected long damped Rabi for decayed long scan"
                 f" ({long_features.get('cycle_count', 0.0):.1f} cycles, decay ratio {long_features.get('decay_ratio', 0.0):.2f})"
             )
             long_damped.extras["rabi_long_phase_reference_r2"] = float(phase_ramp.r2)
-            long_damped.extras["rabi_long_phase_reference_weighted_r2"] = float(phase_wr2)
             long_damped.extras["rabi_long_constant_reference_r2"] = float(constant.r2)
-            long_damped.extras["rabi_long_constant_reference_weighted_r2"] = float(constant_wr2)
             return _with_selection(long_damped, note)
 
     data_first_peak = _first_peak_from_series(x, y)
@@ -992,22 +1125,39 @@ def fit_non_ramsey(
         mode = cfg.rabi_mode.lower().strip()
         if mode.startswith("long"):
             return _semantic_result(_attach_rabi_envelope(_with_selection(_fit_rabi_long_damped(x, y, weights, n_starts), "selected long damped Rabi model"), x, y))
+        if mode.startswith("constant-frequency"):
+            constant = _fit_rabi_constant_reference(x, y, weights, n_starts)
+            return _semantic_result(_attach_rabi_envelope(_with_selection(constant, "selected constant-frequency damped cosine Rabi model"), x, y))
+        if mode.startswith("chirped"):
+            chirped = _fit_rabi_chirp(x, y, weights, n_starts)
+            return _semantic_result(_attach_rabi_envelope(_with_selection(chirped, "selected chirped Rabi model"), x, y))
+        if mode.startswith("adaptive"):
+            chirped = _fit_rabi_chirp(x, y, weights, n_starts)
+            adaptive = _fit_rabi_adaptive(
+                x,
+                y,
+                weights,
+                n_starts,
+                metadata=(trace.metadata if trace is not None else None),
+                chirped_reference=chirped,
+            )
+            return _semantic_result(_attach_rabi_envelope(_with_selection(adaptive, "selected adaptive pulse-area Rabi model"), x, y))
         phase_ramp = _fit_rabi_phase_ramp(x, y, weights, n_starts)
         constant = _fit_rabi_constant_reference(x, y, weights, n_starts)
         chirped = _fit_rabi_chirp(x, y, weights, n_starts)
+        adaptive = _fit_rabi_adaptive(
+            x,
+            y,
+            weights,
+            n_starts,
+            metadata=(trace.metadata if trace is not None else None),
+            chirped_reference=chirped,
+        )
         features = _rabi_long_scan_features(x, y)
         long_damped = _fit_rabi_long_damped(x, y, weights, n_starts) if bool(features["is_long_decayed"]) else None
         if mode.startswith("phase-ramp"):
-            if long_damped is not None and bool(features["is_long_decayed"]):
-                chosen = _choose_rabi_model(x=x, y=y, phase_ramp=phase_ramp, constant=constant, chirped=chirped, long_damped=long_damped)
-                if chosen is long_damped:
-                    return _semantic_result(_attach_rabi_envelope(chosen, x, y))
             return _semantic_result(_attach_rabi_envelope(_with_selection(phase_ramp, "selected phase-ramp Rabi model"), x, y))
-        if mode.startswith("chirped"):
-            return _semantic_result(_attach_rabi_envelope(_with_selection(chirped, "selected chirped Rabi model"), x, y))
-        if mode.startswith("constant-frequency"):
-            return _semantic_result(_attach_rabi_envelope(_with_selection(constant, "selected constant-frequency damped cosine Rabi model"), x, y))
-        return _semantic_result(_attach_rabi_envelope(_choose_rabi_model(x=x, y=y, phase_ramp=phase_ramp, constant=constant, chirped=chirped, long_damped=long_damped), x, y))
+        return _semantic_result(_attach_rabi_envelope(_choose_rabi_model(x=x, y=y, phase_ramp=phase_ramp, constant=constant, chirped=chirped, adaptive=adaptive, long_damped=long_damped), x, y))
 
     if exp_type == "T1":
         return _semantic_result(_fit_t1(x, y, cfg, trace=trace, locks=locks))

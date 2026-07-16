@@ -8,7 +8,7 @@ from nvfit.io_mat import load_saved_data_mat
 from nvfit.rabi_utils import build_rabi_nv_metrics, rabi_envelope_metrics
 
 
-def test_rabi_default_prefers_phase_ramp_on_checkpoint():
+def test_rabi_auto_prefers_adaptive_pulse_area_on_checkpoint():
     root = Path(__file__).resolve().parents[1]
     tr = load_saved_data_mat(root / "TestData" / "NewCodebaseTests" / "323RabiFullRun__checkpoint.mat", mode="contrast")
     res = fit_non_ramsey(
@@ -19,14 +19,15 @@ def test_rabi_default_prefers_phase_ramp_on_checkpoint():
         trace_experiment_type="Rabi",
         trace=tr,
     )
-    assert res.model_name == "RabiPhaseRamp"
-    assert res.r2 > 0.90
-    assert "phase-ramp" in res.selection_note.lower()
+    assert res.model_name == "RabiAdaptive"
+    assert res.r2 > 0.98
+    assert "adaptive pulse-area" in res.selection_note.lower()
     p = {n: float(v) for n, v in zip(res.param_names, res.params)}
-    assert "tau_ramp" in p
+    assert {"f0", "chirp1", "chirp2", "delay"} <= set(p)
     metrics = build_rabi_nv_metrics(p, metadata=tr.metadata or {}, errors=None)
     assert 0.0 < metrics["delay_ns"] < 30.0
     assert 25.0 <= metrics["first_peak_ns"] <= 36.0
+    assert metrics["programmed_pi_time_ns"] == pytest.approx(metrics["first_peak_ns"])
     assert "rabi_envelope" in res.extras
     envelope_metrics = rabi_envelope_metrics(res.extras["rabi_envelope"])
     assert envelope_metrics["T2rho_ns"] > 0.0
@@ -40,15 +41,15 @@ def test_rabi_default_prefers_phase_ramp_on_checkpoint():
         Path(r"D:\BacklundLabResearch\Data\Experiments\429_TDD\May3\0145_RabiLongAfterAlign.mat"),
     ],
 )
-def test_long_rabi_scans_auto_select_long_damped_fit(path: Path):
+def test_long_rabi_scans_auto_select_best_valid_calibration_fit(path: Path):
     if not path.exists():
         pytest.skip(f"missing external long Rabi fixture: {path}")
     tr = load_saved_data_mat(path, mode="contrast")
-    phase = fit_non_ramsey(
+    auto = fit_non_ramsey(
         "Rabi",
         tr.x_ns,
         tr.y,
-        config=FitWorkflowConfig(multistart=8, rabi_mode="Phase-ramp (recommended physical fit)"),
+        config=FitWorkflowConfig(multistart=8, rabi_mode="Single reliable Rabi"),
         trace_experiment_type=tr.experiment_type,
         trace=tr,
     )
@@ -60,15 +61,35 @@ def test_long_rabi_scans_auto_select_long_damped_fit(path: Path):
         trace_experiment_type=tr.experiment_type,
         trace=tr,
     )
-    assert phase.model_name == "RabiLongDamped"
-    assert "long damped rabi" in phase.selection_note.lower()
+    assert auto.model_name in {"RabiAdaptive", "RabiPhaseRamp", "RabiLongDamped", "RabiChirp"}
     assert long_fit.model_name == "RabiLongDamped"
     assert long_fit.r2 > 0.25
-    assert long_fit.r2 > phase.extras.get("rabi_long_phase_reference_r2", -1.0)
+    assert auto.r2 >= long_fit.r2
     p = {n: float(v) for n, v in zip(long_fit.param_names, long_fit.params)}
     assert 0.02 <= p["f"] <= 0.05
     env = rabi_envelope_metrics(long_fit.extras["rabi_envelope"])
     assert env["T2rho_ns"] > 100.0
+
+
+def test_user_ensemble_rabi_reaches_iteration_noise_floor_when_available():
+    path = Path(r"C:\Users\Div\Box\Backlund lab shared\data\Div\Experiments\0714_DGalterNoDyeCoverslip\July15\1636_RabiEnsemble.mat")
+    if not path.exists():
+        pytest.skip(f"missing external ensemble Rabi fixture: {path}")
+    tr = load_saved_data_mat(path, mode="contrast")
+    res = fit_non_ramsey(
+        "Rabi",
+        tr.x_ns,
+        tr.y,
+        config=FitWorkflowConfig(multistart=12, rabi_mode="Adaptive pulse-area (recommended)"),
+        trace_experiment_type="Rabi",
+        trace=tr,
+    )
+    p = {n: float(v) for n, v in zip(res.param_names, res.params)}
+    metrics = build_rabi_nv_metrics(p, metadata=tr.metadata or {}, errors=None)
+    assert res.model_name == "RabiAdaptive"
+    assert res.r2 > 0.95
+    assert 10.5 <= metrics["delay_ns"] <= 13.0
+    assert 20.0 <= metrics["programmed_pi_time_ns"] <= 23.0
 
 
 def test_odmr_raw_signal_no_longer_collapses_to_invalid_scale():

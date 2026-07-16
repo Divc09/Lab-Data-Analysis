@@ -43,6 +43,22 @@ def test_build_rabi_nv_metrics_reports_first_observable_peak_inside_trace_window
     assert metrics["first_peak_ns"] >= 10.0
 
 
+def test_build_rabi_nv_metrics_uses_adaptive_delay_and_pulse_area_roots():
+    params = {
+        "A": 0.02,
+        "f0": 0.05,
+        "chirp1": 5.0e-5,
+        "chirp2": -5.0e-8,
+        "delay": 12.0,
+    }
+    metrics = build_rabi_nv_metrics(params, metadata={"rf_ramp_time_ns": 11.5}, errors=None)
+    assert metrics["delay_ns"] == 12.0
+    assert metrics["saved_rf_ramp_time_ns"] == 11.5
+    assert metrics["programmed_pi_time_ns"] == metrics["first_peak_ns"]
+    assert metrics["programmed_pi_time_ns"] > metrics["pi_time_ns"]
+    assert metrics["pi_time_ns"] > metrics["pi_over_2_time_ns"]
+
+
 def test_fit_rabi_envelope_recovers_exponential_decay():
     x = np.linspace(0.0, 1200.0, 600)
     baseline = 0.04

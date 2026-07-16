@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Mapping
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import brentq, least_squares
 from scipy.signal import find_peaks, hilbert, savgol_filter
 
 
@@ -23,14 +23,18 @@ def extract_rabi_dead_time_ns(metadata: Mapping[str, object] | None) -> float:
 
     candidate_keys = (
         "rabi_dead_time_ns",
+        "rf_ramp_time_ns",
         "dead_time_ns",
         "pulse_dead_time_ns",
         "pulse_length_dead_time_ns",
         "rabiDeadTimeNs",
+        "rfRampTimeNs",
         "deadTimeNs",
         "pulseDeadTimeNs",
         "pulseLengthDeadTimeNs",
         "rabiDeadTime",
+        "RFRampTime",
+        "rfRampTime",
         "deadTime",
         "pulseDeadTime",
     )
@@ -57,6 +61,8 @@ def rabi_timing_metrics_from_frequency(freq_ghz: float, dead_time_ns: float = 0.
         "pi_over_2_time_ns_nominal": float(pi2_nominal),
         "pi_time_ns": float(pi_nominal),
         "pi_over_2_time_ns": float(pi2_nominal),
+        "programmed_pi_time_ns": float(dead_time + pi_nominal),
+        "programmed_pi_over_2_time_ns": float(dead_time + pi2_nominal),
     }
 
 
@@ -74,7 +80,7 @@ def _baseline_from_rabi_params(
     params: np.ndarray,
 ) -> tuple[np.ndarray, dict[str, float | str]]:
     p = {name: float(value) for name, value in zip(param_names, params)}
-    if model_name in {"RabiPhaseRamp", "RabiCosine", "RabiChirp", "RabiLongDamped"}:
+    if model_name in {"RabiAdaptive", "RabiPhaseRamp", "RabiCosine", "RabiChirp", "RabiLongDamped"}:
         intercept = float(p.get("y0", p.get("c", 0.0)))
         slope = 0.0
         mode = "constant"
@@ -101,7 +107,7 @@ def _envelope_source_from_trace(
         if win >= 7:
             amp = savgol_filter(amp, win, 2)
     dx = float(np.median(np.diff(x_rel))) if len(x_rel) > 1 else 1.0
-    freq_candidates = [float(params[k]) for k in ("f", "f1", "f2") if k in params and float(params[k]) > 0.0]
+    freq_candidates = [float(params[k]) for k in ("f0", "f", "f1", "f2") if k in params and float(params[k]) > 0.0]
     if freq_candidates and dx > 0.0:
         period = 1.0 / max(freq_candidates)
         distance = max(1, int(round(0.2 * period / dx)))
@@ -287,6 +293,14 @@ def rabi_envelope_bounds(
 
 
 def _first_rabi_peak_ns(params: Mapping[str, float], metadata: Mapping[str, object] | None = None) -> float | None:
+    if {"f0", "chirp1", "chirp2", "delay"} <= set(params):
+        adaptive = _adaptive_pulse_times(params)
+        if adaptive is None:
+            return None
+        _pi2, pi = adaptive
+        delay = _safe_float(params.get("delay")) or 0.0
+        return float(delay + pi)
+
     freq = _safe_float(params.get("f"))
     if freq is None or freq <= 0.0:
         return None
@@ -306,12 +320,13 @@ def _first_rabi_peak_ns(params: Mapping[str, float], metadata: Mapping[str, obje
         if tau_ramp is None or phi is None:
             return None
         tau_safe = max(tau_ramp, 1e-9)
-        theta = 2.0 * np.pi * freq * (x_rel - tau_safe * (1.0 - np.exp(-x_rel / tau_safe))) + phi
+        x_abs = x_min + x_rel
+        theta = 2.0 * np.pi * freq * (x_abs - tau_safe * (1.0 - np.exp(-x_abs / tau_safe))) + phi
         y = amplitude * np.cos(theta)
         peaks, _ = find_peaks(y if amplitude >= 0.0 else -y, prominence=max(1e-9, 0.15 * float(np.ptp(y))))
         if len(peaks):
-            return float(x_min + x_rel[int(peaks[0])])
-        return float(x_min + x_rel[int(np.argmax(y if amplitude >= 0.0 else -y))])
+            return float(x_abs[int(peaks[0])])
+        return float(x_abs[int(np.argmax(y if amplitude >= 0.0 else -y))])
 
     if "alpha" in params and "phi" in params and "t0" not in params:
         alpha = _safe_float(params.get("alpha"))
@@ -353,25 +368,69 @@ def _first_rabi_peak_ns(params: Mapping[str, float], metadata: Mapping[str, obje
     return peak
 
 
+def _adaptive_pulse_times(params: Mapping[str, float]) -> tuple[float, float] | None:
+    """Return effective pi/2 and pi durations for an adaptive pulse-area fit."""
+    f0 = _safe_float(params.get("f0"))
+    chirp1 = _safe_float(params.get("chirp1"))
+    chirp2 = _safe_float(params.get("chirp2"))
+    if f0 is None or chirp1 is None or chirp2 is None or f0 <= 0.0:
+        return None
+
+    def cycles(u: float) -> float:
+        return f0 * u + 0.5 * chirp1 * u * u + (chirp2 * u * u * u) / 3.0
+
+    upper = max(4.0 / f0, 20.0)
+    for _ in range(12):
+        grid = np.linspace(0.0, upper, 512)
+        rate = f0 + chirp1 * grid + chirp2 * grid * grid
+        if np.all(rate > 0.0) and cycles(upper) >= 0.5:
+            break
+        upper *= 2.0
+    else:
+        return None
+    try:
+        pi2 = brentq(lambda u: cycles(u) - 0.25, 0.0, upper)
+        pi = brentq(lambda u: cycles(u) - 0.5, 0.0, upper)
+    except ValueError:
+        return None
+    return float(pi2), float(pi)
+
+
 def build_rabi_nv_metrics(
     params: Mapping[str, float],
     *,
     metadata: Mapping[str, object] | None = None,
     errors: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
-    freq_candidates = [(name, float(params[name])) for name in ("f", "f1", "f2") if name in params and float(params[name]) > 0.0]
+    freq_candidates = [(name, float(params[name])) for name in ("f0", "f", "f1", "f2") if name in params and float(params[name]) > 0.0]
     metrics: dict[str, float] = {}
     if not freq_candidates:
         return metrics
 
     freq_name, freq_value = max(freq_candidates, key=lambda item: item[1])
-    dead_time = extract_rabi_dead_time_ns(metadata)
+    saved_dead_time = extract_rabi_dead_time_ns(metadata)
+    dead_time = saved_dead_time
     derived_first_peak = _first_rabi_peak_ns(params, metadata=metadata)
-    if derived_first_peak is not None:
-        derived_delay = max(0.0, derived_first_peak - (1.0 / (2.0 * freq_value)))
-        dead_time = derived_delay
+    explicit_delay = _safe_float(params.get("delay"))
+    explicit_t0 = _safe_float(params.get("t0"))
+    if explicit_delay is not None:
+        dead_time = max(0.0, explicit_delay)
+    elif explicit_t0 is not None:
+        dead_time = max(0.0, explicit_t0)
+    elif saved_dead_time <= 0.0 and derived_first_peak is not None:
+        dead_time = max(0.0, derived_first_peak - (1.0 / (2.0 * freq_value)))
     metrics.update(rabi_timing_metrics_from_frequency(freq_value, dead_time))
     metrics["rabi_period_ns"] = float(1.0 / freq_value)
+    if saved_dead_time > 0.0:
+        metrics["saved_rf_ramp_time_ns"] = float(saved_dead_time)
+    adaptive_times = _adaptive_pulse_times(params)
+    if adaptive_times is not None:
+        pi2_time, pi_time = adaptive_times
+        metrics["pi_time_ns"] = float(pi_time)
+        metrics["pi_over_2_time_ns"] = float(pi2_time)
+        metrics["programmed_pi_time_ns"] = float(dead_time + pi_time)
+        metrics["programmed_pi_over_2_time_ns"] = float(dead_time + pi2_time)
+        metrics["first_lobe_rabi_freq_MHz"] = float(500.0 / pi_time)
     if derived_first_peak is not None:
         metrics["first_peak_ns"] = float(derived_first_peak)
         metrics["delay_ns"] = float(dead_time)
@@ -383,12 +442,30 @@ def build_rabi_nv_metrics(
         alpha = _safe_float(params.get("alpha"))
         if alpha is not None:
             metrics["chirp_alpha"] = float(alpha)
+    if "chirp1" in params:
+        chirp1 = _safe_float(params.get("chirp1"))
+        chirp2 = _safe_float(params.get("chirp2"))
+        if chirp1 is not None:
+            metrics["pulse_area_chirp1_per_ns2"] = float(chirp1)
+        if chirp2 is not None:
+            metrics["pulse_area_chirp2_per_ns3"] = float(chirp2)
 
     if errors is not None and freq_name in errors:
         freq_err = _safe_float(errors.get(freq_name))
         if freq_err is not None:
             pi_err = abs(freq_err / (2.0 * (freq_value ** 2)))
-            metrics["pi_time_ns_err"] = float(pi_err)
-            metrics["pi_over_2_time_ns_err"] = float(0.5 * pi_err)
+            metrics["pi_time_ns_nominal_err"] = float(pi_err)
+            metrics["pi_over_2_time_ns_nominal_err"] = float(0.5 * pi_err)
+            # For fixed-frequency models the nominal and calibrated times are
+            # identical.  Adaptive pulse-area timing also depends on chirp1
+            # and chirp2, so f0 uncertainty alone must not be presented as the
+            # full calibrated pulse-time uncertainty.
+            if adaptive_times is None:
+                metrics["pi_time_ns_err"] = float(pi_err)
+                metrics["pi_over_2_time_ns_err"] = float(0.5 * pi_err)
+    if errors is not None and "delay" in errors:
+        delay_err = _safe_float(errors.get("delay"))
+        if delay_err is not None:
+            metrics["delay_ns_err"] = float(abs(delay_err))
 
     return metrics

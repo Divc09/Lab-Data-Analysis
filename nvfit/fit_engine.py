@@ -48,6 +48,7 @@ def fit_model_multistart(
     loss: str = "soft_l1",
     f_scale: float | None = None,
     max_nfev: int = 20000,
+    x_scale: str | np.ndarray | float = 1.0,
     selection_note: str = "",
 ) -> FitResult:
     lower_arr = np.asarray(list(lower), dtype=float)
@@ -71,6 +72,7 @@ def fit_model_multistart(
             loss=loss,
             f_scale=f_scale,
             max_nfev=max_nfev,
+            x_scale=x_scale,
         )
         if res.cost < best_cost:
             best_cost = res.cost

@@ -39,11 +39,31 @@ def rabi_cosine_decay_model(t, c, a, T, beta, f, phi):
     return c + a * env * np.cos(2 * np.pi * f * x + phi)
 
 
-def rabi_phase_ramp_model(t, c, a, f, tau_ramp, phi):
+def rabi_phase_ramp_model(t, c, a, T, beta, f, tau_ramp, phi):
     x = np.asarray(t, dtype=float)
+    T_safe = np.maximum(T, 1e-9)
+    beta_safe = np.maximum(beta, 1e-9)
+    env = np.exp(-((np.abs(x / T_safe)) ** beta_safe))
     tau_safe = np.maximum(tau_ramp, 1e-9)
     theta = 2 * np.pi * f * (x - tau_safe * (1.0 - np.exp(-x / tau_safe))) + phi
-    return c + a * np.cos(theta)
+    return c + a * env * np.cos(theta)
+
+
+def rabi_adaptive_pulse_area_model(t, c, a, T, beta, f0, chirp1, chirp2, delay):
+    """Rabi signal with a smooth, monotonic-capable pulse-area calibration.
+
+    ``f0 + chirp1*u + chirp2*u**2`` is the instantaneous effective Rabi
+    frequency after the fitted timing delay.  The polynomial describes pulse
+    area versus programmed duration; it does not imply that the microwave
+    carrier frequency is chirped.
+    """
+    x = np.asarray(t, dtype=float)
+    u = np.maximum(x - delay, 0.0)
+    T_safe = np.maximum(T, 1e-9)
+    beta_safe = np.maximum(beta, 1e-9)
+    env = np.exp(-((u / T_safe) ** beta_safe))
+    cycles = f0 * u + 0.5 * chirp1 * u * u + (chirp2 * u * u * u) / 3.0
+    return c - a * env * np.cos(2.0 * np.pi * cycles)
 
 
 def rabi_chirp_model(t, c, a, T, beta, f, alpha, phi):
@@ -170,6 +190,7 @@ MODEL_REGISTRY = {
     "RabiCosine": rabi_cosine_decay_model,
     "RabiLongDamped": rabi_cosine_decay_model,
     "RabiPhaseRamp": rabi_phase_ramp_model,
+    "RabiAdaptive": rabi_adaptive_pulse_area_model,
     "RabiChirp": rabi_chirp_model,
     "RabiShifted": rabi_shifted_model,
     "RabiDual": rabi_dual_model,

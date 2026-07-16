@@ -54,7 +54,7 @@ PROFILES: dict[ProfileName, FitProfile] = {
         candidate_models=("Rabi",),
         r2_min=0.75,
         max_bound_hits=2,
-        notes="Moderate smoothing allowed; extract pi and pi/2 times from fitted frequency.",
+        notes="Moderate smoothing allowed; use adaptive pulse-area roots for pi/pi2 timing and reject low-R2 calibrations.",
     ),
     "SpinEcho": FitProfile(
         name="SpinEcho",

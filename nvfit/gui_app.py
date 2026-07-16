@@ -1317,6 +1317,7 @@ class SmartFitterMainWindow(QMainWindow):
         
         self.rabi_mode_combo = NoScrollComboBox()
         self.rabi_mode_combo.addItems([
+            "Adaptive pulse-area (recommended)",
             "Phase-ramp (recommended physical fit)",
             "Long damped Rabi",
             "Chirped cosine (best overlay)",
@@ -1352,7 +1353,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.rabi_dead_time_ns.setDecimals(3)
         self.rabi_dead_time_ns.setRange(-1e6, 1e9)
         self.rabi_dead_time_ns.setValue(0.0)
-        self.rabi_dead_time_ns.setToolTip("Optional manual timing-offset override used when locking pi or pi/2. Reported delay on fitted Rabi traces is derived from the first fitted peak.")
+        self.rabi_dead_time_ns.setToolTip("Optional manual timing-offset override used when locking pi or pi/2. The adaptive Rabi model fits delay explicitly; other models use saved RF-ramp metadata when available.")
         self.rabi_dead_time_ns.valueChanged.connect(self._on_rabi_dead_time_changed)
         rabi_layout.addRow("Delay override (ns)", self.rabi_dead_time_ns)
         self.rabi_sem_weight_chk = QCheckBox("Use iteration SEM weights")
@@ -1962,10 +1963,13 @@ class SmartFitterMainWindow(QMainWindow):
             ("pi_over_2_time_ns", "pi/2"),
             ("pi_time_ns_nominal", "pi nominal"),
             ("pi_over_2_time_ns_nominal", "pi/2 nominal"),
+            ("programmed_pi_time_ns", "programmed pi"),
+            ("programmed_pi_over_2_time_ns", "programmed pi/2"),
             ("rabi_period_ns", "period"),
             ("t0_ns", "t0"),
             ("first_peak_ns", "first peak"),
             ("delay_ns", "delay"),
+            ("saved_rf_ramp_time_ns", "saved RF ramp"),
             ("tau_ramp_ns", "ramp tau"),
             ("T2rho_ns", "T2rho"),
             ("rabi_envelope_beta", "env beta"),
@@ -1980,7 +1984,7 @@ class SmartFitterMainWindow(QMainWindow):
         cc = 0
         for key, label in report_metric_defs:
             chk = QCheckBox(label)
-            chk.setChecked(key in {"r2", "rmse", "T2_star_ns", "T1_ns", "T2rho_ns", "pi_time_ns", "delay_ns", "rabi_freq_MHz", "D", "E", "fwhm"})
+            chk.setChecked(key in {"r2", "rmse", "T2_star_ns", "T1_ns", "T2rho_ns", "pi_time_ns", "programmed_pi_time_ns", "delay_ns", "rabi_freq_MHz", "D", "E", "fwhm"})
             self.report_metric_checks[key] = chk
             chk.setProperty("drawerHidden", True)
             chk.setVisible(False)
@@ -4054,8 +4058,10 @@ class SmartFitterMainWindow(QMainWindow):
         if not hasattr(self, "rabi_model_help_lbl"):
             return
         mode = self.rabi_mode_combo.currentText() if hasattr(self, "rabi_mode_combo") else ""
-        if mode.startswith("Phase-ramp"):
-            text = "Phase-ramp fits microwave turn-on for short calibration runs and auto-switches to long damped Rabi when a trace is long and strongly decayed."
+        if mode.startswith("Adaptive"):
+            text = "Adaptive pulse-area fits delay, decay, and smooth changes in accumulated rotation rate. It is the recommended calibration fit and does not interpret phase curvature as microwave-carrier chirp."
+        elif mode.startswith("Phase-ramp"):
+            text = "Phase-ramp fits an exponential microwave-amplitude turn-on plus a stretched decay envelope. Use it when a first-order hardware settling transient is independently plausible."
         elif mode.startswith("Long"):
             text = "Long damped Rabi uses peak-derived frequency seeds and calibration-weighted residuals for long decayed scans where late baseline points dominate ordinary residuals."
         elif mode.startswith("Chirped"):
@@ -5474,9 +5480,15 @@ class SmartFitterMainWindow(QMainWindow):
             "pi_over_2_time_ns": "Pi/2 time [ns]",
             "pi_time_ns_nominal": "Nominal pi time [ns]",
             "pi_over_2_time_ns_nominal": "Nominal pi/2 time [ns]",
-            "rabi_dead_time_ns": "Derived delay [ns]",
+            "programmed_pi_time_ns": "Programmed pi duration [ns]",
+            "programmed_pi_over_2_time_ns": "Programmed pi/2 duration [ns]",
+            "rabi_dead_time_ns": "Fitted/effective delay [ns]",
             "first_peak_ns": "First peak [ns]",
             "delay_ns": "Delay [ns]",
+            "saved_rf_ramp_time_ns": "Saved RF ramp setting [ns]",
+            "first_lobe_rabi_freq_MHz": "First-lobe Rabi frequency [MHz]",
+            "pulse_area_chirp1_per_ns2": "Pulse-area rate slope [1/ns^2]",
+            "pulse_area_chirp2_per_ns3": "Pulse-area rate curvature [1/ns^3]",
             "tau_ramp_ns": "Ramp timescale [ns]",
             "T2rho_ns": "T2rho [ns]",
             "rabi_envelope_decay_ns": "Rabi envelope decay [ns]",
@@ -5508,6 +5520,7 @@ class SmartFitterMainWindow(QMainWindow):
             "A2": "Amplitude 2",
             "C": "Peak or dip amplitude",
             "f": "Frequency [GHz]",
+            "f0": "Initial effective Rabi rate [GHz]",
             "f1": "Frequency 1 [GHz]",
             "f2": "Frequency 2 [GHz]",
             "phi": "Phase [rad]",
@@ -5519,6 +5532,9 @@ class SmartFitterMainWindow(QMainWindow):
             "tau_ramp": "Ramp timescale [ns]",
             "beta": "Envelope stretch exponent",
             "alpha": "Chirp [1/ns²]",
+            "chirp1": "Pulse-area rate slope [1/ns²]",
+            "chirp2": "Pulse-area rate curvature [1/ns³]",
+            "delay": "Fitted delay [ns]",
             "T2": "T2 [ns]",
             "T1": "T1 [ns]",
             "T2_star": "T2* [ns]",

@@ -100,6 +100,8 @@ Defined in `models.py`:
 - `ramsey_hyperfine_n14(...)`
 - `ramsey_extended(...)`
 - `rabi_model(t, y0, m, A, f, phi, tau)`
+- `rabi_adaptive_pulse_area_model(t, c, a, T, beta, f0, chirp1, chirp2, delay)`
+- `rabi_phase_ramp_model(t, c, a, T, beta, f, tau_ramp, phi)`
 - `rabi_dual_model(...)`
 - `spin_echo_model(t, y0, A, T2, n)`
 - `odmr_lorentzian(t, y0, C, w, x0)`
@@ -196,11 +198,13 @@ Behavior:
 
 In Fit Strategy:
 
-- `Single (recommended)` (default)
-- `Auto (single vs dual)`
-- `Dual only`
+- `Adaptive pulse-area (recommended)` fits an explicit timing delay, a stretched decay envelope, and a low-order smooth pulse-area calibration. `chirp1` and `chirp2` describe effective rotation rate versus programmed duration; they are not microwave-carrier chirp parameters.
+- `Phase-ramp` fits an exponential amplitude turn-on plus a stretched decay envelope.
+- `Long damped Rabi` emphasizes early calibration lobes in long, strongly decayed scans.
+- `Chirped cosine` and `Constant-frequency damped cosine` remain comparison models.
+- `Auto compare` uses fit quality and BIC while rejecting pathological adaptive solutions.
 
-This is intentionally explicit to avoid always using dual-frequency Rabi.
+For adaptive fits, `delay` is fitted directly. Saved `RFRampTime` metadata is retained separately as `saved_rf_ramp_time_ns`; it is not confused with the exponential turn-on timescale `tau_ramp`.
 
 ### 8.5 ODMR mode
 
@@ -335,9 +339,9 @@ Use this checklist before/after edits:
 - Recursive GUI reload errors:
   - Ensure profile default application does not recursively call file reload loops.
 - Poor Rabi fits:
-  - Start with `Rabi mode = Single (recommended)`.
-  - Adjust ROI/smoothing/multistart.
-  - Use dual mode only when beat-note behavior is physically expected.
+  - Start with `Rabi mode = Adaptive pulse-area (recommended)`.
+  - Compare the residual scale with iteration SEM before adding more model complexity.
+  - Use `Phase-ramp` only for a plausible first-order amplitude-settling transient and `Chirped cosine` only as an empirical comparison.
 - ODMR many-peak traces:
   - Use peak-pick mode and optional ranges rather than forcing single Lorentzian fit.
 - Spatial scans misfit:
