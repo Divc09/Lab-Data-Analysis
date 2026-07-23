@@ -180,6 +180,11 @@ Base plot toggles/settings include:
 - Figure width/height
 - Save DPI
 
+Factory presentation defaults are line-plus-scatter traces with smoothing,
+iteration mean, and the Rabi envelope disabled on an 8.5 × 5.5 inch white
+figure at 300 DPI. Existing preferences are migrated only when they still
+match previous factory values.
+
 Presentation settings affect the live plot, clipboard image, PNG/PDF/SVG outputs, and annotated report figures. Batch CLI plots remain independent.
 
 ### 8.3 Parameter editor

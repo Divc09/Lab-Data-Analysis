@@ -11,7 +11,13 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from nvfit.fit_engine import FitResult
-from nvfit.gui_app import SmartFitterMainWindow
+from nvfit.gui_app import (
+    PRESENTATION_EXPORT_DPI,
+    PRESENTATION_FIGURE_HEIGHT,
+    PRESENTATION_FIGURE_WIDTH,
+    PlotOptions,
+    SmartFitterMainWindow,
+)
 from nvfit.plot_presentation import (
     AnnotationOverride,
     AxisStyle,
@@ -56,6 +62,17 @@ def _fake_fit(win: SmartFitterMainWindow, r2: float = 0.91) -> FitResult:
         success=True,
         message="ok",
     )
+
+
+def test_plot_defaults_are_presentation_oriented():
+    options = PlotOptions()
+    assert options.plot_style == "Line + scatter"
+    assert not options.show_smoothed
+    assert not options.show_iteration_mean
+    assert not options.show_rabi_envelope
+    assert options.fig_width == PRESENTATION_FIGURE_WIDTH == 8.5
+    assert options.fig_height == PRESENTATION_FIGURE_HEIGHT == 5.5
+    assert options.save_dpi == PRESENTATION_EXPORT_DPI == 300
 
 
 def test_presentation_state_round_trip_and_manual_ticks():
@@ -209,7 +226,8 @@ def test_plot_and_legend_visibility_are_independent_and_hidden_data_does_not_set
     win.presentation_state.series["data"] = SeriesOverride(show_series=True, show_legend=False)
     win._refresh_plot_only()
     assert win.ax_main.lines[0].get_visible()
-    assert "Data" not in [text.get_text() for text in win._active_legend.get_texts()]
+    legend_labels = [] if win._active_legend is None else [text.get_text() for text in win._active_legend.get_texts()]
+    assert "Data" not in legend_labels
 
     win.presentation_state.series["data"] = SeriesOverride(show_series=False, show_legend=True)
     win._refresh_plot_only()

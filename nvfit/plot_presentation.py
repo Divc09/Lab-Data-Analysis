@@ -76,13 +76,13 @@ class LegendStyle:
     custom_anchor: bool = False
     anchor_x: float = 0.98
     anchor_y: float = 0.98
-    font_size: int = 9
+    font_size: int = 10
     columns: int = 1
     text_color: str = "#26332d"
     frame_visible: bool = True
     frame_color: str = "#ffffff"
     edge_color: str = "#c8d2cc"
-    frame_alpha: float = 0.94
+    frame_alpha: float = 0.96
     border_pad: float = 0.4
     label_spacing: float = 0.5
 
@@ -137,12 +137,12 @@ class TickStyle:
     format_mode: str = "Automatic"
     precision: int = 4
     show_offset: bool = True
-    label_size: int = 9
+    label_size: int = 10
     label_color: str = "#526159"
     rotation: float = 0.0
     direction: str = "out"
-    major_length: float = 3.5
-    major_width: float = 0.8
+    major_length: float = 4.0
+    major_width: float = 0.9
     minor_length: float = 2.0
     minor_width: float = 0.6
     tick_color: str = "#526159"
@@ -160,9 +160,9 @@ class TickStyle:
 
 @dataclass
 class AxisStyle:
-    title: TextStyle = field(default_factory=lambda: TextStyle(font_size=11, font_weight="normal", padding=6.0))
-    xlabel: TextStyle = field(default_factory=lambda: TextStyle(font_size=10, padding=4.0))
-    ylabel: TextStyle = field(default_factory=lambda: TextStyle(font_size=10, padding=4.0))
+    title: TextStyle = field(default_factory=lambda: TextStyle(font_size=13, font_weight="normal", padding=6.0))
+    xlabel: TextStyle = field(default_factory=lambda: TextStyle(font_size=11, padding=4.0))
+    ylabel: TextStyle = field(default_factory=lambda: TextStyle(font_size=11, padding=4.0))
     x_ticks: TickStyle = field(default_factory=TickStyle)
     y_ticks: TickStyle = field(default_factory=TickStyle)
 

@@ -1,7 +1,10 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+from nvfit import fit_engine
+from nvfit.fit_engine import fit_model_multistart
 from nvfit.io_mat import load_saved_data_mat
 from nvfit.models import ramsey_simple
 from nvfit.pro_batch import _fit_non_ramsey
@@ -42,4 +45,34 @@ def test_dynamic_decoupling_fit_uses_expanded_t2_range():
     t2 = float(res.params[list(res.param_names).index("T2")])
     assert t2 > 20000.0
     assert not res.bound_hits[list(res.param_names).index("T2")]
+
+
+def test_multistart_retains_best_values_when_one_start_raises(monkeypatch: pytest.MonkeyPatch):
+    real_least_squares = fit_engine.least_squares
+    calls = 0
+
+    def flaky_least_squares(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic failed start")
+        return real_least_squares(*args, **kwargs)
+
+    monkeypatch.setattr(fit_engine, "least_squares", flaky_least_squares)
+    x = np.linspace(0.0, 5.0, 30)
+    y = 2.0 * x + 1.0
+    result = fit_model_multistart(
+        model_name="Linear",
+        model_func=lambda t, m, b: m * t + b,
+        x=x,
+        y=y,
+        param_names=["m", "b"],
+        lower=[-10.0, -10.0],
+        upper=[10.0, 10.0],
+        seeds=[np.array([0.0, 0.0]), np.array([1.5, 0.5])],
+    )
+
+    assert result.success
+    assert result.params == pytest.approx([2.0, 1.0])
+    assert "retained best result after 1 of 2 starts failed" in result.message
 

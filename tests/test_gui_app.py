@@ -1034,7 +1034,12 @@ def test_gui_copy_export_figure_places_image_on_clipboard():
     win._message = lambda *args, **kwargs: None
     win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
     win.copy_export_figure()
-    assert not app.clipboard().image().isNull()
+    image = app.clipboard().image()
+    assert not image.isNull()
+    assert win.fig.get_facecolor() == (1.0, 1.0, 1.0, 1.0)
+    assert image.pixelColor(0, 0).red() >= 250
+    assert image.pixelColor(0, 0).green() >= 250
+    assert image.pixelColor(0, 0).blue() >= 250
 
 
 def _fake_fit(win: SmartFitterMainWindow, model_name: str = "Rabi") -> FitResult:
@@ -1068,6 +1073,50 @@ def test_gui_discards_late_fit_result_after_analysis_changes():
 
     assert win.ctx.fit_result is None
     assert "discarded" in win.status_lbl.text().lower()
+
+
+def test_gui_failed_quality_fit_keeps_values_and_reveals_results_summary():
+    app = _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win.resize(1366, 768)
+    win.show()
+    win._load_file(str(_fixture("TestData", "NewCodebaseTests", "323RabiFullRun__checkpoint.mat")))
+    result = _fake_fit(win, model_name="RabiAdaptive")
+    result.r2 = 0.10
+    result.success = False
+    result.message = "maximum evaluations reached"
+
+    win.right_scroll.verticalScrollBar().setValue(0)
+    win.on_fit_finished(result)
+    app.processEvents()
+    app.processEvents()
+
+    summary = win.summary_text.toPlainText()
+    assert win.ctx.fit_result is result
+    assert "WARNING: This fit did not pass all quality checks." in summary
+    assert "maximum evaluations reached" in summary
+    assert "f (" in summary
+    assert "FAIL" in win.status_lbl.text()
+    viewport = win.right_scroll.viewport()
+    result_top = win.results_box.mapTo(viewport, win.results_box.rect().topLeft()).y()
+    assert result_top < viewport.height()
+
+
+def test_gui_fit_exception_preserves_previous_summary_values():
+    app = _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "Rabi10us.mat")))
+    win.on_fit_finished(_fake_fit(win, model_name="RabiAdaptive"))
+
+    win.on_fit_error("all starts failed")
+    app.processEvents()
+
+    summary = win.summary_text.toPlainText()
+    assert "FIT ERROR: all starts failed" in summary
+    assert "previous fitted values are retained below" in summary
+    assert "Analysis mode: RabiAdaptive" in summary
 
 
 def test_gui_undo_history_is_chronological_across_parameters_and_masks():

@@ -62,30 +62,42 @@ def fit_model_multistart(
 
     best = None
     best_cost = np.inf
+    failed_attempts: list[str] = []
+    attempted = 0
     for seed in seeds:
+        attempted += 1
         seed = np.asarray(seed, dtype=float)
         seed = np.clip(seed, lower_arr, upper_arr)
-        res = least_squares(
-            lambda p: w_sqrt * (model_func(x, *p) - y),
-            seed,
-            bounds=(lower_arr, upper_arr),
-            loss=loss,
-            f_scale=f_scale,
-            max_nfev=max_nfev,
-            x_scale=x_scale,
-        )
+        try:
+            res = least_squares(
+                lambda p: w_sqrt * (model_func(x, *p) - y),
+                seed,
+                bounds=(lower_arr, upper_arr),
+                loss=loss,
+                f_scale=f_scale,
+                max_nfev=max_nfev,
+                x_scale=x_scale,
+            )
+        except Exception as exc:
+            failed_attempts.append(str(exc))
+            continue
         if res.cost < best_cost:
             best_cost = res.cost
             best = res
 
     if best is None:
-        raise RuntimeError("No fit attempt executed.")
+        detail = failed_attempts[-1] if failed_attempts else "no optimizer attempts were available"
+        raise RuntimeError(f"All {attempted} fit attempts failed: {detail}")
 
     p_opt = best.x
     y_fit = model_func(x, *p_opt)
     dof = len(y) - len(p_opt)
     cov = _estimate_covariance(best.jac, best.cost, dof=max(1, dof))
     p_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+
+    message = str(best.message)
+    if failed_attempts:
+        message += f"; retained best result after {len(failed_attempts)} of {attempted} starts failed"
 
     return FitResult(
         model_name=model_name,
@@ -100,7 +112,7 @@ def fit_model_multistart(
         durbin_watson=durbin_watson(y - y_fit),
         bound_hits=bound_hit_flags(p_opt, lower_arr, upper_arr),
         success=bool(best.success),
-        message=str(best.message),
+        message=message,
         selection_note=selection_note,
     )
 

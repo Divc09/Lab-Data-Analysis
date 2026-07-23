@@ -135,18 +135,23 @@ class ParamMeta:
     description: str
 
 
+PRESENTATION_FIGURE_WIDTH = 8.5
+PRESENTATION_FIGURE_HEIGHT = 5.5
+PRESENTATION_EXPORT_DPI = 300
+
+
 @dataclass
 class PlotOptions:
     show_data: bool = True
-    show_smoothed: bool = True
+    show_smoothed: bool = False
     show_fit: bool = True
-    show_rabi_envelope: bool = True
+    show_rabi_envelope: bool = False
     show_peaks: bool = True
     show_signal_layer: bool = False
     show_reference_layer: bool = False
     show_difference_layer: bool = False
     show_iteration_layer: bool = False
-    show_iteration_mean: bool = True
+    show_iteration_mean: bool = False
     show_iteration_std: bool = False
     iteration_std_mode: str = "Band"
     hide_failed_iterations: bool = True
@@ -165,10 +170,12 @@ class PlotOptions:
     annotation_show_nv_metrics: bool = True
     annotation_show_params: bool = False
     legend_compact_labels: bool = True
+    # Presentation-oriented defaults: a compact widescreen canvas, line-first
+    # traces, and enough resolution for slides or papers.
     plot_style: str = "Line + scatter"
-    fig_width: float = 10.0
-    fig_height: float = 6.0
-    save_dpi: int = 220
+    fig_width: float = PRESENTATION_FIGURE_WIDTH
+    fig_height: float = PRESENTATION_FIGURE_HEIGHT
+    save_dpi: int = PRESENTATION_EXPORT_DPI
     export_png: bool = True
     export_pdf: bool = False
     export_svg: bool = False
@@ -1047,10 +1054,15 @@ class SmartFitterMainWindow(QMainWindow):
         single_layout.setSpacing(8)
         self.mode_stack.addWidget(single_page)
 
-        self.fig = Figure(figsize=(10, 6))
+        self.fig = Figure(
+            figsize=(PRESENTATION_FIGURE_WIDTH, PRESENTATION_FIGURE_HEIGHT),
+            facecolor="#ffffff",
+            edgecolor="#ffffff",
+        )
         self.canvas = FigureCanvas(self.fig)
-        self.ax_main = self.fig.add_subplot(2, 1, 1)
-        self.ax_res = self.fig.add_subplot(2, 1, 2)
+        plot_grid = self.fig.add_gridspec(2, 1, height_ratios=(3.2, 1.0), hspace=0.28)
+        self.ax_main = self.fig.add_subplot(plot_grid[0])
+        self.ax_res = self.fig.add_subplot(plot_grid[1])
         self._ax_main_default_pos = self.ax_main.get_position().frozen()
         self._ax_res_default_pos = self.ax_res.get_position().frozen()
         self.toolbar = NavigationToolbar(self.canvas, root)
@@ -1599,7 +1611,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.show_data_chk.setToolTip("Show/hide raw measured points.")
         self.show_data_chk.toggled.connect(self._refresh_plot_only)
         self.show_smoothed_chk = QCheckBox("Smoothed")
-        self.show_smoothed_chk.setChecked(True)
+        self.show_smoothed_chk.setChecked(False)
         self.show_smoothed_chk.setToolTip("Show/hide smoothed trace overlay.")
         self.show_smoothed_chk.toggled.connect(self._refresh_plot_only)
         self.show_fit_chk = QCheckBox("Fit")
@@ -1607,7 +1619,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.show_fit_chk.setToolTip("Show/hide model fit curve.")
         self.show_fit_chk.toggled.connect(self._refresh_plot_only)
         self.show_rabi_envelope_chk = QCheckBox("Rabi envelope")
-        self.show_rabi_envelope_chk.setChecked(True)
+        self.show_rabi_envelope_chk.setChecked(False)
         self.show_rabi_envelope_chk.setToolTip("Show/hide dashed upper and lower Rabi envelope bounds when available.")
         self.show_rabi_envelope_chk.toggled.connect(self._refresh_plot_only)
         self.show_peaks_chk = QCheckBox("ODMR peaks")
@@ -1669,7 +1681,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.show_iteration_layer_chk.setToolTip("Overlay selected individual iteration traces when available.")
         self.show_iteration_layer_chk.toggled.connect(self._refresh_plot_only)
         self.show_iteration_mean_chk = QCheckBox("Mean")
-        self.show_iteration_mean_chk.setChecked(True)
+        self.show_iteration_mean_chk.setChecked(False)
         self.show_iteration_mean_chk.setToolTip("Overlay the mean of the selected complete iterations.")
         self.show_iteration_mean_chk.toggled.connect(self._refresh_plot_only)
         self.show_iteration_std_chk = QCheckBox("Std")
@@ -1743,18 +1755,18 @@ class SmartFitterMainWindow(QMainWindow):
         self.fig_w_spin = NoScrollDoubleSpinBox()
         self.fig_w_spin.setRange(4.0, 30.0)
         self.fig_w_spin.setDecimals(1)
-        self.fig_w_spin.setValue(10.0)
+        self.fig_w_spin.setValue(PRESENTATION_FIGURE_WIDTH)
         self.fig_w_spin.setToolTip("Live figure width in inches.")
         self.fig_w_spin.valueChanged.connect(self._apply_figure_size)
         self.fig_h_spin = NoScrollDoubleSpinBox()
         self.fig_h_spin.setRange(3.0, 20.0)
         self.fig_h_spin.setDecimals(1)
-        self.fig_h_spin.setValue(6.0)
+        self.fig_h_spin.setValue(PRESENTATION_FIGURE_HEIGHT)
         self.fig_h_spin.setToolTip("Live figure height in inches.")
         self.fig_h_spin.valueChanged.connect(self._apply_figure_size)
         self.save_dpi_spin = NoScrollSpinBox()
         self.save_dpi_spin.setRange(72, 600)
-        self.save_dpi_spin.setValue(220)
+        self.save_dpi_spin.setValue(PRESENTATION_EXPORT_DPI)
         self.save_dpi_spin.setToolTip("Export resolution (dots per inch).")
         plot_gl.addWidget(QLabel("Figure W/H"), 14, 0)
         wh_row = QHBoxLayout()
@@ -2006,8 +2018,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.metadata_progress_bar.setToolTip("Completed iterations divided by target iterations when scan metadata provides it.")
         right_inner_layout.addWidget(self.metadata_progress_bar)
 
-        results_box = QGroupBox("Results")
+        results_box = QGroupBox("Results summary")
         self.results_box = results_box
+        results_box.setMinimumHeight(300)
         results_layout = QVBoxLayout(results_box)
         results_actions = QHBoxLayout()
         results_actions.addStretch(1)
@@ -2026,7 +2039,10 @@ class SmartFitterMainWindow(QMainWindow):
         self.summary_text.setToolTip("Model diagnostics, parameter estimates, and quality assessment.")
         self.summary_text.setMinimumHeight(200)
         results_layout.addWidget(self.summary_text, 1)
-        right_inner_layout.addWidget(results_box, 1)
+        # Keep results near the top of the analysis sidebar. Previously this
+        # box was populated correctly but sat below every plot/export control,
+        # outside the visible scroll viewport at normal window sizes.
+        right_inner_layout.insertWidget(1, results_box, 1)
         left_inner_layout.addStretch(1)
         right_inner_layout.addStretch(1)
 
@@ -2405,6 +2421,12 @@ class SmartFitterMainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(text)
         self.statusBar().showMessage("Result summary copied", 3000)
+
+    def _reveal_results_summary(self) -> None:
+        self.results_box.setVisible(True)
+        self.summary_text.setVisible(True)
+        self.summary_text.verticalScrollBar().setValue(0)
+        self.right_scroll.ensureWidgetVisible(self.results_box, 12, 12)
 
     def _browse_batch_dir(self, line_edit: QLineEdit):
         start = line_edit.text().strip() or str(self.settings.value("session/last_open_dir", ""))
@@ -3894,7 +3916,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.main_splitter is not None:
             self.settings.setValue("layout/main_splitter_sizes", self.main_splitter.sizes())
         s = self.settings
-        s.setValue("ui/version", 4)
+        s.setValue("ui/version", 7)
         s.setValue("plot/fig_width", self.plot_opts.fig_width)
         s.setValue("plot/fig_height", self.plot_opts.fig_height)
         s.setValue("plot/save_dpi", self.plot_opts.save_dpi)
@@ -3949,21 +3971,61 @@ class SmartFitterMainWindow(QMainWindow):
     def _load_preferences(self):
         s = self.settings
         ui_version = int(s.value("ui/version", 0))
+        # Migrate the old factory plot defaults without overwriting a user's
+        # deliberate figure-size, DPI, or trace-style choice.
+        if ui_version < 5:
+            try:
+                old_width = s.value("plot/fig_width", None)
+                if old_width is None or np.isclose(float(old_width), 10.0):
+                    s.setValue("plot/fig_width", PRESENTATION_FIGURE_WIDTH)
+            except (TypeError, ValueError):
+                pass
+            try:
+                old_height = s.value("plot/fig_height", None)
+                if old_height is None or np.isclose(float(old_height), 6.0):
+                    s.setValue("plot/fig_height", PRESENTATION_FIGURE_HEIGHT)
+            except (TypeError, ValueError):
+                pass
+            try:
+                old_dpi = s.value("plot/save_dpi", None)
+                if old_dpi is None or int(old_dpi) == 220:
+                    s.setValue("plot/save_dpi", PRESENTATION_EXPORT_DPI)
+            except (TypeError, ValueError):
+                pass
+            if str(s.value("plot/plot_style", "Line + scatter")) == "Line + scatter":
+                s.setValue("plot/plot_style", "Line")
+        if ui_version < 6:
+            # Version 5 introduced the line-first presentation defaults. Move
+            # only those old factory values to the new scatter-first defaults;
+            # explicit False choices remain untouched.
+            if str(s.value("plot/plot_style", "Line")) == "Line":
+                s.setValue("plot/plot_style", "Scatter")
+            if str(s.value("plot/show_smoothed", "true")).lower() == "true":
+                s.setValue("plot/show_smoothed", False)
+            if str(s.value("plot/show_iteration_mean", "true")).lower() == "true":
+                s.setValue("plot/show_iteration_mean", False)
+        if ui_version < 7:
+            # Version 6 used scatter-only traces and no Rabi envelope. Move
+            # only those factory values to the current defaults.
+            if str(s.value("plot/plot_style", "Scatter")) == "Scatter":
+                s.setValue("plot/plot_style", "Line + scatter")
+            if str(s.value("plot/show_rabi_envelope", "true")).lower() == "true":
+                s.setValue("plot/show_rabi_envelope", False)
         self.fig_w_spin.setValue(float(s.value("plot/fig_width", self.plot_opts.fig_width)))
         self.fig_h_spin.setValue(float(s.value("plot/fig_height", self.plot_opts.fig_height)))
         self.save_dpi_spin.setValue(int(s.value("plot/save_dpi", self.plot_opts.save_dpi)))
         self.show_residual_chk.setChecked(str(s.value("plot/show_residual", "true")).lower() != "false")
         self.show_legend_chk.setChecked(str(s.value("plot/show_legend", "true")).lower() != "false")
         self.show_data_chk.setChecked(str(s.value("plot/show_data", "true")).lower() != "false")
-        self.show_smoothed_chk.setChecked(str(s.value("plot/show_smoothed", "true")).lower() != "false")
+        self.show_smoothed_chk.setChecked(str(s.value("plot/show_smoothed", "false")).lower() != "false")
         self.show_fit_chk.setChecked(str(s.value("plot/show_fit", "true")).lower() != "false")
-        self.show_rabi_envelope_chk.setChecked(str(s.value("plot/show_rabi_envelope", "true")).lower() != "false")
+        self.show_rabi_envelope_chk.setChecked(str(s.value("plot/show_rabi_envelope", "false")).lower() != "false")
         self.show_peaks_chk.setChecked(str(s.value("plot/show_peaks", "true")).lower() != "false")
         self.show_signal_layer_chk.setChecked(str(s.value("plot/show_signal_layer", "false")).lower() == "true")
         self.show_reference_layer_chk.setChecked(str(s.value("plot/show_reference_layer", "false")).lower() == "true")
         self.show_difference_layer_chk.setChecked(str(s.value("plot/show_difference_layer", "false")).lower() == "true")
         self.show_iteration_layer_chk.setChecked(str(s.value("plot/show_iteration_layer", "false")).lower() == "true")
-        self.show_iteration_mean_chk.setChecked(str(s.value("plot/show_iteration_mean", "true")).lower() != "false")
+        self.show_iteration_mean_chk.setChecked(str(s.value("plot/show_iteration_mean", "false")).lower() != "false")
         self.show_iteration_std_chk.setChecked(str(s.value("plot/show_iteration_std", "false")).lower() == "true")
         self.iteration_std_mode_combo.setCurrentText(str(s.value("plot/iteration_std_mode", self.plot_opts.iteration_std_mode)))
         self.hide_failed_iterations_chk.setChecked(str(s.value("plot/hide_failed_iterations", "true")).lower() != "false")
@@ -3993,7 +4055,7 @@ class SmartFitterMainWindow(QMainWindow):
         scan_swap = str(s.value("scan/swap_axes", "true")).lower() != "false" if ui_version >= 4 else True
         scan_equal = str(s.value("scan/equal_aspect", "false")).lower() == "true" if ui_version >= 3 else False
         if ui_version < 4:
-            s.setValue("ui/version", 4)
+            s.setValue("ui/version", 7)
             s.setValue("scan/swap_axes", True)
         if ui_version < 3:
             s.setValue("scan/equal_aspect", False)
@@ -4033,6 +4095,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.exp_report_pdf_chk.setChecked(False)
         self._update_contextual_visibility()
         self._sync_quick_toolbar_from_state()
+        if ui_version < 7:
+            s.setValue("ui/version", 7)
 
     def _update_contextual_visibility(self):
         model = self.model_combo.currentText()
@@ -4768,7 +4832,15 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Copy figure", "Load data before copying a figure.")
             return
         buffer = BytesIO()
-        self.fig.savefig(buffer, format="png", dpi=max(300, int(self.plot_opts.save_dpi)), bbox_inches="tight", pad_inches=0.12)
+        self.fig.savefig(
+            buffer,
+            format="png",
+            dpi=max(300, int(self.plot_opts.save_dpi)),
+            bbox_inches="tight",
+            pad_inches=0.10,
+            facecolor="#ffffff",
+            edgecolor="#ffffff",
+        )
         image = QImage.fromData(buffer.getvalue(), "PNG")
         if image.isNull():
             self._message("Copy figure", "The figure could not be rendered for the clipboard.")
@@ -5548,12 +5620,12 @@ class SmartFitterMainWindow(QMainWindow):
         style = self.plot_opts.plot_style
         scale = float(getattr(self, "_plot_scale", 1.0))
         if role in {"fit", "smoothed", "overlay", "linecut"}:
-            return "-", {"lw": 2.0 * scale}
+            return "-", {"lw": 2.0 * scale, "alpha": 0.95}
         if style == "Scatter":
-            return "o", {"ms": 4 * scale, "linestyle": "None", "alpha": 0.65}
+            return "o", {"ms": 4.2 * scale, "linestyle": "None", "alpha": 0.88}
         if style == "Line":
-            return "-", {"lw": 1.8 * scale, "alpha": 0.9}
-        return "o-", {"ms": 3.6 * scale, "lw": 1.2 * scale, "alpha": 0.78}
+            return "-", {"lw": 1.8 * scale, "alpha": 0.95}
+        return "o-", {"ms": 3.4 * scale, "lw": 1.5 * scale, "alpha": 0.88}
 
     def _start_series_registry(self) -> None:
         self._series_registry = []
@@ -6210,7 +6282,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.ax_main.set_position(self._ax_main_default_pos)
             self.ax_res.set_position(self._ax_res_default_pos)
             return
-        rect = [0.10, 0.13, 0.82, 0.76]
+        rect = [0.11, 0.14, 0.82, 0.76]
         self.ax_main.set_position(rect)
         if self._ax_secondary is not None:
             self._ax_secondary.set_position(rect)
@@ -6402,20 +6474,29 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _apply_axes_visual_style(self):
         """Keep the scientific plot bright, quiet, and readable inside the dark workbench."""
-        self.fig.patch.set_facecolor("#f3f6f4")
+        # Keep the exported figure and the live canvas visually consistent.
+        # In particular, the figure patch must be white so clipboard PNGs do
+        # not acquire a grey border around the white axes.
+        self.fig.patch.set_facecolor("#ffffff")
+        self.fig.patch.set_edgecolor("#ffffff")
+        self.fig.patch.set_linewidth(0.0)
         axes = [self.ax_main, self.ax_res, self._ax_secondary, self._scan_colorbar_ax]
         for ax in axes:
             if ax is None or not ax.get_visible():
                 continue
             ax.set_facecolor("#ffffff")
             ax.set_axisbelow(True)
-            ax.tick_params(axis="both", colors="#526159", labelsize=max(6.0, 9 * self._plot_scale), width=max(0.6, 0.8 * self._plot_scale))
+            ax.tick_params(axis="both", colors="#526159", labelsize=max(6.0, 9.5 * self._plot_scale), width=max(0.7, 0.9 * self._plot_scale))
             ax.xaxis.label.set_color("#26332d")
             ax.yaxis.label.set_color("#26332d")
             ax.title.set_color("#1d2923")
             for spine in ax.spines.values():
-                spine.set_color("#c8d2cc")
-                spine.set_linewidth(0.8)
+                spine.set_color("#b8c5bd")
+                spine.set_linewidth(0.9)
+            for gridline in [*ax.get_xgridlines(), *ax.get_ygridlines()]:
+                gridline.set_color("#d8e0dc")
+                gridline.set_alpha(0.72)
+                gridline.set_linewidth(0.8)
         if self._scan_colorbar is not None:
             self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=max(6.0, 8 * self._plot_scale))
             self._scan_colorbar.ax.yaxis.label.set_color("#26332d")
@@ -7121,6 +7202,17 @@ class SmartFitterMainWindow(QMainWindow):
         self._active_fit_request = None
         self._set_ui_busy(False)
         self._set_status("FAIL", msg)
+        previous = self.summary_text.toPlainText().strip()
+        if previous:
+            text = (
+                f"FIT ERROR: {msg}\n"
+                "No new parameter set was produced; the previous fitted values are retained below.\n\n"
+                f"{previous}"
+            )
+        else:
+            text = f"FIT ERROR: {msg}\nNo fitted values were produced by any optimizer attempt."
+        self.summary_text.setPlainText(text)
+        QTimer.singleShot(0, self._reveal_results_summary)
         self._message("Fit error", f"Fit failed:\n{msg}")
 
     def _set_status(self, status: str, reason: str = ""):
@@ -7313,6 +7405,13 @@ class SmartFitterMainWindow(QMainWindow):
             status, reason = classify_status(r2=result.r2, bound_hits=int(sum(result.bound_hits)), profile=profile)
         else:
             status, reason = "N/A", "Quality gate disabled"
+        if not result.success:
+            convergence_note = "optimizer did not report convergence; fitted values retained for inspection"
+            if status in {"PASS", "N/A"}:
+                status = "WARN"
+                reason = convergence_note
+            else:
+                reason = f"{reason}; {convergence_note}"
         self.ctx.status = status
         self.ctx.status_reason = reason
         self._set_status(status, reason)
@@ -7329,6 +7428,14 @@ class SmartFitterMainWindow(QMainWindow):
             f"Success: {result.success}",
             f"Status: {status} | {reason}",
         ]
+        if status in {"WARN", "FAIL"} or not result.success:
+            lines += [
+                "",
+                "WARNING: This fit did not pass all quality checks.",
+                "The fitted values are still shown below for inspection and export; verify them before using them as a calibration.",
+            ]
+        if result.message:
+            lines.append(f"Optimizer: {result.message}")
         if result.selection_note:
             lines.append(f"Selection: {result.selection_note}")
         if self.ctx.trace is not None:
@@ -7382,6 +7489,7 @@ class SmartFitterMainWindow(QMainWindow):
         if robust_summary:
             lines += ["", robust_summary]
         self.summary_text.setPlainText("\n".join(lines))
+        QTimer.singleShot(0, self._reveal_results_summary)
         self.ctx.fit_signature = self._current_fit_signature()
 
     def _run_single_fit_background(self, model_name, x, y, locks, config):
@@ -7679,15 +7787,15 @@ class SmartFitterMainWindow(QMainWindow):
             self.fig.tight_layout(pad=0.5)
         saved_paths: list[Path] = []
         if self.exp_png_chk.isChecked():
-            self.fig.savefig(fit_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
+            self.fig.savefig(fit_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
             saved_paths.append(fit_png)
         fit_pdf = out / f"{stem}_gui_fit.pdf"
         fit_svg = out / f"{stem}_gui_fit.svg"
         if self.exp_pdf_chk.isChecked():
-            self.fig.savefig(fit_pdf, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
+            self.fig.savefig(fit_pdf, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
             saved_paths.append(fit_pdf)
         if self.exp_svg_chk.isChecked():
-            self.fig.savefig(fit_svg, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
+            self.fig.savefig(fit_svg, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
             saved_paths.append(fit_svg)
 
         profile = self._active_profile()
@@ -7786,7 +7894,11 @@ class SmartFitterMainWindow(QMainWindow):
         # Save an annotated report figure with key extracted metrics.
         if self.ctx.trace.fit_allowed and (self.exp_report_png_chk.isChecked() or self.exp_report_pdf_chk.isChecked()):
             report_png = out / f"{stem}_gui_report.png"
-            fig = Figure(figsize=(self.plot_opts.fig_width, self.plot_opts.fig_height))
+            fig = Figure(
+                figsize=(self.plot_opts.fig_width, self.plot_opts.fig_height),
+                facecolor="#ffffff",
+                edgecolor="#ffffff",
+            )
             if self.plot_opts.show_residual:
                 gs = fig.add_gridspec(2, 2, width_ratios=[4.5, 1.7], height_ratios=[3.0, 1.4])
                 ax = fig.add_subplot(gs[0, 0])
@@ -7899,11 +8011,11 @@ class SmartFitterMainWindow(QMainWindow):
                 self._apply_axis_presentation(axr, "residual")
             fig.tight_layout(pad=0.5)
             if self.exp_report_png_chk.isChecked():
-                FigureCanvas(fig).print_figure(report_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
+                FigureCanvas(fig).print_figure(report_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
                 saved_paths.append(report_png)
             if self.exp_report_pdf_chk.isChecked():
                 report_pdf = out / f"{stem}_gui_report.pdf"
-                FigureCanvas(fig).print_figure(report_pdf, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.12)
+                FigureCanvas(fig).print_figure(report_pdf, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
                 saved_paths.append(report_pdf)
 
         # Origin-friendly bundle CSV.
