@@ -1,8 +1,14 @@
-# Local Python environments and test caches
+# Local Python environments, tests, and test outputs
 .venv/
 .pytest_cache/
 __pycache__/
 *.py[cod]
+.coverage
+.coverage.*
+htmlcov/
+test-results/
+tests/
+TestData/
 
 # Local agent/editor state
 .codex/
@@ -11,6 +17,7 @@ __pycache__/
 skills-lock.json
 
 # Generated analysis outputs and local session files
+artifacts/
 Batch Processing Tests/
 batch_out*/
 *.nvfit-session.json
