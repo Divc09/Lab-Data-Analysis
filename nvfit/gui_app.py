@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 from matplotlib import colormaps
-from matplotlib.colors import to_hex
+from matplotlib.colors import LinearSegmentedColormap, to_hex
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -149,6 +149,21 @@ class ParamMeta:
 PRESENTATION_FIGURE_WIDTH = 8.5
 PRESENTATION_FIGURE_HEIGHT = 5.5
 PRESENTATION_EXPORT_DPI = 300
+
+# MATLAB's modern default is parula. Keeping it available here makes raw maps
+# visually comparable without percentile clipping or rainbow-style banding.
+PARULA = LinearSegmentedColormap.from_list(
+    "parula",
+    [
+        "#352a87", "#1265a8", "#148ab4", "#12a7a2", "#3fbc73",
+        "#86c94b", "#c6d63c", "#f1df3a", "#f9c932", "#f9a721",
+    ],
+    N=256,
+)
+if "parula" not in colormaps:
+    colormaps.register(PARULA)
+if "parula_r" not in colormaps:
+    colormaps.register(PARULA.reversed(name="parula_r"))
 
 
 @dataclass
@@ -652,6 +667,9 @@ class SmartFitterMainWindow(QMainWindow):
         self._responsive_timer = QTimer(self)
         self._responsive_timer.setSingleShot(True)
         self._responsive_timer.timeout.connect(self._apply_responsive_scaling)
+        self._splitter_timer = QTimer(self)
+        self._splitter_timer.setSingleShot(True)
+        self._splitter_timer.timeout.connect(self._workspace_splitter_settled)
         # Keep the last/current point as a compatibility and readout anchor,
         # while retaining an ordered set of 1D points for additive selection.
         # Existing session/fit actions intentionally continue to operate on
@@ -964,19 +982,19 @@ class SmartFitterMainWindow(QMainWindow):
         QToolButton:hover { background-color: #202b25; color: #f0f6f2; border-color: #46584f; }
         QToolButton:checked { background-color: #254637; color: #7ee0b7; border-color: #4cad86; }
         QToolBar {
-            background-color: #e8eeea;
+            background-color: #252c34;
             border: none;
-            border-bottom: 1px solid #cbd4cf;
+            border-bottom: 1px solid #485360;
             spacing: 4px;
             padding: 4px 6px;
         }
         QToolBar QToolButton {
             background-color: transparent;
             border: none;
-            color: #24302a;
+            color: #f1f5f8;
             padding: 5px;
         }
-        QToolBar QToolButton:hover { background-color: #d8e2dc; border-radius: 5px; }
+        QToolBar QToolButton:hover { background-color: #3a4652; border-radius: 5px; }
         QSplitter::handle { background-color: #1c2520; }
         QSplitter::handle:horizontal { width: 5px; }
         QSplitter::handle:hover { background-color: #3d6d58; }
@@ -1127,9 +1145,9 @@ class SmartFitterMainWindow(QMainWindow):
         QPushButton#PrimaryAction:hover { background: #3989ca; }
         QPushButton#CommandAction { background: #292f37; }
         QToolButton:checked { background: #173f62; color: #c7e5ff; border-color: #62b0f2; font-weight: 600; }
-        QToolBar { background: #e7ebef; border: 0; border-bottom: 1px solid #8f99a5; spacing: 2px; padding: 1px 3px; }
-        QToolBar QToolButton { border: 0; padding: 3px; color: #20242a; background: transparent; }
-        QToolBar QToolButton:hover { background: #cfd7e0; }
+        QToolBar { background: #252c34; border: 0; border-bottom: 1px solid #596574; spacing: 2px; padding: 1px 3px; }
+        QToolBar QToolButton { border: 0; padding: 3px; color: #f1f5f8; background: transparent; }
+        QToolBar QToolButton:hover { background: #3a4652; }
         QTabWidget#InspectorTabs::pane { border: 1px solid #4b5663; background: #20242b; top: -1px; }
         QTabBar::tab { background: #2a3038; color: #c7ced7; border: 1px solid #4c5663; padding: 5px 8px; margin-right: 1px; }
         QTabBar::tab:selected { background: #20242b; color: #a9d7ff; border-top: 2px solid #62b0f2; border-bottom-color: #20242b; }
@@ -1183,14 +1201,15 @@ class SmartFitterMainWindow(QMainWindow):
         font_width = self.fontMetrics().horizontalAdvance("Observable detector controls")
         # Stable dock widths are substantially more predictable than sizeHint()
         # here: long model text must never make the file explorer disappear.
-        left_width = 248
-        right_width = 348
-        required_plot_width = 520
+        left_width = 320
+        right_width = 360
+        required_plot_width = 620
+        files_mode_plot_width = 520
         chrome = 36
         if width >= required_plot_width + left_width + right_width + chrome:
             mode = "expanded"
             show_left, show_right = self._preferred_files_open, self._preferred_inspector_open
-        elif width >= required_plot_width + left_width + chrome:
+        elif width >= files_mode_plot_width + 280 + chrome:
             mode = "files"
             show_left, show_right = self._preferred_files_open, False
         else:
@@ -1324,7 +1343,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._apply_responsive_scaling(force=True)
         if self._responsive_layout_mode == "expanded":
             total = max(1, self.main_splitter.width())
-            self.main_splitter.setSizes([248, max(420, total - 596), 348])
+            self.main_splitter.setSizes([320, max(420, total - 680), 360])
         self.statusBar().showMessage("Workspace layout restored", 3000)
 
     def _focus_file_filter(self) -> None:
@@ -1340,13 +1359,25 @@ class SmartFitterMainWindow(QMainWindow):
         trace = self.ctx.trace
         available_ratio = self.plot_stack.width() / max(1, self.plot_stack.height())
         comparison = bool(trace is not None and trace.scan_dim == "scan2d" and self._comparison_trace() is not None)
-        self._dual_map_stacked = bool(comparison and available_ratio < 1.55)
+        # Side-by-side maps use substantially more area whenever the plot is
+        # at least as wide as it is tall. Stack only in genuinely narrow panes.
+        self._dual_map_stacked = bool(comparison and available_ratio < 1.0)
         # The Matplotlib layout owns scientific aspect ratios. The Qt shell
         # should fill the workspace instead of letterboxing the entire figure
         # and creating large unusable gutters.
         toolbar_height = self.toolbar.sizeHint().height() if hasattr(self, "toolbar") else 0
         canvas_height = max(1, self.plot_stack.height() - toolbar_height)
         self.plot_surface.set_ratio(self.plot_stack.width() / canvas_height)
+
+    def _workspace_splitter_settled(self) -> None:
+        previous = bool(getattr(self, "_dual_map_stacked", False))
+        self._update_plot_surface_ratio()
+        if (
+            previous != bool(getattr(self, "_dual_map_stacked", False))
+            and self.ctx.trace is not None
+            and self.ctx.trace.scan_dim == "scan2d"
+        ):
+            self._refresh_plot_only()
 
     def _build_ui(self):
         root = QWidget()
@@ -1447,19 +1478,22 @@ class SmartFitterMainWindow(QMainWindow):
         self._ax_main_default_pos = self.ax_main.get_position().frozen()
         self._ax_res_default_pos = self.ax_res.get_position().frozen()
         self.toolbar = NavigationToolbar(self.canvas, root)
+        self._style_navigation_toolbar_icons()
         splitter = QSplitter(Qt.Horizontal)
         self.main_splitter = splitter
         splitter.setChildrenCollapsible(False)
+        splitter.splitterMoved.connect(lambda *_args: self._splitter_timer.start(80))
 
         left = QWidget()
         left.setObjectName("SidePanel")
-        left.setMinimumWidth(240)
+        left.setMinimumWidth(280)
         self.left_panel = left
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_scroll = SmoothScrollArea()
         self.left_scroll = left_scroll
         left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         left_layout.addWidget(left_scroll)
         left_inner = QWidget()
         left_scroll.setWidget(left_inner)
@@ -2557,7 +2591,11 @@ class SmartFitterMainWindow(QMainWindow):
 
         self._make_group_static(self.overlay_box, title="Project Explorer")
         self.overlay_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        self.overlay_list.setMinimumHeight(120)
+        self.overlay_list.setMinimumHeight(320)
+        self.overlay_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.overlay_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.overlay_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.overlay_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.overlay_list.setAlternatingRowColors(True)
         self.overlay_help_lbl.setVisible(False)
         for label in self.overlay_box.findChildren(QLabel):
@@ -2591,6 +2629,14 @@ class SmartFitterMainWindow(QMainWindow):
         self.overlay_layout.addWidget(self.btn_clear_overlay, 2, 2)
         self.overlay_layout.removeWidget(self.overlay_list)
         self.overlay_layout.addWidget(self.overlay_list, 3, 0, 1, 3)
+        self.overlay_layout.setRowStretch(3, 1)
+        # The old left rail kept a trailing stretch below the explorer, which
+        # consumed most of the panel height and left only a few visible files.
+        for index in reversed(range(self.left_inner_layout.count())):
+            item = self.left_inner_layout.itemAt(index)
+            if item is not None and item.spacerItem() is not None:
+                self.left_inner_layout.takeAt(index)
+        self.left_inner_layout.setStretchFactor(self.overlay_box, 1)
 
         # Compatibility entry points now select an in-place inspector tab.
         self.analysis_tools_btn = QPushButton("Processing")
@@ -3028,7 +3074,7 @@ class SmartFitterMainWindow(QMainWindow):
         outer.setVerticalSpacing(6)
 
         self.scan_colormap_combo = NoScrollComboBox()
-        self.scan_colormap_combo.addItems(["viridis", "cividis", "magma", "inferno", "plasma", "turbo", "coolwarm", "RdBu", "gray"])
+        self.scan_colormap_combo.addItems(["parula", "viridis", "cividis", "magma", "inferno", "plasma", "turbo", "coolwarm", "RdBu", "gray"])
         self.scan_colormap_combo.setToolTip("Change the 2D map colormap immediately.")
         self.scan_colormap_combo.currentTextChanged.connect(self._on_scan_style_changed)
         self.scan_reverse_chk = QCheckBox("Reverse")
@@ -3036,12 +3082,12 @@ class SmartFitterMainWindow(QMainWindow):
         outer.addWidget(QLabel("Colormap"), 0, 0)
         outer.addWidget(self.scan_colormap_combo, 0, 1, 1, 2)
         outer.addWidget(QLabel("Direction"), 1, 0)
-        self.scan_reverse_chk.setText("Reverse color order")
+        self.scan_reverse_chk.setText("Reverse colors")
         outer.addWidget(self.scan_reverse_chk, 1, 1, 1, 2)
 
         self.scan_scale_combo = NoScrollComboBox()
         self.scan_scale_combo.addItems(["Auto", "Robust percentiles", "Manual"])
-        self.scan_scale_combo.setCurrentText("Robust percentiles")
+        self.scan_scale_combo.setCurrentText("Auto")
         self.scan_scale_combo.currentTextChanged.connect(self._on_scan_scale_changed)
         outer.addWidget(QLabel("Color scale"), 2, 0)
         outer.addWidget(self.scan_scale_combo, 2, 1, 1, 2)
@@ -3687,7 +3733,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._on_scan_style_changed()
 
     def _scan_colormap_name(self) -> str:
-        name = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "viridis"
+        name = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "parula"
         return f"{name}_r" if hasattr(self, "scan_reverse_chk") and self.scan_reverse_chk.isChecked() else name
 
     def _scan_color_limits(
@@ -4812,11 +4858,11 @@ class SmartFitterMainWindow(QMainWindow):
             saved_sizes = [int(value) for value in saved]
         except (TypeError, ValueError):
             saved_sizes = []
-        mins = [270, 620, 320]
+        mins = [320, 680, 360]
         if len(saved_sizes) == 3 and sum(saved_sizes) > 0:
             weights = np.asarray(saved_sizes, dtype=float)
             weights = weights / max(float(np.sum(weights)), 1.0)
-            sizes = np.maximum([220, 420, 260], np.floor(weights * total).astype(int)).tolist()
+            sizes = np.maximum([280, 420, 280], np.floor(weights * total).astype(int)).tolist()
             overflow = sum(sizes) - total
             if overflow > 0:
                 sizes[1] = max(320, sizes[1] - overflow)
@@ -4826,7 +4872,7 @@ class SmartFitterMainWindow(QMainWindow):
             center += total - sum(mins)
             sizes = [left, center, right]
         else:
-            weights = np.array([0.24, 0.48, 0.28], dtype=float)
+            weights = np.array([0.25, 0.48, 0.27], dtype=float)
             sizes = np.maximum(1, np.floor(weights * total).astype(int)).tolist()
             sizes[1] += total - sum(sizes)
         self.main_splitter.setSizes(sizes)
@@ -4854,6 +4900,55 @@ class SmartFitterMainWindow(QMainWindow):
             lines.append(f"  Notes: {metadata['scan_notes']}")
         return lines
 
+    @staticmethod
+    def _axis_detail_line(label: str, values: np.ndarray) -> str | None:
+        axis = np.asarray(values, dtype=float).ravel()
+        axis = axis[np.isfinite(axis)]
+        if axis.size == 0:
+            return None
+        start, end = float(axis[0]), float(axis[-1])
+        text = f"{label}: {start:.9g} to {end:.9g} ({axis.size} points"
+        if axis.size > 1:
+            steps = np.diff(axis)
+            median_step = float(np.median(steps))
+            text += f", step {median_step:.9g}"
+            tolerance = max(abs(median_step) * 1e-6, 1e-12)
+            if not np.allclose(steps, median_step, rtol=1e-6, atol=tolerance):
+                text += f", variable {float(np.min(steps)):.9g} to {float(np.max(steps)):.9g}"
+        return text + ")"
+
+    def _scan_axis_detail_lines(self, trace: ExperimentTrace) -> list[str]:
+        lines: list[str] = []
+        if trace.scan_dim == "scan2d" and trace.x2d is not None and trace.y2d is not None:
+            x2d = np.asarray(trace.x2d, dtype=float)
+            y2d = np.asarray(trace.y2d, dtype=float)
+            if x2d.ndim == 2 and y2d.ndim == 2 and x2d.size and y2d.size:
+                lines.append(f"Map size: {x2d.shape[1]} columns x {x2d.shape[0]} rows")
+                x_label = trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"
+                y_label = trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"
+                for label, values in ((x_label, x2d[0, :]), (y_label, y2d[:, 0])):
+                    detail = self._axis_detail_line(label, values)
+                    if detail:
+                        lines.append(detail)
+                return lines
+        axis_label = trace.scan_axes[0] if trace.scan_axes else trace.x_label
+        detail = self._axis_detail_line(axis_label, trace.x_ns)
+        if detail:
+            lines.append(detail)
+        return lines
+
+    @staticmethod
+    def _compact_metadata_value(value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool, np.integer, np.floating)):
+            return str(value)
+        if isinstance(value, (list, tuple)) and len(value) <= 8 and all(
+            isinstance(item, (str, int, float, bool, np.integer, np.floating)) for item in value
+        ):
+            return ", ".join(str(item) for item in value)
+        return None
+
     def _trace_summary_lines(self, trace: ExperimentTrace) -> list[str]:
         metadata = trace.metadata or {}
         completed = metadata.get("completed_iterations")
@@ -4869,6 +4964,7 @@ class SmartFitterMainWindow(QMainWindow):
             f"Fit allowed: {'yes' if trace.fit_allowed else 'no'}",
             f"Source: {trace.source_path}",
         ]
+        lines.extend(self._scan_axis_detail_lines(trace))
         if metadata.get("save_type") or metadata.get("run_status"):
             lines.append(f"Run state: {metadata.get('run_status', 'unknown')} ({metadata.get('save_type', 'unknown')})")
         if completed is not None or target is not None:
@@ -4895,6 +4991,22 @@ class SmartFitterMainWindow(QMainWindow):
                 lines.extend([f"Warning: {w}" for w in warnings])
             else:
                 lines.append(f"Warning: {warnings}")
+        shown_metadata = {
+            "schema", "detector_id", "detector_label", "detector_labels", "scan_axes",
+            "save_type", "run_status", "completed_iterations", "target_iterations",
+            "current_iteration", "warnings", "rf_frequency_ghz", "rf2_frequency_ghz",
+            "rf2_duration_ns", "pi_pulse_ns", "tau_ns", "rabi_dead_time_ns",
+        }
+        extra_lines: list[str] = []
+        for key in sorted(metadata):
+            if key in shown_metadata:
+                continue
+            value = self._compact_metadata_value(metadata[key])
+            if value not in {None, ""}:
+                extra_lines.append(f"  {key.replace('_', ' ')}: {value}")
+        if extra_lines:
+            lines.append("Additional saved parameters:")
+            lines.extend(extra_lines)
         lines.extend(self._snapshot_summary_lines(trace.metadata if trace.metadata is not None else {}))
         return lines
 
@@ -5491,7 +5603,11 @@ class SmartFitterMainWindow(QMainWindow):
             self._show_loaded_trace_summary()
 
     def _refresh_plot_only(self, *, preserve_view: bool = True):
-        view_state = None if self._overlay_view_dirty or not preserve_view else self._capture_view_state()
+        is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
+        # 2D maps own a paired X/Y view in _scan_view_limits. Restoring the
+        # generic 1D X-only state after a legend or style refresh corrupts the
+        # map extent and can resurrect limits from the previously loaded file.
+        view_state = None if self._overlay_view_dirty or not preserve_view or is_scan2d else self._capture_view_state()
         self._apply_plot_controls_to_state()
         if self.ctx.fit_result is not None and self.ctx.y is not None:
             plot_y = self.ctx.fit_target if self.ctx.fit_target is not None else self.ctx.y
@@ -5680,7 +5796,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.main_splitter is not None:
             self.settings.setValue("layout/main_splitter_sizes", self.main_splitter.sizes())
         s = self.settings
-        s.setValue("ui/version", 9)
+        s.setValue("ui/version", 10)
         s.setValue("ui/reduce_motion", self._reduce_motion)
         s.setValue("ui/files_drawer_open", self._preferred_files_open)
         s.setValue("ui/inspector_drawer_open", self._preferred_inspector_open)
@@ -5799,6 +5915,13 @@ class SmartFitterMainWindow(QMainWindow):
             except (TypeError, ValueError):
                 migrated_mode = "auto"
             s.setValue("plot/export_size_mode", migrated_mode)
+        if ui_version < 10:
+            # Move only the old map factory choices to a MATLAB-like full-range
+            # view. Custom colormaps and manual color limits remain untouched.
+            if str(s.value("scan/colormap", "viridis")) == "viridis":
+                s.setValue("scan/colormap", "parula")
+            if str(s.value("scan/color_scale", "Robust percentiles")) in {"Robust percentiles", "Robust 2–98%"}:
+                s.setValue("scan/color_scale", "Auto")
         self.plot_opts.export_size_mode = str(s.value("plot/export_size_mode", "auto"))
         self.fig_w_spin.setValue(float(s.value("plot/fig_width", self.plot_opts.fig_width)))
         self.fig_h_spin.setValue(float(s.value("plot/fig_height", self.plot_opts.fig_height)))
@@ -5836,8 +5959,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.ann_nv_metrics_chk.setChecked(str(s.value("plot/annotation_nv_metrics", "true")).lower() != "false")
         self.ann_params_chk.setChecked(str(s.value("plot/annotation_params", "false")).lower() == "true")
         self.plot_style_combo.setCurrentText(str(s.value("plot/plot_style", "Line + scatter")))
-        scan_cmap = str(s.value("scan/colormap", "viridis"))
-        scan_scale = str(s.value("scan/color_scale", "Robust percentiles"))
+        scan_cmap = str(s.value("scan/colormap", "parula"))
+        scan_scale = str(s.value("scan/color_scale", "Auto"))
         if scan_scale == "Robust 2–98%":
             scan_scale = "Robust percentiles"
         scan_reverse = str(s.value("scan/reverse_colormap", "false")).lower() == "true"
@@ -5886,8 +6009,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._loading_preferences = False
         if hasattr(self, "reduce_motion_action"):
             self.reduce_motion_action.setChecked(self._reduce_motion)
-        if ui_version < 9:
-            s.setValue("ui/version", 9)
+        if ui_version < 10:
+            s.setValue("ui/version", 10)
 
     def _update_contextual_visibility(self):
         model = self.model_combo.currentText()
@@ -7617,7 +7740,10 @@ class SmartFitterMainWindow(QMainWindow):
         overlay_warnings = self._sync_loaded_traces_for_detector(detector_id)
         if not preserve_analysis:
             self._overlay_visible_names.clear()
-        self._overlay_view_dirty = not preserve_analysis
+        # A newly selected primary file always gets its own full data view.
+        # preserve_analysis retains processing/overlay state, not navigation
+        # limits from a different acquisition.
+        self._overlay_view_dirty = True
         self._refresh_detector_controls(detector_id)
         self._update_overlay_widgets(checked_overlays)
         self._update_recent_files(str(Path(file_path).resolve()))
@@ -8463,9 +8589,31 @@ class SmartFitterMainWindow(QMainWindow):
     def _reset_export_navigation_history(self):
         """Discard toolbar views whose limits predate the rebuilt axes."""
         try:
+            self.toolbar._nav_stack.clear()
+            self.toolbar.push_current()
             self.toolbar.update()
         except Exception:
             pass
+
+    def _style_navigation_toolbar_icons(self) -> None:
+        """Use explicit high-contrast icons instead of OS-theme-dependent SVGs."""
+        if qta is None or not hasattr(self, "toolbar"):
+            return
+        icon_names = {
+            "home": "fa5s.home",
+            "back": "fa5s.arrow-left",
+            "forward": "fa5s.arrow-right",
+            "pan": "fa5s.arrows-alt",
+            "zoom": "fa5s.search-plus",
+            "subplots": "fa5s.sliders-h",
+            "customize": "fa5s.chart-line",
+            "save": "fa5s.save",
+        }
+        for action in self.toolbar.actions():
+            text = action.text().replace("&", "").strip().lower()
+            icon_name = next((value for key, value in icon_names.items() if key in text), None)
+            if icon_name is not None:
+                action.setIcon(qta.icon(icon_name, color="#f1f5f8", color_disabled="#7f8995"))
 
     def _nearest_trace_point(self, xdata: float) -> tuple[int, float, float] | None:
         x = self.ctx.analysis_x if self.ctx.analysis_x is not None else self.ctx.x
@@ -8528,9 +8676,11 @@ class SmartFitterMainWindow(QMainWindow):
     def _format_inspect_value(self, value: float) -> str:
         if not np.isfinite(value):
             return "n/a"
-        if abs(value) >= 100:
+        nearest_integer = round(value)
+        tolerance = max(1e-10, abs(value) * 1e-12)
+        if abs(value - nearest_integer) <= tolerance:
             return str(int(round(value)))
-        return f"{value:.6f}"
+        return f"{value:.9g}"
 
     def _inspectable_axes(self) -> set:
         axes = {self.ax_main}
@@ -9709,12 +9859,12 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _configure_scan2d_layout(self, show_linecut: bool, box_aspect: float) -> None:
         if show_linecut:
-            base_rect = [0.09, 0.45, 0.66, 0.42]
+            base_rect = [0.08, 0.43, 0.80, 0.50]
             main_rect = self._fit_axes_box_to_aspect(base_rect, box_aspect)
-            self.ax_res.set_position([0.09, 0.12, 0.66, 0.20])
+            self.ax_res.set_position([0.09, 0.10, 0.79, 0.21])
             self.ax_res.set_visible(True)
         else:
-            base_rect = [0.09, 0.12, 0.66, 0.76]
+            base_rect = [0.08, 0.10, 0.80, 0.82]
             main_rect = self._fit_axes_box_to_aspect(base_rect, box_aspect)
             self.ax_res.set_visible(False)
         self.ax_main.set_position(main_rect)
@@ -9731,22 +9881,16 @@ class SmartFitterMainWindow(QMainWindow):
         stacked = bool(getattr(self, "_dual_map_stacked", False))
         if stacked:
             if show_linecut:
-                # Leave a real text gutter between the xlabel of the upper
-                # map and the title of the lower map.  The old 0.06 gutter
-                # was enough for empty axes but clipped/overlapped at the
-                # stable 11 pt label / 13 pt title sizes used by exports.
-                main_base_rect = [0.10, 0.75, 0.72, 0.15]
-                compare_base_rect = [0.10, 0.42, 0.72, 0.15]
+                main_base_rect = [0.08, 0.69, 0.80, 0.22]
+                compare_base_rect = [0.08, 0.39, 0.80, 0.22]
             else:
-                # Keep the two map rows visually balanced while reserving a
-                # 0.17 normalized gap for tick labels and the next title.
-                main_base_rect = [0.10, 0.60, 0.72, 0.27]
-                compare_base_rect = [0.10, 0.16, 0.72, 0.27]
+                main_base_rect = [0.08, 0.56, 0.80, 0.37]
+                compare_base_rect = [0.08, 0.08, 0.80, 0.37]
         else:
-            bottom = 0.45 if show_linecut else 0.14
-            height = 0.42 if show_linecut else 0.72
-            main_base_rect = [0.07, bottom, 0.34, height]
-            compare_base_rect = [0.55, bottom, 0.34, height]
+            bottom = 0.43 if show_linecut else 0.11
+            height = 0.50 if show_linecut else 0.81
+            main_base_rect = [0.05, bottom, 0.39, height]
+            compare_base_rect = [0.54, bottom, 0.39, height]
         main_rect = self._fit_axes_box_to_aspect(main_base_rect, box_aspect)
         compare_rect = self._fit_axes_box_to_aspect(compare_base_rect, box_aspect)
         self.ax_main.set_position(main_rect)
@@ -9760,7 +9904,7 @@ class SmartFitterMainWindow(QMainWindow):
             [compare_rect[0] + compare_rect[2] + cbar_pad, compare_rect[1], cbar_width, compare_rect[3]]
         )
         if show_linecut:
-            self.ax_res.set_position([0.10, 0.08, 0.78, 0.18] if stacked else [0.09, 0.10, 0.80, 0.20])
+            self.ax_res.set_position([0.09, 0.07, 0.80, 0.18] if stacked else [0.08, 0.09, 0.84, 0.21])
             self.ax_res.set_visible(True)
         else:
             self.ax_res.set_visible(False)

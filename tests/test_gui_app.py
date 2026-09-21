@@ -436,6 +436,12 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     assert win.ax_main.get_xlim() == pytest.approx(xlim)
     assert win.ax_main.get_ylim() == pytest.approx(ylim)
 
+    # Plot presentation changes must preserve the paired 2D view rather than
+    # restoring a stale X-only state from another plot.
+    win.quick_legend_btn.setChecked(not win.quick_legend_btn.isChecked())
+    assert win.ax_main.get_xlim() == pytest.approx(xlim)
+    assert win.ax_main.get_ylim() == pytest.approx(ylim)
+
     before_xspan = np.ptp(win.ax_main.get_xlim())
     event = SimpleNamespace(inaxes=win.ax_main, xdata=float(np.mean(xlim)), ydata=float(np.mean(ylim)), button="up")
     win._on_scan_scroll(event)
@@ -486,6 +492,45 @@ def test_gui_2d_pixel_geometry_survives_axis_swap_for_rectangular_map():
             _x_edges, _y_edges, extent = win._scan2d_extent(trace)
             assert win.ax_main.get_xlim() == pytest.approx((extent[0], extent[1]))
             assert win.ax_main.get_ylim() == pytest.approx((extent[2], extent[3]))
+
+
+def test_gui_2d_details_include_grid_range_step_and_precise_readout():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+
+    assert win.ctx.trace is not None
+    details = "\n".join(win._trace_summary_lines(win.ctx.trace))
+    assert "Map size:" in details
+    assert "Stage X:" in details
+    assert "Stage Z:" in details
+    assert "step" in details
+    assert win._format_inspect_value(1483.125) == "1483.125"
+    assert win._format_inspect_value(11000.0) == "11000"
+
+
+def test_gui_second_2d_file_and_plot_refresh_keep_new_full_extent(tmp_path):
+    _app()
+    second = tmp_path / "second_2d.mat"
+    _write_gui_dual_snapshot(second, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+    win.toolbar.push_current()
+    assert win._load_file(str(second))
+    assert win.ctx.trace is not None
+    extent = win._scan2d_extent(win.ctx.trace)[2]
+    expected_x = (extent[0], extent[1])
+    expected_y = (extent[2], extent[3])
+    assert win.ax_main.get_xlim() == pytest.approx(expected_x)
+    assert win.ax_main.get_ylim() == pytest.approx(expected_y)
+
+    win.quick_legend_btn.setChecked(not win.quick_legend_btn.isChecked())
+    win.toolbar.home()
+    assert win.ax_main.get_xlim() == pytest.approx(expected_x)
+    assert win.ax_main.get_ylim() == pytest.approx(expected_y)
 
 
 def test_gui_2d_scan_draws_after_removing_twinned_observable_axis():
@@ -925,6 +970,9 @@ def test_gui_layout_is_two_workspaces_without_horizontal_panel_scrolling():
     assert win.mode_stack.count() == 2
     assert win.left_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
     assert win.right_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert win.overlay_list.minimumHeight() >= 320
+    assert win.overlay_list.verticalScrollMode().name == "ScrollPerPixel"
+    assert win.overlay_list.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
     assert win.live_plot_widget is None
     assert sum(win.main_splitter.sizes()) <= win.main_splitter.width() + 4
 
