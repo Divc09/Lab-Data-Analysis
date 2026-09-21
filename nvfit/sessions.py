@@ -7,8 +7,8 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-SESSION_VERSION = 2
-SUPPORTED_SESSION_VERSIONS = {1, SESSION_VERSION}
+SESSION_VERSION = 3
+SUPPORTED_SESSION_VERSIONS = {1, 2, SESSION_VERSION}
 
 
 def _sha256(path: Path) -> str:
@@ -68,6 +68,14 @@ def load_session(path: str | Path) -> dict[str, Any]:
     document = json.loads(Path(path).read_text(encoding="utf-8"))
     if document.get("format") != "nvfit-session" or document.get("version") not in SUPPORTED_SESSION_VERSIONS:
         raise ValueError("Unsupported SmartFitter session file.")
-    if document.get("version") == 1:
-        document = {**document, "version": SESSION_VERSION, "migrated_from": 1}
+    source_version = int(document.get("version", 0))
+    if source_version in {1, 2}:
+        document = {
+            **document,
+            "version": SESSION_VERSION,
+            "migrated_from": source_version,
+            "active_detector_id": str(document.get("active_detector_id", "detector1")),
+            "compare_detectors": bool(document.get("compare_detectors", False)),
+            "detector_labels": dict(document.get("detector_labels") or {"detector1": "Detector 1", "detector2": "Detector 2"}),
+        }
     return document

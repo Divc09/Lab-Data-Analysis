@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from html import escape as _html_escape
 import json
 import re
 import sys
-from io import BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from matplotlib.colors import to_hex
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.patches import Ellipse
 from PySide6.QtCore import (
     QEvent,
     QEasingCurve,
@@ -30,12 +32,14 @@ from PySide6.QtCore import (
     QMimeData,
     QTimer,
 )
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QColor, QCursor, QImage, QKeySequence, QShortcut
 from scipy.signal import find_peaks
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -43,7 +47,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGraphicsDropShadowEffect,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -94,7 +97,13 @@ from .app_state import (
 )
 from .fit_engine import FitResult, fit_model_multistart
 from .fit_workflows import FitWorkflowConfig, fit_non_ramsey
-from .io_mat import DataMode, ExperimentTrace, load_saved_data_mat
+from .io_mat import (
+    DETECTOR_LABELS,
+    DataMode,
+    ExperimentDataset,
+    ExperimentTrace,
+    load_experiment_dataset,
+)
 from .models import (
     MODEL_REGISTRY,
     build_custom_expression_model,
@@ -112,12 +121,14 @@ from .profiles import PROFILES, FitProfile, classify_status
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
 from .sessions import load_session, resolve_source, save_session, source_descriptor
+from .scan_spots import SpotFit, detect_fluorescent_spots
 from .plot_presentation import (
     AnnotationDescriptor,
     AnnotationOverride,
     PlotEditorDialog,
     PlotPresentationState,
     SeriesDescriptor,
+    SeriesOverride,
     apply_series_override,
     apply_tick_style,
     format_annotation_value,
@@ -175,6 +186,7 @@ class PlotOptions:
     plot_style: str = "Line + scatter"
     fig_width: float = PRESENTATION_FIGURE_WIDTH
     fig_height: float = PRESENTATION_FIGURE_HEIGHT
+    export_size_mode: str = "auto"
     save_dpi: int = PRESENTATION_EXPORT_DPI
     export_png: bool = True
     export_pdf: bool = False
@@ -184,6 +196,61 @@ class PlotOptions:
     export_json: bool = True
     export_csv: bool = True
     export_origin_bundle: bool = False
+
+
+@dataclass
+class DetectorAnalysisState:
+    """Fit and presentation result retained independently for each detector."""
+
+    fit_result: FitResult | None = None
+    fit_target: np.ndarray | None = None
+    fit_signature: str | None = None
+    status: str = "N/A"
+    status_reason: str = ""
+    odmr_peaks: np.ndarray | None = None
+    pending_locks: dict[str, tuple[float, bool, float | None, float | None]] | None = None
+    summary: str = ""
+
+
+class AspectRatioContainer(QWidget):
+    """Center one child at a preferred aspect without stretching the figure."""
+
+    def __init__(self, child: QWidget, ratio: float = 1.5, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._child = child
+        self._ratio = max(0.25, float(ratio))
+        child.setParent(self)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_ratio(self, ratio: float) -> None:
+        ratio = max(0.25, float(ratio))
+        if abs(ratio - self._ratio) < 1e-6:
+            return
+        self._ratio = ratio
+        self._layout_child()
+
+    def ratio(self) -> float:
+        return self._ratio
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._layout_child()
+
+    def _layout_child(self) -> None:
+        width = max(1, self.width())
+        height = max(1, self.height())
+        chrome = 0
+        for widget in self._child.findChildren(NavigationToolbar):
+            if widget.parent() is self._child and widget.isVisibleTo(self._child):
+                chrome += max(0, widget.sizeHint().height())
+        child_width = width
+        child_height = round(child_width / self._ratio) + chrome
+        if child_height > height:
+            child_height = height
+            child_width = round(max(1, child_height - chrome) * self._ratio)
+        left = (width - child_width) // 2
+        top = (height - child_height) // 2
+        self._child.setGeometry(left, top, max(1, child_width), max(1, child_height))
 
 
 PARAM_METADATA: dict[str, ParamMeta] = {
@@ -433,6 +500,35 @@ class IterationSelectionDialog(QDialog):
         return self.mean_chk.isChecked()
 
 
+class DetectorLabelsDialog(QDialog):
+    def __init__(self, parent: QWidget | None, labels: dict[str, str], detector_ids: tuple[str, ...]):
+        super().__init__(parent)
+        self.setWindowTitle("Detector labels")
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        help_label = QLabel("Labels are stored in the analysis session and exports; the MAT file is not changed.")
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        form = QFormLayout()
+        self.edits: dict[str, QLineEdit] = {}
+        for detector_id in detector_ids:
+            edit = QLineEdit(labels.get(detector_id, DETECTOR_LABELS.get(detector_id, detector_id)))
+            edit.setPlaceholderText(DETECTOR_LABELS.get(detector_id, detector_id))
+            form.addRow(DETECTOR_LABELS.get(detector_id, detector_id), edit)
+            self.edits[detector_id] = edit
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def labels(self) -> dict[str, str]:
+        return {
+            detector_id: (edit.text().strip() or DETECTOR_LABELS.get(detector_id, detector_id))
+            for detector_id, edit in self.edits.items()
+        }
+
+
 
 class BatchFitWorker(QThread):
     """Worker thread for batch fitting."""
@@ -488,7 +584,7 @@ class FitWorker(QThread):
 class SmartFitterMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SmartFitter")
+        self.setWindowTitle("SmartFitter 2026.08")
         screen = QApplication.primaryScreen()
         available = screen.availableGeometry() if screen is not None else None
         target_width = min(1366, int(available.width() * 0.94)) if available is not None else 1366
@@ -500,6 +596,22 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.exclusion_ranges = []
         self.ctx.loaded_traces = {}
         self.ctx.sample_metadata = {}
+        self._primary_dataset: ExperimentDataset | None = None
+        self._loaded_datasets: dict[str, ExperimentDataset] = {}
+        self._detector_labels: dict[str, str] = dict(DETECTOR_LABELS)
+        self._detector_map_limits: dict[str, tuple[str, str]] = {}
+        self._scan_spot_results: dict[str, list[SpotFit]] = {}
+        self._scan_spot_diagnostics: dict[str, dict[str, Any]] = {}
+        self._scan_spot_removed_backup: dict[str, list[SpotFit]] | None = None
+        self._scan_spot_removed_diagnostics_backup: dict[str, dict[str, Any]] | None = None
+        self._scan_spot_removed_pair_backup: tuple[tuple[str, int], tuple[str, int]] | None = None
+        self._scan_spot_removed_metrics_backup: dict[str, float | str] = {}
+        self._spot_comparison_pair: tuple[tuple[str, int], tuple[str, int]] | None = None
+        self._spot_comparison_metrics: dict[str, float | str] = {}
+        self._detector_analysis_states: dict[str, DetectorAnalysisState] = {}
+        self._syncing_detector_controls = False
+        self._activating_detector = False
+        self._auto_reference_fallback = False
         self.settings = QSettings("BacklundLab", "SmartFitterPy")
         self.plot_opts = PlotOptions()
         self.presentation_factory = PlotPresentationState()
@@ -523,10 +635,29 @@ class SmartFitterMainWindow(QMainWindow):
         self._ui_scale = 1.0
         self._plot_scale = 1.0
         self._responsive_band: tuple[int, bool] | None = None
+        self._responsive_layout_mode = "expanded"
+        self._manual_panel_override = False
+        self._preferred_files_open = True
+        self._preferred_inspector_open = True
+        self._panel_animations: dict[str, QPropertyAnimation] = {}
+        self._reduce_motion = False
+        self._last_processing_signature: str | None = None
+        self._dual_fit_queue: list[str] = []
+        self._dual_fit_origin: str | None = None
+        self._dual_fit_robust = False
+        self._dual_fit_summaries: dict[str, str] = {}
+        self._last_editable_series_id: str | None = None
+        self._plot_element_popover: QDialog | None = None
+        self._loading_preferences = False
         self._responsive_timer = QTimer(self)
         self._responsive_timer.setSingleShot(True)
         self._responsive_timer.timeout.connect(self._apply_responsive_scaling)
-        self._selected_plot_point: dict[str, float] | None = None
+        # Keep the last/current point as a compatibility and readout anchor,
+        # while retaining an ordered set of 1D points for additive selection.
+        # Existing session/fit actions intentionally continue to operate on
+        # ``_selected_plot_point`` (the most recently selected point).
+        self._selected_plot_point: dict[str, Any] | None = None
+        self._selected_plot_points: list[dict[str, Any]] = []
         self._selected_iteration_indices: set[int] = set()
         self._iteration_selection_source: str | None = None
         self._annotation_enabled_mode = "Compact"
@@ -539,10 +670,15 @@ class SmartFitterMainWindow(QMainWindow):
         self._secondary_plot_data: tuple[np.ndarray, np.ndarray, str] | None = None
         self._scan_colorbar = None
         self._scan_colorbar_ax = None
+        self._detector_compare_ax = None
+        self._detector_compare_colorbar = None
+        self._detector_compare_colorbar_ax = None
         self._scan_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._syncing_scan_controls = False
         self._crosshair_v = None
         self._crosshair_h = None
+        self._detector_compare_crosshair_v = None
+        self._detector_compare_crosshair_h = None
         self.live_selection_marker = None
         self.live_selection_vline = None
         self.live_selection_hline = None
@@ -595,11 +731,21 @@ class SmartFitterMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+O"), self, self.on_load)
         QShortcut(QKeySequence("Ctrl+F"), self, self.on_fit)
         QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.on_robust_fit)
-        QShortcut(QKeySequence("Ctrl+S"), self, self.on_save_results)
-        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
-        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
-        QShortcut(QKeySequence("Ctrl+Shift+C"), self, self.copy_export_figure)
         QShortcut(QKeySequence("Escape"), self, self.clear_selected_marker)
+        QShortcut(QKeySequence("Ctrl+K"), self, self._focus_file_filter)
+        self._inspector_shortcuts: list[QShortcut] = []
+        for sequence, page in (
+            ("Alt+1", "setup"),
+            ("Alt+2", "parameters"),
+            ("Alt+3", "processing"),
+            ("Alt+4", "plot"),
+            ("Alt+5", "results"),
+            ("Alt+6", "map"),
+            ("Alt+7", "export"),
+        ):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(lambda page=page: self._show_inspector_page(page))
+            self._inspector_shortcuts.append(shortcut)
 
         # Drag-and-drop support
         self.setAcceptDrops(True)
@@ -647,13 +793,25 @@ class SmartFitterMainWindow(QMainWindow):
         QWidget#PlotColumn {
             background-color: #0d1210;
         }
+        QFrame#DataStrip, QFrame#DataInfoBar {
+            background-color: #111714;
+            border: 1px solid #27322d;
+            border-radius: 8px;
+        }
+        QFrame#DataInfoBar {
+            background-color: #0f1512;
+        }
+        QDialog#PlotElementPopover {
+            background-color: #151b18;
+            border: 1px solid #4cad86;
+        }
         QGroupBox {
             border: 1px solid #29332e;
             border-radius: 10px;
             margin-top: 14px;
             font-weight: 600;
             padding: 15px 9px 9px 9px;
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #19201d, stop:1 #151b18);
+            background-color: #151b18;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
@@ -706,7 +864,7 @@ class SmartFitterMainWindow(QMainWindow):
             border-color: #242d28;
         }
         QPushButton#PrimaryAction {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #23845f, stop:1 #38a879);
+            background-color: #2d946d;
             border-color: #59c99b;
             color: #ffffff;
             font-weight: 700;
@@ -714,7 +872,7 @@ class SmartFitterMainWindow(QMainWindow):
             padding-right: 15px;
         }
         QPushButton#PrimaryAction:hover {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2c9b71, stop:1 #47bc89);
+            background-color: #39aa7c;
             border-color: #80ddb6;
         }
         QPushButton#CommandAction {
@@ -736,7 +894,7 @@ class SmartFitterMainWindow(QMainWindow):
             border-bottom: 2px solid #54c998;
         }
         QWidget#WorkspaceBar {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #121815, stop:0.55 #101512, stop:1 #151b18);
+            background-color: #101512;
             border-bottom: 1px solid #27312c;
         }
         QLabel#AppTitle {
@@ -759,7 +917,7 @@ class SmartFitterMainWindow(QMainWindow):
         }
         QGroupBox#ScanQuickBar {
             border-color: #315244;
-            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1a2821, stop:1 #152019);
+            background-color: #152019;
         }
         QLabel#PaneTitle {
             color: #f4f8f6;
@@ -838,7 +996,7 @@ class SmartFitterMainWindow(QMainWindow):
         }
         QProgressBar::chunk {
             border-radius: 5px;
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2d946d, stop:1 #58c997);
+            background-color: #42ad82;
         }
         QTableWidget {
             gridline-color: #2a342f;
@@ -910,7 +1068,103 @@ class SmartFitterMainWindow(QMainWindow):
         QLabel#EmptyStateText {{ font-size: {max(8.0, 11.0 * scale):.2f}pt; }}
         QHeaderView::section {{ padding: {max(4, round(7 * scale))}px; }}
         """
-        self.setStyleSheet(dark_qss + responsive_qss)
+        # Compact desktop-scientific styling inspired by LabPlot/KDE: neutral
+        # dock panels, dense native controls, a clear selected state, and no
+        # decorative card spacing competing with the figure.
+        dense_qss = """
+        QMainWindow, QWidget {
+            background-color: #181b20;
+            color: #e7ebf0;
+            font-family: "Segoe UI";
+            font-size: 10pt;
+        }
+        QLabel { background: transparent; color: #e7ebf0; }
+        QScrollArea, QScrollArea > QWidget > QWidget { border: none; background: #20242b; }
+        QWidget#SidePanel { background: #20242b; }
+        QWidget#PlotColumn { background: #14171b; }
+        QWidget#WorkspaceBar { background: #22272e; border-bottom: 1px solid #46505d; }
+        QLabel#AppTitle { color: #f4f7fb; font-size: 13pt; font-weight: 600; padding: 0 8px 0 2px; }
+        QLabel#FileChip, QLabel#StatusChip { background: transparent; border: 0; padding: 2px 5px; color: #bcc5d0; }
+        QLabel#StatusChip { color: #8ac7ff; font-weight: 600; }
+        QPushButton#WorkspaceTab {
+            border: 0; border-radius: 2px; padding: 4px 8px;
+            background: transparent; color: #d1d7df; font-weight: 500;
+        }
+        QPushButton#WorkspaceTab:hover { background: #303741; color: #ffffff; }
+        QPushButton#WorkspaceTab:checked { background: #193c5d; color: #cbe6ff; border-bottom: 2px solid #62b0f2; }
+        QFrame#DataStrip, QFrame#DataInfoBar, QFrame#ReadoutBar {
+            background: #22272e; border: 1px solid #46505d; border-radius: 2px;
+        }
+        QFrame#DataInfoBar { border-top: 0; }
+        QFrame#PlotShell { background: #ffffff; border: 1px solid #66717e; border-radius: 1px; }
+        QWidget#EmptyState { background: #20242b; border: 1px solid #4a5563; }
+        QLabel#EmptyStateTitle { color: #f2f5f8; font-size: 15pt; font-weight: 600; }
+        QLabel#EmptyStateText, QLabel#MutedLabel { color: #adb7c4; }
+        QLabel#PaneTitle { color: #f2f5f8; font-size: 12pt; font-weight: 600; padding: 2px; }
+        QGroupBox {
+            background: #22272e; border: 1px solid #48525f; border-radius: 2px;
+            margin-top: 10px; padding: 8px 5px 5px 5px; font-weight: 600;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px; background: #22272e; color: #edf1f5; }
+        QGroupBox::indicator { width: 0; height: 0; }
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+            background: #111419; color: #f0f3f7; border: 1px solid #56616f;
+            border-radius: 2px; padding: 2px 4px; min-height: 18px;
+            selection-background-color: #357bb8; selection-color: #ffffff;
+        }
+        QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover, QTextEdit:hover { border-color: #788697; }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QTextEdit:focus { border: 1px solid #62b0f2; }
+        QComboBox QAbstractItemView { background: #171b20; color: #edf1f5; border: 1px solid #657180; selection-background-color: #357bb8; }
+        QPushButton, QToolButton {
+            background: #2a3038; color: #edf1f5; border: 1px solid #56616f;
+            border-radius: 2px; padding: 3px 6px; min-height: 18px; font-weight: 400;
+        }
+        QPushButton:hover, QToolButton:hover { background: #36404b; border-color: #7b8999; color: #ffffff; }
+        QPushButton:pressed, QToolButton:pressed { background: #172f47; }
+        QPushButton:disabled, QToolButton:disabled, QLineEdit:disabled, QComboBox:disabled,
+        QSpinBox:disabled, QDoubleSpinBox:disabled { color: #7f8995; background: #242930; border-color: #3d454f; }
+        QPushButton#PrimaryAction { background: #2f78b7; color: #ffffff; border-color: #69b5f2; font-weight: 600; }
+        QPushButton#PrimaryAction:hover { background: #3989ca; }
+        QPushButton#CommandAction { background: #292f37; }
+        QToolButton:checked { background: #173f62; color: #c7e5ff; border-color: #62b0f2; font-weight: 600; }
+        QToolBar { background: #e7ebef; border: 0; border-bottom: 1px solid #8f99a5; spacing: 2px; padding: 1px 3px; }
+        QToolBar QToolButton { border: 0; padding: 3px; color: #20242a; background: transparent; }
+        QToolBar QToolButton:hover { background: #cfd7e0; }
+        QTabWidget#InspectorTabs::pane { border: 1px solid #4b5663; background: #20242b; top: -1px; }
+        QTabBar::tab { background: #2a3038; color: #c7ced7; border: 1px solid #4c5663; padding: 5px 8px; margin-right: 1px; }
+        QTabBar::tab:selected { background: #20242b; color: #a9d7ff; border-top: 2px solid #62b0f2; border-bottom-color: #20242b; }
+        QTabBar::tab:hover:!selected { background: #353d47; color: #ffffff; }
+        QListWidget, QTableWidget {
+            background: #14181d; alternate-background-color: #1b2026; color: #e8ecf1;
+            border: 1px solid #505b68; gridline-color: #37404a;
+            selection-background-color: #326fa5; selection-color: #ffffff;
+        }
+        QListWidget::item { padding: 3px 2px; border-bottom: 1px solid #2b323a; }
+        QListWidget::item:hover { background: #293746; color: #ffffff; }
+        QListWidget::item:selected { background: #326fa5; color: #ffffff; }
+        QHeaderView::section { background: #2a3038; color: #e5e9ee; border: 0; border-right: 1px solid #48515d; border-bottom: 1px solid #515c69; padding: 4px; font-weight: 600; }
+        QMenuBar { background: #22272e; color: #e5e9ee; border-bottom: 1px solid #46505d; }
+        QMenuBar::item { padding: 4px 7px; }
+        QMenuBar::item:selected { background: #35404c; color: #ffffff; }
+        QMenu { background: #20242b; color: #edf1f5; border: 1px solid #596574; padding: 2px; }
+        QMenu::item { padding: 5px 24px 5px 7px; }
+        QMenu::item:selected { background: #357bb8; color: #ffffff; }
+        QMenu::item:disabled { color: #7f8995; }
+        QProgressBar { background: #12151a; color: #edf1f5; border: 1px solid #56616f; border-radius: 2px; text-align: center; min-height: 16px; }
+        QProgressBar::chunk { background: #357bb8; }
+        QSplitter::handle { background: #414a55; }
+        QSplitter::handle:horizontal { width: 4px; }
+        QSplitter::handle:hover { background: #5d9bd0; }
+        QScrollBar:vertical { background: #1b1f25; width: 10px; }
+        QScrollBar::handle:vertical { background: #596473; min-height: 24px; border-radius: 2px; }
+        QScrollBar::handle:vertical:hover { background: #758394; }
+        QCheckBox { color: #e2e7ed; spacing: 5px; }
+        QCheckBox:disabled { color: #7f8995; }
+        QStatusBar { background: #22272e; color: #b8c1cc; border-top: 1px solid #46505d; }
+        QToolTip { background: #313741; color: #ffffff; border: 1px solid #7b8795; padding: 4px; }
+        QDialog#PlotElementPopover { background: #20242b; border: 1px solid #62b0f2; }
+        """
+        self.setStyleSheet(dense_qss)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -922,36 +1176,62 @@ class SmartFitterMainWindow(QMainWindow):
             return
         width = max(1, self.width())
         height = max(1, self.height())
-        scale = float(np.clip(min(width / 1366.0, height / 820.0), 0.72, 1.08))
-        plot_scale = float(np.clip(scale, 0.72, 1.0))
-        center_width = self.plot_column.width() if self.plot_column.width() > 0 else width
-        toolbar_columns = 10 if center_width >= 920 else (5 if center_width >= 560 else (3 if center_width >= 360 else 2))
-        compact_header = width < 1050
-        band = (toolbar_columns, compact_header)
-        if not force and abs(scale - self._ui_scale) < 0.025 and band == self._responsive_band:
+        # Typography stays stable. The workspace reflows before controls or
+        # scientific labels are made difficult to read.
+        self._ui_scale = 1.0
+        self._plot_scale = 1.0
+        font_width = self.fontMetrics().horizontalAdvance("Observable detector controls")
+        # Stable dock widths are substantially more predictable than sizeHint()
+        # here: long model text must never make the file explorer disappear.
+        left_width = 248
+        right_width = 348
+        required_plot_width = 520
+        chrome = 36
+        if width >= required_plot_width + left_width + right_width + chrome:
+            mode = "expanded"
+            show_left, show_right = self._preferred_files_open, self._preferred_inspector_open
+        elif width >= required_plot_width + left_width + chrome:
+            mode = "files"
+            show_left, show_right = self._preferred_files_open, False
+        else:
+            mode = "plot"
+            show_left, show_right = False, False
+        compact_header = mode != "expanded"
+        band = (0 if mode == "plot" else (1 if mode == "files" else 2), compact_header)
+        if not force and band == self._responsive_band:
+            self._update_plot_surface_ratio()
             return
 
-        plot_scale_changed = abs(plot_scale - self._plot_scale) >= 0.025
-        self._ui_scale = scale
-        self._plot_scale = plot_scale
         self._responsive_band = band
-        self.left_panel.setMinimumWidth(max(160, round(240 * scale)))
-        responsive_right = round(width * 0.32) if compact_header else 0
-        self.right_panel.setMinimumWidth(max(220, round(360 * scale), responsive_right))
-        self.plot_column.setMinimumWidth(max(240, round(380 * scale)))
-        self.main_splitter.setHandleWidth(max(3, round(5 * scale)))
-        margin = max(5, round(10 * scale))
-        self.single_layout.setContentsMargins(margin, margin, margin, margin)
-        self.single_layout.setSpacing(max(4, round(8 * scale)))
-        self.workspace_layout.setContentsMargins(max(6, round(14 * scale)), max(4, round(9 * scale)), max(6, round(14 * scale)), max(4, round(9 * scale)))
-        self.workspace_layout.setSpacing(max(4, round(8 * scale)))
-        self.app_title.setVisible(width >= 820)
-        self.command_session_btn.setVisible(width >= 1040)
-        self.command_file_lbl.setVisible(width >= 900)
-        self.quick_iteration_select_btn.setText("Select…" if compact_header else "Choose iterations…")
-        self.eq_preview_canvas.setMaximumHeight(max(34, round(50 * scale)))
-        self.summary_text.setMinimumHeight(max(120, round(200 * scale)))
-        wrap_policy = QFormLayout.RowWrapPolicy.WrapLongRows if width < 1120 else QFormLayout.RowWrapPolicy.DontWrapRows
+        self._responsive_layout_mode = mode
+        self._left_target_width = left_width
+        self._right_target_width = right_width
+        self.plot_column.setMinimumWidth(320)
+        self.main_splitter.setHandleWidth(4)
+        self.single_layout.setContentsMargins(4, 4, 4, 4)
+        self.single_layout.setSpacing(4)
+        self.workspace_layout.setContentsMargins(6, 3, 6, 3)
+        self.workspace_layout.setSpacing(4)
+        self.app_title.setVisible(width >= max(700, font_width * 3))
+        self.command_session_btn.setVisible(width >= 900)
+        self.command_file_lbl.setVisible(mode != "plot")
+        for label in (self.profile_strip_label, self.mode_strip_label):
+            label.setVisible(mode == "expanded")
+        self.profile_combo.setVisible(mode != "plot")
+        self.mode_combo.setVisible(mode != "plot")
+        has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        self.detector_strip_label.setVisible(mode == "expanded" and has_dual)
+        self.detector_combo.setVisible(mode != "plot" and has_dual)
+        self.detector_scope_label.setVisible(mode == "expanded" and has_dual)
+        self.detector_scope_combo.setVisible(mode != "plot" and has_dual)
+        self.file_details_btn.setVisible(mode == "expanded" and self.ctx.trace is not None)
+        self._set_workspace_panel_visible("files", show_left, animate=not force)
+        self._set_workspace_panel_visible("inspector", show_right, animate=not force)
+        self.files_drawer_btn.setVisible(not show_left or mode != "expanded")
+        self.inspector_drawer_btn.setVisible(not show_right or mode != "expanded")
+        self.eq_preview_canvas.setMaximumHeight(38)
+        self.summary_text.setMinimumHeight(90)
+        wrap_policy = QFormLayout.RowWrapPolicy.WrapLongRows if mode != "expanded" else QFormLayout.RowWrapPolicy.DontWrapRows
         for form_layout in self.findChildren(QFormLayout):
             form_layout.setRowWrapPolicy(wrap_policy)
         for label in self.findChildren(QLabel):
@@ -964,8 +1244,109 @@ class SmartFitterMainWindow(QMainWindow):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._relayout_plot_quick_toolbar()
         self._apply_theme()
-        if plot_scale_changed and self.ctx.trace is not None:
-            self._refresh_plot_only()
+        self._update_plot_surface_ratio()
+
+    def _panel_for_name(self, name: str) -> QWidget:
+        return self.left_panel if name == "files" else self.right_panel
+
+    def _panel_button_for_name(self, name: str) -> QToolButton:
+        return self.files_drawer_btn if name == "files" else self.inspector_drawer_btn
+
+    def _set_workspace_panel_visible(self, name: str, visible: bool, *, animate: bool = True) -> None:
+        panel = self._panel_for_name(name)
+        button = self._panel_button_for_name(name)
+        target = int(self._left_target_width if name == "files" else self._right_target_width)
+        was_visible = panel.isVisible()
+        button.blockSignals(True)
+        button.setChecked(visible)
+        button.blockSignals(False)
+        action = getattr(self, "view_files_action" if name == "files" else "view_inspector_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(visible)
+            action.blockSignals(False)
+        animation = self._panel_animations.get(name)
+        if animation is not None:
+            animation.stop()
+        duration = 0 if self._reduce_motion or not animate else 160
+        if duration == 0:
+            panel.setMinimumWidth(target if visible else 0)
+            panel.setMaximumWidth(16777215)
+            panel.setVisible(visible)
+            self._update_plot_surface_ratio()
+            return
+        if visible:
+            panel.setVisible(True)
+            panel.setMinimumWidth(0)
+            start = max(0, panel.width()) if was_visible else 0
+            panel.setMaximumWidth(max(1, start))
+        else:
+            start = max(1, panel.width())
+            panel.setMinimumWidth(0)
+        animation = QPropertyAnimation(panel, b"maximumWidth", self)
+        animation.setDuration(duration)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(start)
+        animation.setEndValue(target if visible else 0)
+
+        def finish() -> None:
+            if visible:
+                panel.setMinimumWidth(target)
+                panel.setMaximumWidth(16777215)
+            else:
+                panel.setVisible(False)
+                panel.setMaximumWidth(16777215)
+            self._update_plot_surface_ratio()
+
+        animation.finished.connect(finish)
+        self._panel_animations[name] = animation
+        animation.start()
+
+    def _toggle_workspace_panel(self, name: str, checked: bool) -> None:
+        if name == "files":
+            self._preferred_files_open = bool(checked)
+        else:
+            self._preferred_inspector_open = bool(checked)
+        if checked and self._responsive_layout_mode != "expanded":
+            other = "inspector" if name == "files" else "files"
+            self._set_workspace_panel_visible(other, False)
+        self._set_workspace_panel_visible(name, checked)
+
+    def _reset_workspace_layout(self) -> None:
+        """Restore predictable dock visibility and proportions without touching analysis state."""
+        self._preferred_files_open = True
+        self._preferred_inspector_open = True
+        self.settings.setValue("ui/files_drawer_open", True)
+        self.settings.setValue("ui/inspector_drawer_open", True)
+        if hasattr(self, "file_filter_edit"):
+            self.file_filter_edit.clear()
+        self._responsive_band = None
+        self._apply_responsive_scaling(force=True)
+        if self._responsive_layout_mode == "expanded":
+            total = max(1, self.main_splitter.width())
+            self.main_splitter.setSizes([248, max(420, total - 596), 348])
+        self.statusBar().showMessage("Workspace layout restored", 3000)
+
+    def _focus_file_filter(self) -> None:
+        if not hasattr(self, "file_filter_edit"):
+            return
+        self._toggle_workspace_panel("files", True)
+        self.file_filter_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.file_filter_edit.selectAll()
+
+    def _update_plot_surface_ratio(self) -> None:
+        if not hasattr(self, "plot_surface"):
+            return
+        trace = self.ctx.trace
+        available_ratio = self.plot_stack.width() / max(1, self.plot_stack.height())
+        comparison = bool(trace is not None and trace.scan_dim == "scan2d" and self._comparison_trace() is not None)
+        self._dual_map_stacked = bool(comparison and available_ratio < 1.55)
+        # The Matplotlib layout owns scientific aspect ratios. The Qt shell
+        # should fill the workspace instead of letterboxing the entire figure
+        # and creating large unusable gutters.
+        toolbar_height = self.toolbar.sizeHint().height() if hasattr(self, "toolbar") else 0
+        canvas_height = max(1, self.plot_stack.height() - toolbar_height)
+        self.plot_surface.set_ratio(self.plot_stack.width() / canvas_height)
 
     def _build_ui(self):
         root = QWidget()
@@ -979,8 +1360,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.drop_banner.setAlignment(Qt.AlignCenter)
         self.drop_banner.setVisible(False)
         self.drop_banner.setStyleSheet(
-            "QLabel { background-color: #243029; border: 1px dashed #5aa989; "
-            "border-radius: 4px; padding: 8px; color: #e3ece6; font-weight: 600; }"
+            "QLabel { background-color: #173a59; border: 1px dashed #62b0f2; "
+            "border-radius: 2px; padding: 6px; color: #d7ecff; font-weight: 600; }"
         )
         layout.addWidget(self.drop_banner)
 
@@ -1090,6 +1471,7 @@ class SmartFitterMainWindow(QMainWindow):
         center.setObjectName("PlotColumn")
         self.plot_column = center
         center_layout = QVBoxLayout(center)
+        self.center_layout = center_layout
         center_layout.setContentsMargins(0, 0, 0, 0)
         self._build_plot_quick_toolbar(center_layout)
         self._build_scan_quick_toolbar(center_layout)
@@ -1105,7 +1487,7 @@ class SmartFitterMainWindow(QMainWindow):
         empty_layout.addStretch(1)
         empty_icon = QLabel("◇")
         empty_icon.setAlignment(Qt.AlignCenter)
-        empty_icon.setStyleSheet("QLabel { color: #56c99a; font-size: 32pt; }")
+        empty_icon.setStyleSheet("QLabel { color: #62b0f2; font-size: 28pt; }")
         empty_layout.addWidget(empty_icon)
         empty_title = QLabel("Start with a MATLAB data file")
         empty_title.setObjectName("EmptyStateTitle")
@@ -1120,24 +1502,21 @@ class SmartFitterMainWindow(QMainWindow):
         self.plot_stack.addWidget(empty_state)
 
         plot_shell = QFrame()
+        self.plot_shell = plot_shell
         plot_shell.setObjectName("PlotShell")
         plot_layout = QVBoxLayout(plot_shell)
         plot_layout.setContentsMargins(1, 1, 1, 1)
         plot_layout.setSpacing(0)
         plot_layout.addWidget(self.toolbar)
         plot_layout.addWidget(self.canvas, 1)
-        shadow = QGraphicsDropShadowEffect(plot_shell)
-        shadow.setBlurRadius(20)
-        shadow.setOffset(0, 4)
-        shadow.setColor(QColor(0, 0, 0, 110))
-        plot_shell.setGraphicsEffect(shadow)
-        self.plot_stack.addWidget(plot_shell)
+        self.plot_surface = AspectRatioContainer(plot_shell, ratio=1.5)
+        self.plot_stack.addWidget(self.plot_surface)
         self.plot_stack.setCurrentIndex(0)
         center_layout.addWidget(self.plot_stack, 1)
-        self.live_readout_lbl = QLabel("Point readout: click a plotted sample")
+        self.live_readout_lbl = QLabel("Point readout: click a sample · Ctrl/Shift-click for multiple")
         self.live_readout_lbl.setObjectName("MutedLabel")
         self.live_readout_lbl.setMinimumHeight(24)
-        self.live_readout_lbl.setToolTip("Shows the nearest data coordinates. Click the selected point again or press Escape to remove its marker.")
+        self.live_readout_lbl.setToolTip("Shows the nearest data coordinates. Ctrl/Shift-click to keep multiple 1D samples highlighted; click again or press Escape to clear.")
         readout_bar = QFrame()
         readout_bar.setObjectName("ReadoutBar")
         readout_row = QHBoxLayout(readout_bar)
@@ -1158,6 +1537,7 @@ class SmartFitterMainWindow(QMainWindow):
         right.setMinimumWidth(360)
         self.right_panel = right
         right_layout = QVBoxLayout(right)
+        self.right_layout = right_layout
         right_layout.setContentsMargins(0, 0, 0, 0)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
@@ -1202,59 +1582,93 @@ class SmartFitterMainWindow(QMainWindow):
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
         data_gl.addWidget(QLabel("Observable view"), 3, 0)
         data_gl.addWidget(self.mode_combo, 3, 1)
+
+        self.detector_combo = NoScrollComboBox()
+        self.detector_combo.addItem("Detector 1", "detector1")
+        self.detector_combo.setToolTip("Select the independent detector stream used for plotting, processing, and fitting.")
+        self.detector_combo.currentIndexChanged.connect(self._on_detector_changed)
+        self.edit_detector_labels_btn = QPushButton("Labels…")
+        self.edit_detector_labels_btn.setToolTip("Edit session-local detector labels used in plots and exports.")
+        self.edit_detector_labels_btn.clicked.connect(self._edit_detector_labels)
+        detector_row = QWidget()
+        detector_row_layout = QHBoxLayout(detector_row)
+        detector_row_layout.setContentsMargins(0, 0, 0, 0)
+        detector_row_layout.setSpacing(4)
+        detector_row_layout.addWidget(self.detector_combo, 1)
+        detector_row_layout.addWidget(self.edit_detector_labels_btn)
+        data_gl.addWidget(QLabel("Detector"), 4, 0)
+        data_gl.addWidget(detector_row, 4, 1)
+
+        self.compare_detectors_chk = QCheckBox("Compare detectors")
+        self.compare_detectors_chk.setToolTip("Show the inactive detector for visual comparison without including it in the fit.")
+        self.compare_detectors_chk.setChecked(False)
+        self.compare_detectors_chk.toggled.connect(self._on_compare_detectors_toggled)
+        data_gl.addWidget(self.compare_detectors_chk, 5, 0, 1, 2)
         self.profile_hint_lbl = QLabel("No file loaded.")
         self.profile_hint_lbl.setWordWrap(True)
         self.profile_hint_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
-        data_gl.addWidget(self.profile_hint_lbl, 4, 0, 1, 2)
+        data_gl.addWidget(self.profile_hint_lbl, 6, 0, 1, 2)
         left_inner_layout.addWidget(data_box)
 
         overlay_box = QGroupBox("Overlays")
         self.overlay_box = overlay_box
         ov_gl = QGridLayout(overlay_box)
-        overlay_help = QLabel("Check the files to draw together. Double-click a file to make it the primary trace.")
+        self.overlay_layout = ov_gl
+        overlay_help = QLabel("Select a file and click Plot selected (or double-click it). Check compatible 1D files to draw them together.")
+        self.overlay_help_lbl = overlay_help
         overlay_help.setWordWrap(True)
         overlay_help.setObjectName("MutedLabel")
         ov_gl.addWidget(overlay_help, 0, 0, 1, 2)
-        btn_add_overlay = QPushButton("Add files")
-        btn_add_overlay.setToolTip("Add traces and show the newly added files with the current primary trace.")
-        btn_add_overlay.clicked.connect(self.on_add_overlays)
-        ov_gl.addWidget(btn_add_overlay, 1, 0)
-        btn_remove_overlay = QPushButton("Remove selected")
-        btn_remove_overlay.setToolTip("Remove selected overlay traces from registry.")
-        btn_remove_overlay.clicked.connect(self.on_remove_overlays)
-        ov_gl.addWidget(btn_remove_overlay, 1, 1)
-        btn_show_all_overlays = QPushButton("Show all")
-        btn_show_all_overlays.setToolTip("Check every loaded non-primary trace and fit the view to the combined data range.")
-        btn_show_all_overlays.clicked.connect(self.on_show_all_overlays)
-        ov_gl.addWidget(btn_show_all_overlays, 2, 0)
-        btn_primary_only = QPushButton("Primary only")
-        btn_primary_only.setToolTip("Hide every overlay without unloading any files.")
-        btn_primary_only.clicked.connect(self.on_show_primary_only)
-        ov_gl.addWidget(btn_primary_only, 2, 1)
-        btn_clear_overlay = QPushButton("Unload non-primary files")
-        btn_clear_overlay.setToolTip("Remove all loaded files except the current primary trace.")
-        btn_clear_overlay.clicked.connect(self.on_clear_overlays)
-        ov_gl.addWidget(btn_clear_overlay, 3, 0, 1, 2)
+        self.btn_add_overlay = QPushButton("Add files")
+        self.btn_add_overlay.setToolTip("Add traces and show the newly added files with the current primary trace.")
+        self.btn_add_overlay.clicked.connect(self.on_add_overlays)
+        ov_gl.addWidget(self.btn_add_overlay, 1, 0)
+        self.btn_remove_overlay = QPushButton("Remove selected")
+        self.btn_remove_overlay.setToolTip("Remove selected overlay traces from registry.")
+        self.btn_remove_overlay.clicked.connect(self.on_remove_overlays)
+        ov_gl.addWidget(self.btn_remove_overlay, 1, 1)
+        self.btn_plot_selected_file = QPushButton("Plot selected")
+        self.btn_plot_selected_file.setToolTip("Make the highlighted loaded file the primary plot.")
+        self.btn_plot_selected_file.clicked.connect(self.on_plot_selected_file)
+        ov_gl.addWidget(self.btn_plot_selected_file, 2, 0, 1, 2)
+        self.btn_show_all_overlays = QPushButton("Show all")
+        self.btn_show_all_overlays.setToolTip("Check every loaded non-primary trace and fit the view to the combined data range.")
+        self.btn_show_all_overlays.clicked.connect(self.on_show_all_overlays)
+        ov_gl.addWidget(self.btn_show_all_overlays, 3, 0)
+        self.btn_primary_only = QPushButton("Primary only")
+        self.btn_primary_only.setToolTip("Hide every overlay without unloading any files.")
+        self.btn_primary_only.clicked.connect(self.on_show_primary_only)
+        ov_gl.addWidget(self.btn_primary_only, 3, 1)
+        self.btn_clear_overlay = QPushButton("Unload non-primary files")
+        self.btn_clear_overlay.setToolTip("Remove all loaded files except the current primary trace.")
+        self.btn_clear_overlay.clicked.connect(self.on_clear_overlays)
+        ov_gl.addWidget(self.btn_clear_overlay, 4, 0, 1, 2)
         self.overlay_list = QListWidget()
         self.overlay_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.overlay_list.setToolTip("Checked traces are drawn. Highlighted rows are used only by Remove selected. Double-click changes the primary trace.")
+        self.overlay_list.setToolTip("Highlight a row and use Plot selected, or double-click it, to make that file primary. Only compatible 1D traces can be checked as overlays.")
         self.overlay_list.itemChanged.connect(self._on_overlay_item_changed)
         self.overlay_list.itemDoubleClicked.connect(self.on_overlay_set_primary)
-        ov_gl.addWidget(self.overlay_list, 4, 0, 1, 2)
+        for key in ("Return", "Enter"):
+            shortcut = QShortcut(QKeySequence(key), self.overlay_list)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.on_plot_selected_file)
+        self.overlay_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.overlay_list.customContextMenuRequested.connect(self._show_file_context_menu)
+        ov_gl.addWidget(self.overlay_list, 5, 0, 1, 2)
         self.baseline_combo = NoScrollComboBox()
         self.baseline_combo.addItem("None")
         self.baseline_combo.setToolTip("Optional baseline trace to subtract before fitting.")
         self.baseline_combo.currentTextChanged.connect(self._refresh_processed)
-        ov_gl.addWidget(QLabel("Baseline subtract"), 5, 0)
-        ov_gl.addWidget(self.baseline_combo, 5, 1)
+        ov_gl.addWidget(QLabel("Baseline subtract"), 6, 0)
+        ov_gl.addWidget(self.baseline_combo, 6, 1)
         self.compare_metric_combo = NoScrollComboBox()
         self.compare_metric_combo.addItems(["r2", "T2_star_ns", "T2_dd_ns", "T1_ns", "pi_time_ns", "pi_time_ns_nominal", "first_peak_ns", "delay_ns", "rabi_freq_MHz", "center_freq", "fwhm"])
         self.compare_metric_combo.setToolTip("Metric used in overlay comparison table.")
-        ov_gl.addWidget(QLabel("Compare metric"), 6, 0)
-        ov_gl.addWidget(self.compare_metric_combo, 6, 1)
-        btn_compare = QPushButton("Build Comparison")
-        btn_compare.clicked.connect(self.on_compare_traces)
-        ov_gl.addWidget(btn_compare, 7, 0, 1, 2)
+        ov_gl.addWidget(QLabel("Compare metric"), 7, 0)
+        ov_gl.addWidget(self.compare_metric_combo, 7, 1)
+        self.btn_compare = QPushButton("Build Comparison")
+        self.btn_compare.clicked.connect(self.on_compare_traces)
+        ov_gl.addWidget(self.btn_compare, 8, 0, 1, 2)
         left_inner_layout.addWidget(overlay_box)
 
         prep_box = QGroupBox("Preprocess")
@@ -1471,7 +1885,8 @@ class SmartFitterMainWindow(QMainWindow):
         st_layout.addWidget(self.eq_preview_canvas)
 
         # Equation Editor (Unified)
-        st_layout.addWidget(QLabel("Model Expression (Edit to Custom):"))
+        self.equation_source_label = QLabel("Model expression (edit to customize)")
+        st_layout.addWidget(self.equation_source_label)
         self.equation_display = QTextEdit()
         self.equation_display.setMaximumHeight(80)
         self.equation_display.setToolTip("Equation source code. Edit to switch to CustomModel.")
@@ -1543,7 +1958,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.point_readout_lbl = QLabel("Point readout: none")
         self.point_readout_lbl.setWordWrap(True)
         self.point_readout_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
-        self.point_readout_lbl.setToolTip("Last selected or hovered sample coordinate.")
+        self.point_readout_lbl.setToolTip("Last selected or hovered sample coordinate. Ctrl/Shift-click 1D samples to keep more than one highlighted.")
         mk_gl.addWidget(self.point_readout_lbl, 4, 0, 1, 2)
         self.mask_list = QListWidget()
         self.mask_list.setMaximumHeight(96)
@@ -1709,13 +2124,15 @@ class SmartFitterMainWindow(QMainWindow):
         self.iteration_std_mode_combo.addItems(["Band", "Error bars"])
         self.iteration_std_mode_combo.setToolTip("Choose how standard deviation is displayed.")
         self.iteration_std_mode_combo.currentTextChanged.connect(self._refresh_plot_only)
-        plot_gl.addWidget(QLabel("Iteration"), 10, 0)
+        self.iteration_control_label = QLabel("Iteration")
+        plot_gl.addWidget(self.iteration_control_label, 10, 0)
         iter_row = QHBoxLayout()
         iter_row.addWidget(self.iteration_select_btn)
         iter_row.addWidget(self.iteration_summary_lbl)
         iter_row.addWidget(self.hide_failed_iterations_chk)
         plot_gl.addLayout(iter_row, 10, 1)
-        plot_gl.addWidget(QLabel("Std mode"), 11, 0)
+        self.iteration_std_mode_label = QLabel("Std mode")
+        plot_gl.addWidget(self.iteration_std_mode_label, 11, 0)
         plot_gl.addWidget(self.iteration_std_mode_combo, 11, 1)
 
         self.legend_loc_combo = NoScrollComboBox()
@@ -1900,7 +2317,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.param_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.param_table.horizontalHeader().setMinimumSectionSize(50)
         self.param_table.verticalHeader().setDefaultSectionSize(24)
-        self.param_table.setMinimumHeight(220)
+        self.param_table.setMinimumHeight(150)
         self.param_table.itemChanged.connect(self._on_param_item_changed)
         param_layout.addWidget(self.param_table)
         right_inner_layout.addWidget(param_box)
@@ -2020,7 +2437,7 @@ class SmartFitterMainWindow(QMainWindow):
 
         results_box = QGroupBox("Results summary")
         self.results_box = results_box
-        results_box.setMinimumHeight(300)
+        results_box.setMinimumHeight(0)
         results_layout = QVBoxLayout(results_box)
         results_actions = QHBoxLayout()
         results_actions.addStretch(1)
@@ -2037,7 +2454,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.summary_text = QTextEdit()
         self.summary_text.setReadOnly(True)
         self.summary_text.setToolTip("Model diagnostics, parameter estimates, and quality assessment.")
-        self.summary_text.setMinimumHeight(200)
+        self.summary_text.setMinimumHeight(90)
         results_layout.addWidget(self.summary_text, 1)
         # Keep results near the top of the analysis sidebar. Previously this
         # box was populated correctly but sat below every plot/export control,
@@ -2060,6 +2477,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_group_collapsible(param_box, checked=False)
         self._set_group_collapsible(export_box)
 
+        self._build_plot_first_workspace()
+
         self._build_batch_workspace()
         self.scan_workspace_plot = None
         self.scan_workspace_image = None
@@ -2070,6 +2489,419 @@ class SmartFitterMainWindow(QMainWindow):
         self._update_contextual_visibility()
         self._update_mask_mode()
 
+    def _build_plot_first_workspace(self) -> None:
+        """Recompose the existing controls around the plot without changing their state paths."""
+        self.data_strip = QFrame()
+        self.data_strip.setObjectName("DataStrip")
+        strip = QHBoxLayout(self.data_strip)
+        strip.setContentsMargins(6, 3, 6, 3)
+        strip.setSpacing(5)
+
+        self.files_drawer_btn = QToolButton()
+        self.files_drawer_btn.setText("Files")
+        self.files_drawer_btn.setCheckable(True)
+        self.files_drawer_btn.setChecked(True)
+        self.files_drawer_btn.setToolTip("Show or hide the loaded-files rail.")
+        self.files_drawer_btn.toggled.connect(lambda checked: self._toggle_workspace_panel("files", checked))
+        strip.addWidget(self.files_drawer_btn)
+
+        self.profile_strip_label = QLabel("Experiment")
+        strip.addWidget(self.profile_strip_label)
+        strip.addWidget(self.profile_combo)
+        self.mode_strip_label = QLabel("Observable")
+        strip.addWidget(self.mode_strip_label)
+        strip.addWidget(self.mode_combo)
+        self.detector_strip_label = QLabel("Detector")
+        strip.addWidget(self.detector_strip_label)
+        strip.addWidget(self.detector_combo)
+
+        self.detector_scope_combo = NoScrollComboBox()
+        self.detector_scope_combo.addItem("Active detector", "active")
+        self.detector_scope_combo.addItem("Both detectors", "both")
+        self.detector_scope_combo.setToolTip(
+            "Choose whether preprocessing, fitting, and supported analysis actions apply only to the active detector or to both saved streams."
+        )
+        self.detector_scope_combo.currentIndexChanged.connect(self._on_detector_scope_changed)
+        self.detector_scope_label = QLabel("Apply to")
+        strip.addWidget(self.detector_scope_label)
+        strip.addWidget(self.detector_scope_combo)
+        strip.addStretch(1)
+
+        self.file_details_btn = QPushButton("File details")
+        self.file_details_btn.setToolTip("View and edit sample metadata plus the complete loaded-file summary.")
+        self.file_details_btn.clicked.connect(self._open_file_details)
+        strip.addWidget(self.file_details_btn)
+        self.inspector_drawer_btn = QToolButton()
+        self.inspector_drawer_btn.setText("Inspector")
+        self.inspector_drawer_btn.setCheckable(True)
+        self.inspector_drawer_btn.setChecked(True)
+        self.inspector_drawer_btn.setToolTip("Show or hide the contextual Fit or Map inspector.")
+        self.inspector_drawer_btn.toggled.connect(lambda checked: self._toggle_workspace_panel("inspector", checked))
+        strip.addWidget(self.inspector_drawer_btn)
+        self.center_layout.insertWidget(0, self.data_strip)
+
+        self.data_info_bar = QFrame()
+        self.data_info_bar.setObjectName("DataInfoBar")
+        info_row = QHBoxLayout(self.data_info_bar)
+        info_row.setContentsMargins(6, 2, 6, 2)
+        self.data_info_lbl = QLabel("No file loaded")
+        self.data_info_lbl.setObjectName("MutedLabel")
+        self.data_info_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        info_row.addWidget(self.data_info_lbl, 1)
+        self.center_layout.insertWidget(1, self.data_info_bar)
+
+        self.data_box.setVisible(False)
+        self.profile_hint_lbl.setVisible(False)
+        self.compare_detectors_chk.setVisible(False)
+        self.edit_detector_labels_btn.setVisible(False)
+
+        self._make_group_static(self.overlay_box, title="Project Explorer")
+        self.overlay_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.overlay_list.setMinimumHeight(120)
+        self.overlay_list.setAlternatingRowColors(True)
+        self.overlay_help_lbl.setVisible(False)
+        for label in self.overlay_box.findChildren(QLabel):
+            if label.text() in {"Baseline subtract", "Compare metric"}:
+                label.setVisible(False)
+        file_buttons = (
+            self.btn_add_overlay,
+            self.btn_remove_overlay,
+            self.btn_plot_selected_file,
+            self.btn_show_all_overlays,
+            self.btn_primary_only,
+            self.btn_clear_overlay,
+        )
+        for button in file_buttons:
+            self.overlay_layout.removeWidget(button)
+            button.setMaximumHeight(28)
+        self.file_filter_edit = QLineEdit()
+        self.file_filter_edit.setPlaceholderText("Filter files…")
+        self.file_filter_edit.setClearButtonEnabled(True)
+        self.file_filter_edit.setToolTip("Filter by filename, experiment, dimensions, or detector availability.")
+        self.file_filter_edit.textChanged.connect(self._filter_project_files)
+        self.file_filter_edit.returnPressed.connect(self._activate_filtered_file)
+        self.btn_plot_selected_file.setText("Make primary")
+        self.btn_clear_overlay.setText("Clear extras")
+        self.overlay_layout.addWidget(self.file_filter_edit, 0, 0, 1, 3)
+        self.overlay_layout.addWidget(self.btn_add_overlay, 1, 0)
+        self.overlay_layout.addWidget(self.btn_remove_overlay, 1, 1)
+        self.overlay_layout.addWidget(self.btn_plot_selected_file, 1, 2)
+        self.overlay_layout.addWidget(self.btn_show_all_overlays, 2, 0)
+        self.overlay_layout.addWidget(self.btn_primary_only, 2, 1)
+        self.overlay_layout.addWidget(self.btn_clear_overlay, 2, 2)
+        self.overlay_layout.removeWidget(self.overlay_list)
+        self.overlay_layout.addWidget(self.overlay_list, 3, 0, 1, 3)
+
+        # Compatibility entry points now select an in-place inspector tab.
+        self.analysis_tools_btn = QPushButton("Processing")
+        self.analysis_tools_btn.clicked.connect(self._open_analysis_tools)
+        self.analysis_tools_btn.setVisible(False)
+        self.detector_labels_btn = QPushButton("Detector labels")
+        self.detector_labels_btn.clicked.connect(self._edit_detector_labels)
+        self.detector_labels_btn.setVisible(False)
+
+        # ROI is used during fitting, so keep it in the contextual inspector.
+        roi_form = QFormLayout()
+        roi_row = QHBoxLayout()
+        self.roi_min.setMinimumWidth(0)
+        self.roi_max.setMinimumWidth(0)
+        self.roi_min.setMaximumWidth(110)
+        self.roi_max.setMaximumWidth(110)
+        roi_row.addWidget(self.roi_min)
+        roi_row.addWidget(QLabel("to"))
+        roi_row.addWidget(self.roi_max)
+        roi_form.addRow("Fit range", roi_row)
+        self.strategy_layout.insertLayout(1, roi_form)
+
+        self.inspector_title = QLabel("Inspector")
+        self.inspector_title.setObjectName("PaneTitle")
+        self.right_layout.insertWidget(0, self.inspector_title)
+        self.inspector_title.setVisible(False)
+        fit_actions = QFrame()
+        fit_actions.setObjectName("InspectorActions")
+        fit_row = QHBoxLayout(fit_actions)
+        fit_row.setContentsMargins(0, 0, 0, 0)
+        fit_row.addWidget(self.btn_fit)
+        fit_row.addWidget(self.btn_robust_fit)
+        fit_row.addWidget(self.btn_cancel_fit)
+        self.right_layout.insertWidget(1, fit_actions)
+        self.fit_actions = fit_actions
+        for box in (self.strategy_box, self.param_box):
+            self._make_group_static(box)
+        self.strategy_box.setTitle("Fit setup")
+        self.param_box.setTitle("Parameters")
+        self.results_box.setTitle("Results")
+        self._make_group_static(self.scan_tools_box, title="Map readout")
+        for box in (self.prep_box, self.advanced_box, self.action_box, self.export_box):
+            self._make_group_static(box)
+        for box in (self.meta_box, self.plot_box, self.annotation_box):
+            box.setVisible(False)
+
+        self.auto_export_size_btn = QPushButton("Use automatic figure size")
+        self.auto_export_size_btn.setToolTip("Use the plot-type preset for clipboard copies and exports.")
+        self.auto_export_size_btn.clicked.connect(self._restore_automatic_export_size)
+        export_layout = self.export_box.layout()
+        if isinstance(export_layout, QGridLayout):
+            export_layout.addWidget(self.auto_export_size_btn, export_layout.rowCount(), 0, 1, 3)
+        self.export_box.setTitle("Formats and figure size")
+        self.report_content_lbl.setProperty("drawerHidden", False)
+        for checkbox in self.report_metric_checks.values():
+            checkbox.setProperty("drawerHidden", False)
+        self.exp_report_png_chk.toggled.connect(self._update_report_controls_visibility)
+        self.exp_report_pdf_chk.toggled.connect(self._update_report_controls_visibility)
+
+        # Replace the long mixed inspector and floating utility dialogs with
+        # stable, one-click pages. Controls keep their original objects and
+        # signals, so fitting, sessions, batch, and plot state remain intact.
+        self.right_layout.removeWidget(self.right_scroll)
+        self.inspector_tabs = QTabWidget()
+        self.inspector_tabs.setObjectName("InspectorTabs")
+        self.inspector_tabs.setDocumentMode(True)
+        self.inspector_tabs.setUsesScrollButtons(True)
+        self.inspector_tabs.addTab(self.right_scroll, "Model")
+
+        def scroll_page() -> tuple[QScrollArea, QVBoxLayout]:
+            page_scroll = SmoothScrollArea()
+            page_scroll.setWidgetResizable(True)
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(5, 5, 5, 5)
+            page_layout.setSpacing(5)
+            page_scroll.setWidget(page)
+            return page_scroll, page_layout
+
+        processing_page, processing_layout = scroll_page()
+        baseline_row = QFrame()
+        baseline_layout = QHBoxLayout(baseline_row)
+        baseline_layout.setContentsMargins(4, 2, 4, 2)
+        baseline_layout.addWidget(QLabel("Baseline"))
+        baseline_layout.addWidget(self.baseline_combo, 1)
+        processing_layout.addWidget(baseline_row)
+        processing_layout.addWidget(self.prep_box)
+        processing_layout.addWidget(self.advanced_box)
+        processing_layout.addWidget(self.action_box)
+        processing_layout.addStretch(1)
+        self.inspector_tabs.addTab(processing_page, "Process")
+
+        parameter_page = QWidget()
+        parameter_layout = QVBoxLayout(parameter_page)
+        parameter_layout.setContentsMargins(5, 5, 5, 5)
+        parameter_layout.addWidget(self.param_box, 1)
+        self.inspector_tabs.addTab(parameter_page, "Params")
+
+        results_page = QWidget()
+        results_layout = QVBoxLayout(results_page)
+        results_layout.setContentsMargins(5, 5, 5, 5)
+        results_layout.setSpacing(5)
+        results_layout.addWidget(self.results_box, 1)
+        comparison_row = QFrame()
+        comparison_layout = QHBoxLayout(comparison_row)
+        comparison_layout.setContentsMargins(4, 2, 4, 2)
+        comparison_layout.addWidget(QLabel("Compare"))
+        comparison_layout.addWidget(self.compare_metric_combo, 1)
+        self.btn_compare.setText("Build table")
+        comparison_layout.addWidget(self.btn_compare)
+        results_layout.addWidget(comparison_row)
+        results_layout.addWidget(self.metadata_status_lbl)
+        results_layout.addWidget(self.metadata_progress_bar)
+        self.inspector_tabs.addTab(results_page, "Results")
+
+        plot_page, plot_layout_page = scroll_page()
+        plot_layout = self.plot_box.layout()
+        if isinstance(plot_layout, QGridLayout):
+            plot_layout.removeWidget(self.edit_plot_btn)
+            plot_layout.addWidget(self.compare_detectors_chk, 16, 0)
+            plot_layout.addWidget(self.edit_detector_labels_btn, 16, 1)
+            plot_layout.addWidget(self.edit_plot_btn, 17, 0, 1, 2)
+        for widget in (
+            self.show_legend_chk,
+            self.legend_compact_chk,
+            self.legend_loc_combo,
+            self.legend_font_spin,
+            self.legend_loc_label,
+            self.legend_font_label,
+        ):
+            widget.setProperty("drawerHidden", False)
+            widget.setVisible(True)
+        self._make_group_static(self.plot_box, title="Layers and legend")
+        self._make_group_static(self.annotation_box, title="Annotations")
+        for widget in (
+            self.show_legend_chk,
+            self.legend_compact_chk,
+            self.legend_loc_combo,
+            self.legend_font_spin,
+            self.legend_loc_label,
+            self.legend_font_label,
+        ):
+            widget.setVisible(True)
+        plot_layout_page.addWidget(self.plot_box)
+        plot_layout_page.addWidget(self.annotation_box)
+        plot_layout_page.addStretch(1)
+        self.inspector_tabs.addTab(plot_page, "Plot")
+
+        map_page, map_layout = scroll_page()
+        map_layout.addWidget(self.scan_quick_bar)
+        self._build_scan_spot_tools()
+        map_layout.addWidget(self.scan_spot_box)
+        map_layout.addWidget(self.scan_tools_box)
+        map_layout.addStretch(1)
+        self.inspector_tabs.addTab(map_page, "Map")
+
+        export_page, export_layout_page = scroll_page()
+        export_layout_page.addWidget(self.export_box)
+        export_layout_page.addStretch(1)
+        self.inspector_tabs.addTab(export_page, "Export")
+        self.inspector_tabs.tabBar().moveTab(self.inspector_tabs.indexOf(parameter_page), 1)
+        self.inspector_tabs.tabBar().moveTab(self.inspector_tabs.indexOf(plot_page), 3)
+        self.right_layout.addWidget(self.inspector_tabs, 1)
+        self.inspector_tab_indices = {
+            "setup": self.inspector_tabs.indexOf(self.right_scroll),
+            "processing": self.inspector_tabs.indexOf(processing_page),
+            "parameters": self.inspector_tabs.indexOf(parameter_page),
+            "results": self.inspector_tabs.indexOf(results_page),
+            "plot": self.inspector_tabs.indexOf(plot_page),
+            "map": self.inspector_tabs.indexOf(map_page),
+            "export": self.inspector_tabs.indexOf(export_page),
+        }
+        for name, shortcut in (
+            ("setup", "Alt+1"),
+            ("parameters", "Alt+2"),
+            ("processing", "Alt+3"),
+            ("plot", "Alt+4"),
+            ("results", "Alt+5"),
+            ("map", "Alt+6"),
+            ("export", "Alt+7"),
+        ):
+            self.inspector_tabs.setTabToolTip(self.inspector_tab_indices[name], f"Open this inspector page ({shortcut})")
+
+        self._analysis_tools_dialog: QDialog | None = None
+        self._file_details_dialog: QDialog | None = None
+        self._export_options_dialog: QDialog | None = None
+        self._build_plot_more_menu()
+
+    def _update_report_controls_visibility(self, *_args) -> None:
+        fit_trace = bool(self.ctx.trace is not None and self.ctx.trace.fit_allowed)
+        show_fields = bool(fit_trace and (self.exp_report_png_chk.isChecked() or self.exp_report_pdf_chk.isChecked()))
+        self.report_content_lbl.setVisible(show_fields)
+        for checkbox in self.report_metric_checks.values():
+            checkbox.setVisible(show_fields)
+
+    def _build_plot_more_menu(self) -> None:
+        self.quick_more_menu.clear()
+        self._plot_more_actions: dict[str, QAction] = {}
+
+        def mirror(label: str, checkbox: QCheckBox, key: str) -> QAction:
+            action = self.quick_more_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(checkbox.isChecked())
+            action.toggled.connect(checkbox.setChecked)
+            checkbox.toggled.connect(action.setChecked)
+            self._plot_more_actions[key] = action
+            return action
+
+        mirror("Smoothed trace", self.show_smoothed_chk, "smooth")
+        self.smoothing_action = self.quick_more_menu.addAction("Smoothing amount…")
+        self.smoothing_action.triggered.connect(self._open_analysis_tools)
+        self.quick_more_menu.addSeparator()
+        mirror("Signal layer", self.show_signal_layer_chk, "signal")
+        mirror("Reference layer", self.show_reference_layer_chk, "reference")
+        mirror("Difference layer", self.show_difference_layer_chk, "difference")
+        mirror("Compare detectors", self.compare_detectors_chk, "detectors")
+        self.quick_more_menu.addSeparator()
+        mirror("Iterations", self.show_iteration_layer_chk, "iterations")
+        mirror("Iteration mean", self.show_iteration_mean_chk, "mean")
+        mirror("Iteration spread", self.show_iteration_std_chk, "std")
+        iteration_action = self.quick_more_menu.addAction("Choose iterations…")
+        iteration_action.triggered.connect(self._open_iteration_dialog)
+        self._plot_more_actions["iteration_select"] = iteration_action
+        self.quick_more_menu.addSeparator()
+        mirror("Residual", self.show_residual_chk, "residual")
+        mirror("Confidence band", self.show_confidence_chk, "confidence")
+        mirror("ODMR peaks", self.show_peaks_chk, "peaks")
+        mirror("Rabi envelope", self.show_rabi_envelope_chk, "rabi_envelope")
+        mirror("FFT panel", self.show_fft_panel_chk, "fft")
+        self.quick_more_menu.addSeparator()
+        export_action = self.quick_more_menu.addAction("Export options…")
+        export_action.triggered.connect(self._open_export_options)
+        self._plot_more_actions["export"] = export_action
+        self._update_plot_more_menu()
+
+    def _update_plot_more_menu(self) -> None:
+        if not hasattr(self, "_plot_more_actions"):
+            return
+        trace = self.ctx.trace
+        fit_allowed = bool(trace is not None and trace.fit_allowed)
+        is_scan2d = bool(trace is not None and trace.scan_dim == "scan2d")
+        is_rabi = bool(trace is not None and trace.experiment_type in {"Rabi", "DEERDuration"})
+        is_odmr = bool(trace is not None and trace.experiment_type in {"ODMR", "DEERFrequency"})
+        has_iterations = self._iteration_count() > 0 if trace is not None else False
+        has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        visibility = {
+            "smooth": not is_scan2d,
+            "signal": not is_scan2d,
+            "reference": not is_scan2d,
+            "difference": not is_scan2d,
+            "detectors": has_dual,
+            "iterations": has_iterations and not is_scan2d,
+            "mean": has_iterations and not is_scan2d,
+            "std": has_iterations and not is_scan2d,
+            "iteration_select": has_iterations and not is_scan2d,
+            "residual": fit_allowed,
+            "confidence": fit_allowed,
+            "peaks": is_odmr,
+            "rabi_envelope": is_rabi,
+            "fft": fit_allowed,
+        }
+        for key, visible in visibility.items():
+            action = self._plot_more_actions.get(key)
+            if action is not None:
+                action.setVisible(visible)
+        self.smoothing_action.setVisible(bool(visibility["smooth"] and self.show_smoothed_chk.isChecked()))
+        active = sum(
+            1
+            for key, action in self._plot_more_actions.items()
+            if key not in {"iteration_select", "export"} and action.isVisible() and action.isCheckable() and action.isChecked()
+        )
+        self.quick_more_btn.setText(f"More ({active})" if active else "More")
+
+    def _open_analysis_tools(self) -> None:
+        self._show_inspector_page("processing")
+
+    def _show_inspector_page(self, name: str) -> None:
+        if not hasattr(self, "inspector_tabs") or name not in self.inspector_tab_indices:
+            return
+        index = self.inspector_tab_indices[name]
+        if not self.inspector_tabs.isTabVisible(index):
+            return
+        self._toggle_workspace_panel("inspector", True)
+        self.inspector_tabs.setCurrentIndex(index)
+
+    def _open_file_details(self) -> None:
+        if self._file_details_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("File details")
+            dialog.setModal(False)
+            dialog.resize(520, 520)
+            layout = QVBoxLayout(dialog)
+            self._make_group_static(self.meta_box)
+            layout.addWidget(self.meta_box)
+            metadata = QTextEdit()
+            metadata.setReadOnly(True)
+            metadata.setObjectName("FileMetadataText")
+            layout.addWidget(metadata, 1)
+            self.file_metadata_text = metadata
+            self._file_details_dialog = dialog
+        if self.ctx.trace is None:
+            self.file_metadata_text.setPlainText("No file loaded.")
+        else:
+            self.file_metadata_text.setPlainText("\n".join(self._trace_summary_lines(self.ctx.trace)))
+        self._file_details_dialog.show()
+        self._file_details_dialog.raise_()
+        self._file_details_dialog.activateWindow()
+
+    def _open_export_options(self) -> None:
+        self._show_inspector_page("export")
+
     def _message(self, title: str, text: str):
         QMessageBox.information(self, title, text)
 
@@ -2077,7 +2909,7 @@ class SmartFitterMainWindow(QMainWindow):
         if qta is None:
             return
         try:
-            button.setIcon(qta.icon(icon_name, color="#d8d8d8"))
+            button.setIcon(qta.icon(icon_name, color="#d7e3f0"))
         except Exception:
             pass
 
@@ -2094,11 +2926,13 @@ class SmartFitterMainWindow(QMainWindow):
         bar = QWidget()
         bar.setObjectName("PlotQuickBar")
         self.plot_quick_bar = bar
-        grid = QGridLayout(bar)
-        grid.setContentsMargins(4, 2, 4, 6)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(4)
-        self.plot_quick_grid = grid
+        row = QGridLayout(bar)
+        row.setContentsMargins(4, 3, 4, 3)
+        row.setHorizontalSpacing(4)
+        row.setVerticalSpacing(3)
+        self.plot_quick_row = row
+        # Compatibility alias for integrations that inspect the toolbar layout.
+        self.plot_quick_grid = row
 
         self.quick_data_btn = self._make_quick_toggle("Data", "Show measured data points.", self._on_quick_data_toggled)
         self.quick_fit_btn = self._make_quick_toggle("Fit", "Show fitted model curve.", self._on_quick_fit_toggled)
@@ -2107,10 +2941,16 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_annotation_btn = self._make_quick_toggle("Annotations", "Show the fit-summary annotation. It stays off until a fit succeeds.", self._on_quick_annotation_toggled)
         self.quick_signal_btn = self._make_quick_toggle("Signal", "Overlay signal counts on the right axis.", self._on_quick_signal_toggled)
         self.quick_reference_btn = self._make_quick_toggle("Reference", "Overlay reference counts on the right axis.", self._on_quick_reference_toggled)
+        self.quick_compare_detectors_btn = self._make_quick_toggle("Detectors", "Compare the active detector with the other saved detector.", self._on_quick_compare_detectors_toggled)
         self.quick_difference_btn = self._make_quick_toggle("Diff", "Overlay reference-signal.", self._on_quick_difference_toggled)
         self.quick_iterations_btn = self._make_quick_toggle("Iterations", "Show selected individual iterations.", self._on_quick_iterations_toggled)
         self.quick_mean_btn = self._make_quick_toggle("Mean", "Show mean of selected iterations.", self._on_quick_mean_toggled)
         self.quick_std_btn = self._make_quick_toggle("Std", "Show standard deviation of selected iterations.", self._on_quick_std_toggled)
+        self.quick_residual_btn = self._make_quick_toggle("Residual", "Show fit residuals below the trace.", lambda checked: self.show_residual_chk.setChecked(checked) if not self._syncing_plot_controls else None)
+        self.quick_confidence_btn = self._make_quick_toggle("Band", "Show the fit confidence band.", lambda checked: self.show_confidence_chk.setChecked(checked) if not self._syncing_plot_controls else None)
+        self.quick_peaks_btn = self._make_quick_toggle("Peaks", "Show detected ODMR peaks.", lambda checked: self.show_peaks_chk.setChecked(checked) if not self._syncing_plot_controls else None)
+        self.quick_envelope_btn = self._make_quick_toggle("Envelope", "Show the fitted Rabi envelope.", lambda checked: self.show_rabi_envelope_chk.setChecked(checked) if not self._syncing_plot_controls else None)
+        self.quick_fft_btn = self._make_quick_toggle("FFT", "Show the FFT detail panel.", lambda checked: self.show_fft_panel_chk.setChecked(checked) if not self._syncing_plot_controls else None)
 
         self.quick_iteration_select_btn = QPushButton("Choose iterations…")
         self.quick_iteration_select_btn.setToolTip("Choose multiple complete iterations to plot.")
@@ -2125,39 +2965,59 @@ class SmartFitterMainWindow(QMainWindow):
         self.copy_figure_btn.setToolTip("Copy the current export figure to the clipboard (Ctrl+Shift+C).")
         self.copy_figure_btn.clicked.connect(self.copy_export_figure)
         self.copy_figure_btn.setEnabled(False)
+        self.quick_edit_plot_btn = QPushButton("Edit plot")
+        self.quick_edit_plot_btn.setToolTip("Edit titles, axes, typography, series, legends, and annotations.")
+        self.quick_edit_plot_btn.clicked.connect(self._open_plot_editor)
+        self.quick_more_btn = QToolButton()
+        self.quick_more_btn.setText("More")
+        self.quick_more_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.quick_more_btn.setPopupMode(QToolButton.InstantPopup)
+        self.quick_more_menu = QMenu(self.quick_more_btn)
+        self.quick_more_btn.setMenu(self.quick_more_menu)
         self._plot_quick_widgets = [
             self.quick_data_btn,
             self.quick_fit_btn,
             self.quick_smooth_btn,
             self.quick_legend_btn,
             self.quick_annotation_btn,
+            self.quick_residual_btn,
+            self.quick_confidence_btn,
             self.quick_signal_btn,
             self.quick_reference_btn,
+            self.quick_difference_btn,
+            self.quick_compare_detectors_btn,
             self.quick_iterations_btn,
+            self.quick_mean_btn,
+            self.quick_std_btn,
             self.quick_iteration_select_btn,
+            self.quick_peaks_btn,
+            self.quick_envelope_btn,
+            self.quick_fft_btn,
+            self.quick_edit_plot_btn,
             self.copy_figure_btn,
         ]
-        # Difference/mean/std remain available in the Plot drawer. Keep these
-        # legacy quick-control objects alive without crowding the primary bar.
-        for extra in (self.quick_difference_btn, self.quick_mean_btn, self.quick_std_btn, self.quick_std_mode_combo):
+        # Legacy mirror widgets stay alive for session/test compatibility, but
+        # the user-facing toolbar no longer hides plot controls in an overflow.
+        for extra in (
+            self.quick_std_mode_combo,
+            self.quick_more_btn,
+        ):
             extra.setParent(bar)
             extra.setVisible(False)
         self._relayout_plot_quick_toolbar()
         layout.addWidget(bar)
 
     def _relayout_plot_quick_toolbar(self) -> None:
-        if not hasattr(self, "plot_quick_grid"):
+        if not hasattr(self, "plot_quick_row"):
             return
-        grid = self.plot_quick_grid
-        while grid.count():
-            grid.takeAt(0)
-        available = self.plot_column.width() if hasattr(self, "plot_column") and self.plot_column.width() > 0 else self.width()
-        columns = 10 if available >= 920 else (5 if available >= 560 else (3 if available >= 360 else 2))
-        for index, widget in enumerate(self._plot_quick_widgets):
-            row, column = divmod(index, columns)
-            grid.addWidget(widget, row, column)
-        for column in range(columns):
-            grid.setColumnStretch(column, 1 if column == columns - 1 else 0)
+        row = self.plot_quick_row
+        while row.count():
+            row.takeAt(0)
+        visible = [widget for widget in self._plot_quick_widgets if not widget.isHidden()]
+        columns = 10 if self.plot_column.width() >= 900 else (7 if self.plot_column.width() >= 620 else 5)
+        for index, widget in enumerate(visible):
+            row.addWidget(widget, index // columns, index % columns)
+        row.setColumnStretch(columns, 1)
 
     def _build_scan_quick_toolbar(self, layout: QVBoxLayout):
         self.scan_quick_bar = QGroupBox("Map controls")
@@ -2233,21 +3093,173 @@ class SmartFitterMainWindow(QMainWindow):
         outer.addWidget(apply_view, 11, 1, 1, 2)
         outer.addWidget(self.scan_pan_btn, 12, 0)
         outer.addWidget(self.scan_zoom_btn, 12, 1, 1, 2)
-        self.scan_swap_axes_chk = QCheckBox("Swap X/Y axes")
+        self.scan_swap_axes_chk = QCheckBox("Swap displayed axes")
         self.scan_swap_axes_chk.setChecked(True)
-        self.scan_swap_axes_chk.setToolTip("Transpose the displayed map and exchange its X/Y labels. This is the default view.")
+        self.scan_swap_axes_chk.setToolTip("Transpose the displayed 2D map and exchange its horizontal and vertical axes.")
         self.scan_swap_axes_chk.toggled.connect(self._on_scan_axis_swap_changed)
         outer.addWidget(self.scan_swap_axes_chk, 13, 0, 1, 3)
-        self.scan_equal_aspect_chk = QCheckBox("Equal physical axes")
-        self.scan_equal_aspect_chk.setChecked(False)
-        self.scan_equal_aspect_chk.setToolTip("Show equal physical distances at equal screen scale.")
-        self.scan_equal_aspect_chk.toggled.connect(self._on_scan_style_changed)
-        outer.addWidget(self.scan_equal_aspect_chk, 14, 0, 1, 3)
+        self.scan_pixel_geometry_combo = NoScrollComboBox()
+        self.scan_pixel_geometry_combo.addItems(["Physical pixel size", "Square pixels"])
+        self.scan_pixel_geometry_combo.setToolTip(
+            "Physical pixel size uses the scan-axis spacing; Square pixels gives every sampled cell equal screen width and height."
+        )
+        self.scan_pixel_geometry_combo.currentTextChanged.connect(self._on_scan_style_changed)
+        outer.addWidget(QLabel("Pixel geometry"), 14, 0)
+        outer.addWidget(self.scan_pixel_geometry_combo, 14, 1, 1, 2)
+        self.scan_compare_scale_combo = NoScrollComboBox()
+        self.scan_compare_scale_combo.addItems(["Independent", "Shared"])
+        self.scan_compare_scale_combo.setCurrentText("Independent")
+        self.scan_compare_scale_combo.setToolTip("Use separate detector color ranges, or one shared quantitative range.")
+        self.scan_compare_scale_combo.currentTextChanged.connect(self._on_scan_style_changed)
+        outer.addWidget(QLabel("Detector ranges"), 15, 0)
+        outer.addWidget(self.scan_compare_scale_combo, 15, 1, 1, 2)
 
         self.scan_quick_bar.setVisible(False)
         layout.addWidget(self.scan_quick_bar)
         self.scan_vmin_edit.setEnabled(False)
         self.scan_vmax_edit.setEnabled(False)
+
+    def _build_scan_spot_tools(self) -> None:
+        self.scan_spot_box = QGroupBox("Fluorescent spots")
+        grid = QGridLayout(self.scan_spot_box)
+        grid.setContentsMargins(6, 10, 6, 6)
+        grid.setHorizontalSpacing(5)
+        grid.setVerticalSpacing(4)
+
+        self.spot_source_combo = NoScrollComboBox()
+        self.spot_source_combo.addItems(["Auto fluorescence", "Current observable", "Signal", "Reference", "Difference"])
+        self.spot_source_combo.setToolTip(
+            "Auto fluorescence uses the raw signal map when available, so a flat contrast view does not hide bright objects."
+        )
+        grid.addWidget(QLabel("Analyze"), 0, 0)
+        grid.addWidget(self.spot_source_combo, 0, 1)
+
+        self.spot_polarity_combo = NoScrollComboBox()
+        self.spot_polarity_combo.addItems(["Auto", "Bright", "Dark", "Bright and dark"])
+        self.spot_polarity_combo.setToolTip("Auto selects the stronger bright or dark departure from the local background.")
+        grid.addWidget(QLabel("Polarity"), 1, 0)
+        grid.addWidget(self.spot_polarity_combo, 1, 1)
+
+        self.spot_threshold_spin = NoScrollDoubleSpinBox()
+        self.spot_threshold_spin.setRange(0.5, 20.0)
+        self.spot_threshold_spin.setDecimals(1)
+        self.spot_threshold_spin.setSingleStep(0.5)
+        self.spot_threshold_spin.setValue(3.0)
+        self.spot_threshold_spin.setSuffix(" σ")
+        self.spot_threshold_spin.setToolTip("Minimum departure from the locally estimated background noise.")
+        grid.addWidget(QLabel("Threshold"), 2, 0)
+        grid.addWidget(self.spot_threshold_spin, 2, 1)
+
+        self.spot_background_spin = NoScrollSpinBox()
+        self.spot_background_spin.setRange(0, 101)
+        self.spot_background_spin.setSingleStep(2)
+        self.spot_background_spin.setSpecialValueText("Auto")
+        self.spot_background_spin.setValue(0)
+        self.spot_background_spin.setToolTip("Median-filter window used to estimate the varying background; Auto uses roughly one fifth of the shorter map dimension.")
+        grid.addWidget(QLabel("Background window"), 3, 0)
+        grid.addWidget(self.spot_background_spin, 3, 1)
+
+        self.spot_min_pixels_spin = NoScrollSpinBox()
+        self.spot_min_pixels_spin.setRange(1, 500)
+        self.spot_min_pixels_spin.setValue(4)
+        self.spot_min_pixels_spin.setToolTip("Reject threshold regions smaller than this many map cells.")
+        grid.addWidget(QLabel("Minimum area"), 4, 0)
+        grid.addWidget(self.spot_min_pixels_spin, 4, 1)
+
+        self.spot_max_count_spin = NoScrollSpinBox()
+        self.spot_max_count_spin.setRange(1, 100)
+        self.spot_max_count_spin.setValue(12)
+        grid.addWidget(QLabel("Maximum spots"), 5, 0)
+        grid.addWidget(self.spot_max_count_spin, 5, 1)
+
+        self.spot_overlay_chk = QCheckBox("Show fitted shapes")
+        self.spot_overlay_chk.setChecked(True)
+        self.spot_overlay_chk.toggled.connect(self._on_spot_overlay_changed)
+        self.spot_labels_chk = QCheckBox("Show numbers")
+        self.spot_labels_chk.setChecked(True)
+        self.spot_labels_chk.toggled.connect(self._on_spot_overlay_changed)
+        grid.addWidget(self.spot_overlay_chk, 6, 0)
+        grid.addWidget(self.spot_labels_chk, 6, 1)
+
+        self.spot_display_source_chk = QCheckBox("Display analyzed source")
+        self.spot_display_source_chk.setChecked(True)
+        self.spot_display_source_chk.setToolTip(
+            "After detection, display the fluorescence map that was actually fitted instead of a potentially flat derived observable."
+        )
+        self.spot_display_source_chk.toggled.connect(self._on_spot_overlay_changed)
+        grid.addWidget(self.spot_display_source_chk, 7, 0)
+        self.spot_compare_highlight_chk = QCheckBox("Highlight compared pair")
+        self.spot_compare_highlight_chk.setChecked(True)
+        self.spot_compare_highlight_chk.setToolTip("Use a gold outline for the two spots used in detector comparison.")
+        self.spot_compare_highlight_chk.toggled.connect(self._on_spot_overlay_changed)
+        grid.addWidget(self.spot_compare_highlight_chk, 7, 1)
+
+        self.detect_spots_btn = QPushButton("Detect and fit")
+        self.detect_spots_btn.setObjectName("PrimaryAction")
+        self.detect_spots_btn.setToolTip("Detect local background departures and fit each with a rotated elliptical 2D Gaussian.")
+        self.detect_spots_btn.clicked.connect(self._detect_scan_spots)
+        self.clear_spots_btn = QPushButton("Clear")
+        self.clear_spots_btn.clicked.connect(self._clear_scan_spots)
+        grid.addWidget(self.detect_spots_btn, 8, 0)
+        grid.addWidget(self.clear_spots_btn, 8, 1)
+
+        self.spot_status_lbl = QLabel("Not analyzed")
+        self.spot_status_lbl.setObjectName("MutedLabel")
+        self.spot_status_lbl.setWordWrap(True)
+        grid.addWidget(self.spot_status_lbl, 9, 0, 1, 2)
+
+        self.spot_results_table = QTableWidget(0, 5)
+        self.spot_results_table.setHorizontalHeaderLabels(["#", "Detector", "Center X, Y", "R major × minor", "R²"])
+        self.spot_results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.spot_results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.spot_results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.spot_results_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.spot_results_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.spot_results_table.setMinimumHeight(115)
+        self.spot_results_table.setMaximumHeight(190)
+        self.spot_results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.spot_results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.spot_results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for key, action in (("Ctrl+C", self._copy_spot_table), ("Delete", self._remove_selected_spots)):
+            shortcut = QShortcut(QKeySequence(key), self.spot_results_table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(action)
+        self.spot_results_table.setToolTip("Centers are physical X, Y (independent of displayed axis order). R major/minor are half-maximum radii in scan-axis units. Double-click a row to center the map on that spot.")
+        self.spot_results_table.itemDoubleClicked.connect(self._go_to_spot_row)
+        grid.addWidget(self.spot_results_table, 10, 0, 1, 2)
+
+        self.spot_remove_btn = QPushButton("Remove selected")
+        self.spot_remove_btn.setToolTip("Remove selected fitted spots from the analysis and overlay.")
+        self.spot_remove_btn.clicked.connect(self._remove_selected_spots)
+        self.spot_keep_btn = QPushButton("Keep selected only")
+        self.spot_keep_btn.setToolTip("For each detector represented in the selection, discard its other fitted spots.")
+        self.spot_keep_btn.clicked.connect(self._keep_selected_spots)
+        grid.addWidget(self.spot_remove_btn, 11, 0)
+        grid.addWidget(self.spot_keep_btn, 11, 1)
+
+        self.spot_restore_btn = QPushButton("Restore removed")
+        self.spot_restore_btn.setEnabled(False)
+        self.spot_restore_btn.setToolTip("Restore the previous spot list after a remove or keep operation.")
+        self.spot_restore_btn.clicked.connect(self._restore_removed_spots)
+        copy_spots = QPushButton("Copy spot table")
+        copy_spots.setToolTip("Copy selected rows, or all spots when nothing is selected. Ctrl+C copies; Ctrl+A selects all rows; Delete removes selected spots.")
+        copy_spots.clicked.connect(self._copy_spot_table)
+        self.spot_results_table.itemSelectionChanged.connect(
+            lambda: copy_spots.setText("Copy selected spots" if self._selected_spot_keys() else "Copy spot table")
+        )
+        grid.addWidget(self.spot_restore_btn, 12, 0)
+        grid.addWidget(copy_spots, 12, 1)
+
+        self.spot_compare_btn = QPushButton("Compare detector spots")
+        self.spot_compare_btn.setToolTip(
+            "Compare one selected spot from each detector. If no rows are selected, the strongest spot in each detector is used."
+        )
+        self.spot_compare_btn.clicked.connect(self._compare_detector_spots)
+        grid.addWidget(self.spot_compare_btn, 13, 0, 1, 2)
+        self.spot_compare_lbl = QLabel("Detector comparison: not selected")
+        self.spot_compare_lbl.setObjectName("MutedLabel")
+        self.spot_compare_lbl.setWordWrap(True)
+        grid.addWidget(self.spot_compare_lbl, 14, 0, 1, 2)
 
     def _labeled_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -2297,6 +3309,12 @@ class SmartFitterMainWindow(QMainWindow):
         controls_layout = QGridLayout(controls)
         self.batch_mode_combo = NoScrollComboBox()
         self.batch_mode_combo.addItems(["contrast", "signal", "reference", "difference"])
+        self.batch_detector_combo = NoScrollComboBox()
+        self.batch_detector_combo.addItem("Both", "all")
+        self.batch_detector_combo.addItem("Detector 1", "detector1")
+        self.batch_detector_combo.addItem("Detector 2", "detector2")
+        self.batch_detector1_label_edit = QLineEdit("Detector 1")
+        self.batch_detector2_label_edit = QLineEdit("Detector 2")
         self.batch_model_combo = NoScrollComboBox()
         self.batch_model_combo.addItems(["Auto-detect", "Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition"])
         self.batch_bin_spin = NoScrollSpinBox()
@@ -2334,20 +3352,24 @@ class SmartFitterMainWindow(QMainWindow):
         controls_layout.addWidget(self.batch_mode_combo, 0, 1)
         controls_layout.addWidget(QLabel("Model"), 0, 2)
         controls_layout.addWidget(self.batch_model_combo, 0, 3)
-        controls_layout.addWidget(QLabel("Bin"), 1, 0)
-        controls_layout.addWidget(self.batch_bin_spin, 1, 1)
-        controls_layout.addWidget(QLabel("Smooth"), 1, 2)
-        controls_layout.addWidget(self.batch_smooth_spin, 1, 3)
-        controls_layout.addWidget(QLabel("Multistart"), 2, 0)
-        controls_layout.addWidget(self.batch_multistart_spin, 2, 1)
-        controls_layout.addWidget(QLabel("DPI"), 2, 2)
-        controls_layout.addWidget(self.batch_dpi_spin, 2, 3)
-        controls_layout.addWidget(self.batch_robust_chk, 3, 0)
-        controls_layout.addWidget(self.batch_odmr_multi_chk, 3, 1)
-        controls_layout.addWidget(self.batch_recursive_chk, 3, 2)
-        controls_layout.addWidget(self.batch_skip_checkpoints_chk, 4, 0)
-        controls_layout.addWidget(self.batch_cancel_btn, 4, 2)
-        controls_layout.addWidget(self.batch_run_btn, 4, 3)
+        controls_layout.addWidget(QLabel("Detectors"), 1, 0)
+        controls_layout.addWidget(self.batch_detector_combo, 1, 1)
+        controls_layout.addWidget(self.batch_detector1_label_edit, 1, 2)
+        controls_layout.addWidget(self.batch_detector2_label_edit, 1, 3)
+        controls_layout.addWidget(QLabel("Bin"), 2, 0)
+        controls_layout.addWidget(self.batch_bin_spin, 2, 1)
+        controls_layout.addWidget(QLabel("Smooth"), 2, 2)
+        controls_layout.addWidget(self.batch_smooth_spin, 2, 3)
+        controls_layout.addWidget(QLabel("Multistart"), 3, 0)
+        controls_layout.addWidget(self.batch_multistart_spin, 3, 1)
+        controls_layout.addWidget(QLabel("DPI"), 3, 2)
+        controls_layout.addWidget(self.batch_dpi_spin, 3, 3)
+        controls_layout.addWidget(self.batch_robust_chk, 4, 0)
+        controls_layout.addWidget(self.batch_odmr_multi_chk, 4, 1)
+        controls_layout.addWidget(self.batch_recursive_chk, 4, 2)
+        controls_layout.addWidget(self.batch_skip_checkpoints_chk, 5, 0)
+        controls_layout.addWidget(self.batch_cancel_btn, 5, 2)
+        controls_layout.addWidget(self.batch_run_btn, 5, 3)
         layout.addWidget(controls)
 
         self.batch_progress_bar = QProgressBar()
@@ -2379,8 +3401,8 @@ class SmartFitterMainWindow(QMainWindow):
         results_row.addWidget(self.batch_open_output_btn)
         layout.addLayout(results_row)
 
-        self.batch_results_table = QTableWidget(0, 7)
-        self.batch_results_table.setHorizontalHeaderLabels(["File", "Status", "Model", "R2", "RMSE", "Metric", "Path"])
+        self.batch_results_table = QTableWidget(0, 8)
+        self.batch_results_table.setHorizontalHeaderLabels(["File", "Detector", "Status", "Model", "R2", "RMSE", "Metric", "Path"])
         self.batch_results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.batch_results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.batch_results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -2388,6 +3410,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_results_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.batch_results_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.batch_results_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.batch_results_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self.batch_results_table.itemSelectionChanged.connect(self._update_batch_preview)
         self.batch_results_table.itemDoubleClicked.connect(self._open_selected_batch_result)
         layout.addWidget(self.batch_results_table, 1)
@@ -2426,7 +3449,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.results_box.setVisible(True)
         self.summary_text.setVisible(True)
         self.summary_text.verticalScrollBar().setValue(0)
-        self.right_scroll.ensureWidgetVisible(self.results_box, 12, 12)
+        self._show_inspector_page("results")
 
     def _browse_batch_dir(self, line_edit: QLineEdit):
         start = line_edit.text().strip() or str(self.settings.value("session/last_open_dir", ""))
@@ -2452,6 +3475,11 @@ class SmartFitterMainWindow(QMainWindow):
             "input_dir": Path(input_dir),
             "output_dir": out,
             "mode": self.batch_mode_combo.currentText(),
+            "detector": str(self.batch_detector_combo.currentData()),
+            "detector_labels": {
+                "detector1": self.batch_detector1_label_edit.text().strip() or "Detector 1",
+                "detector2": self.batch_detector2_label_edit.text().strip() or "Detector 2",
+            },
             "bin_size": int(self.batch_bin_spin.value()),
             "smooth_window": int(self.batch_smooth_spin.value()),
             "multistart": int(self.batch_multistart_spin.value()),
@@ -2575,15 +3603,16 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_results_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             file_name = row.get("file") or row.get("filename") or row.get("File") or row.get("name") or ""
+            detector_label = row.get("detector_label") or row.get("detector_id") or "Detector 1"
             status = (row.get("status") or row.get("Status") or "").upper()
             model = row.get("model") or row.get("Model") or row.get("analysis_mode") or ""
             r2 = row.get("r2") or row.get("R2") or row.get("R^2") or ""
             rmse = row.get("rmse") or row.get("RMSE") or ""
             metric = row.get("metric") or row.get("validation") or row.get("status_reason") or row.get("reason") or ""
             path = row.get("relative_path") or row.get("path") or row.get("source_path") or ""
-            for col, value in enumerate([file_name, status, model, r2, rmse, metric, path]):
+            for col, value in enumerate([file_name, detector_label, status, model, r2, rmse, metric, path]):
                 item = QTableWidgetItem(str(value))
-                if col == 1:
+                if col == 2:
                     item.setTextAlignment(Qt.AlignCenter)
                     color = {"PASS": "#6fcf97", "WARN": "#e0a458", "FAIL": "#e57373"}.get(status)
                     if color:
@@ -2604,7 +3633,7 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _open_selected_batch_result(self, item: QTableWidgetItem) -> None:
         row = item.row()
-        path_item = self.batch_results_table.item(row, 6)
+        path_item = self.batch_results_table.item(row, 7)
         if path_item is None:
             return
         path = Path(path_item.text())
@@ -2636,11 +3665,12 @@ class SmartFitterMainWindow(QMainWindow):
         self._scan_view_limits = None
         self._scan_cursor = None
         self._selected_plot_point = None
+        self._selected_plot_points = []
         if hasattr(self, "clear_marker_btn"):
             self.clear_marker_btn.setVisible(False)
         self._update_point_readout("Point readout: click the map to pin a cell")
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
-            self._refresh_plot_only()
+            self._refresh_plot_only(preserve_view=False)
 
     def _apply_manual_scan_color_limits(self):
         if self.scan_scale_combo.currentText() != "Manual":
@@ -2653,21 +3683,32 @@ class SmartFitterMainWindow(QMainWindow):
         if not np.isfinite(low) or not np.isfinite(high) or high <= low:
             self.statusBar().showMessage("Color maximum must be greater than color minimum", 4000)
             return
+        self._detector_map_limits[self._active_detector_id()] = (self.scan_vmin_edit.text(), self.scan_vmax_edit.text())
         self._on_scan_style_changed()
 
     def _scan_colormap_name(self) -> str:
         name = self.scan_colormap_combo.currentText() if hasattr(self, "scan_colormap_combo") else "viridis"
         return f"{name}_r" if hasattr(self, "scan_reverse_chk") and self.scan_reverse_chk.isChecked() else name
 
-    def _scan_color_limits(self, values: np.ndarray) -> tuple[float, float]:
+    def _scan_color_limits(
+        self,
+        values: np.ndarray,
+        detector_id: str | None = None,
+        *,
+        update_fields: bool = True,
+    ) -> tuple[float, float]:
         finite = np.asarray(values, dtype=float)
         finite = finite[np.isfinite(finite)]
         if len(finite) == 0:
             return 0.0, 1.0
         mode = self.scan_scale_combo.currentText() if hasattr(self, "scan_scale_combo") else "Auto"
         if mode == "Manual":
+            low_text = self.scan_vmin_edit.text()
+            high_text = self.scan_vmax_edit.text()
+            if detector_id is not None and detector_id != self._active_detector_id():
+                low_text, high_text = self._detector_map_limits.get(detector_id, (low_text, high_text))
             try:
-                low, high = float(self.scan_vmin_edit.text()), float(self.scan_vmax_edit.text())
+                low, high = float(low_text), float(high_text)
                 if np.isfinite(low) and np.isfinite(high) and high > low:
                     return low, high
             except ValueError:
@@ -2684,9 +3725,11 @@ class SmartFitterMainWindow(QMainWindow):
         if np.isclose(low, high):
             pad = max(abs(low) * 0.01, 1e-12)
             low, high = low - pad, high + pad
-        if mode != "Manual" and hasattr(self, "scan_vmin_edit"):
+        if mode != "Manual" and update_fields and hasattr(self, "scan_vmin_edit"):
             self.scan_vmin_edit.setText(f"{low:.6g}")
             self.scan_vmax_edit.setText(f"{high:.6g}")
+            if detector_id is not None:
+                self._detector_map_limits[detector_id] = (self.scan_vmin_edit.text(), self.scan_vmax_edit.text())
         return low, high
 
     def _apply_scan_image_style(self, image, values: np.ndarray) -> None:
@@ -2714,13 +3757,11 @@ class SmartFitterMainWindow(QMainWindow):
             self.statusBar().showMessage("View maxima must be greater than minima", 4000)
             return
         self._scan_view_limits = (xlim, ylim)
-        if self.scan_equal_aspect_chk.isChecked():
-            self.scan_equal_aspect_chk.blockSignals(True)
-            self.scan_equal_aspect_chk.setChecked(False)
-            self.scan_equal_aspect_chk.blockSignals(False)
-            self.ax_main.set_aspect("auto")
         self.ax_main.set_xlim(*xlim)
         self.ax_main.set_ylim(*ylim)
+        if self._detector_compare_ax is not None:
+            self._detector_compare_ax.set_xlim(*xlim)
+            self._detector_compare_ax.set_ylim(*ylim)
         self.canvas.draw_idle()
 
     def _reset_scan_view(self):
@@ -2733,6 +3774,9 @@ class SmartFitterMainWindow(QMainWindow):
         self._scan_view_limits = None
         self.ax_main.set_xlim(xmin, xmax)
         self.ax_main.set_ylim(ymin, ymax)
+        if self._detector_compare_ax is not None:
+            self._detector_compare_ax.set_xlim(xmin, xmax)
+            self._detector_compare_ax.set_ylim(ymin, ymax)
         self._update_scan_view_fields((xmin, xmax), (ymin, ymax))
         self.canvas.draw_idle()
 
@@ -2778,15 +3822,22 @@ class SmartFitterMainWindow(QMainWindow):
             self.toolbar.zoom()
 
     def _on_scan_navigation_finished(self, event):
-        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes is not self.ax_main:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax}:
             return
-        self._scan_view_limits = (tuple(float(value) for value in self.ax_main.get_xlim()), tuple(float(value) for value in self.ax_main.get_ylim()))
+        source_ax = event.inaxes
+        self._scan_view_limits = (tuple(float(value) for value in source_ax.get_xlim()), tuple(float(value) for value in source_ax.get_ylim()))
+        self.ax_main.set_xlim(*self._scan_view_limits[0])
+        self.ax_main.set_ylim(*self._scan_view_limits[1])
+        if self._detector_compare_ax is not None:
+            self._detector_compare_ax.set_xlim(*self._scan_view_limits[0])
+            self._detector_compare_ax.set_ylim(*self._scan_view_limits[1])
         self._update_scan_view_fields(*self._scan_view_limits)
 
     def _on_scan_scroll(self, event):
-        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes is not self.ax_main:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax}:
             return
-        xlim, ylim = self.ax_main.get_xlim(), self.ax_main.get_ylim()
+        source_ax = event.inaxes
+        xlim, ylim = source_ax.get_xlim(), source_ax.get_ylim()
         center_x = float(event.xdata) if event.xdata is not None else float(np.mean(xlim))
         center_y = float(event.ydata) if event.ydata is not None else float(np.mean(ylim))
         factor = 0.8 if event.button == "up" else 1.25
@@ -2794,6 +3845,9 @@ class SmartFitterMainWindow(QMainWindow):
         new_ylim = (center_y - (center_y - ylim[0]) * factor, center_y + (ylim[1] - center_y) * factor)
         self.ax_main.set_xlim(*new_xlim)
         self.ax_main.set_ylim(*new_ylim)
+        if self._detector_compare_ax is not None:
+            self._detector_compare_ax.set_xlim(*new_xlim)
+            self._detector_compare_ax.set_ylim(*new_ylim)
         self._scan_view_limits = (new_xlim, new_ylim)
         self._update_scan_view_fields(new_xlim, new_ylim)
         self.canvas.draw_idle()
@@ -2954,12 +4008,15 @@ class SmartFitterMainWindow(QMainWindow):
                     env_pen = pg.mkPen("#b57edc", width=1.5, style=Qt.DashLine)
                     self.live_plot_widget.plot(self.ctx.x, upper_y, pen=env_pen)
                     self.live_plot_widget.plot(self.ctx.x, lower_y, pen=env_pen)
-        if self._selected_plot_point is not None and "x" in self._selected_plot_point and "y" in self._selected_plot_point:
-            sx = float(self._selected_plot_point["x"])
-            sy_raw = float(self._selected_plot_point["y"])
+        selected_points = self._selected_points_for_plot()
+        for point in selected_points:
+            if "x" not in point or "y" not in point:
+                continue
+            sx = float(point["x"])
+            sy_raw = float(point["y"])
             sy_disp, _ = self._display_y(np.asarray([sy_raw], dtype=float))
-            self.live_selection_vline = pg.InfiniteLine(pos=sx, angle=90, pen=pg.mkPen("#d6a75d", width=1))
-            self.live_plot_widget.addItem(self.live_selection_vline)
+            selection_vline = pg.InfiniteLine(pos=sx, angle=90, pen=pg.mkPen("#d6a75d", width=1))
+            self.live_plot_widget.addItem(selection_vline)
             self.live_selection_marker = pg.ScatterPlotItem(
                 [sx],
                 [float(sy_disp[0])],
@@ -2969,6 +4026,9 @@ class SmartFitterMainWindow(QMainWindow):
                 pen=pg.mkPen("#d6a75d", width=2),
             )
             self.live_plot_widget.addItem(self.live_selection_marker)
+            # Keep the public handle pointing to the most recent marker for
+            # callers that use it to inspect or clear the live selection.
+            self.live_selection_vline = selection_vline
         self.live_plot_widget.setLabel("bottom", self._friendly_axis_label(self.ctx.trace.x_label))
         self.live_plot_widget.setLabel("left", y_label)
 
@@ -2981,7 +4041,11 @@ class SmartFitterMainWindow(QMainWindow):
             point = self.live_plot_widget.plotItem.vb.mapSceneToView(event.scenePos())
         except Exception:
             return
-        self._select_point_from_plot(float(point.x()), float(point.y()))
+        self._select_point_from_plot(
+            float(point.x()),
+            float(point.y()),
+            multi_select=self._multi_point_modifier(event),
+        )
         try:
             event.accept()
         except Exception:
@@ -3012,68 +4076,192 @@ class SmartFitterMainWindow(QMainWindow):
     def _activate_live_selection(self):
         if getattr(self, "plot_tabs", None) is not None:
             self.plot_tabs.setCurrentIndex(0)
-        self._update_point_readout("Point readout: click a plotted sample")
+        self._update_point_readout("Point readout: click a sample · Ctrl/Shift-click for multiple")
 
-    def _select_point_from_plot(self, xdata: float, ydata: float | None = None, *, refresh: bool = True):
-        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None and ydata is not None:
-            display = self._scan2d_display_data(self.ctx.trace)
+    def _select_point_from_plot(
+        self,
+        xdata: float,
+        ydata: float | None = None,
+        *,
+        refresh: bool = True,
+        detector_id: str | None = None,
+        multi_select: bool = False,
+    ):
+        trace = self.ctx.trace
+        if detector_id and self._primary_dataset is not None:
+            trace = self._primary_dataset.detectors.get(detector_id, trace)
+        if trace is not None and trace.scan_dim == "scan2d" and trace.z2d is not None and ydata is not None:
+            display = self._scan2d_display_data(trace)
             if display is None:
                 return
             x_centers, y_centers, z2d, _x_label, _y_label = display
+            z2d, source_label = self._spot_map_for_display(trace, z2d)
             row = int(np.argmin(np.abs(y_centers - ydata)))
             col = int(np.argmin(np.abs(x_centers - xdata)))
             px = float(x_centers[col])
             py = float(y_centers[row])
             z = float(z2d[row, col])
-            if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px) and np.isclose(float(self._selected_plot_point.get("y", np.nan)), py):
+            if (
+                self._selected_plot_point is not None
+                and self._selected_plot_point.get("detector_id") == trace.detector_id
+                and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px)
+                and np.isclose(float(self._selected_plot_point.get("y", np.nan)), py)
+            ):
                 self.clear_selected_marker(refresh=refresh)
                 return
             self._scan_cursor = (px, py)
-            self._selected_plot_point = {"x": px, "y": py, "z": z}
+            self._selected_plot_point = {"x": px, "y": py, "z": z, "detector_id": trace.detector_id}
+            self._selected_plot_points = [self._selected_plot_point]
             self.clear_marker_btn.setVisible(True)
             self.scan_cursor_lbl.setText(f"Cursor: x={px:.6g}, y={py:.6g}, z={z:.6g}")
+            values = [
+                f"z={self._format_inspect_value(z)} ({source_label})",
+                f"{self._detector_label(trace.detector_id)}={self._format_inspect_value(z)}",
+            ]
+            other = self._counterpart_scan_trace(trace)
+            if other is not None:
+                other_display = self._scan2d_display_data(other)
+                if other_display is not None:
+                    ox, oy, oz, _ox_label, _oy_label = other_display
+                    oz, other_source_label = self._spot_map_for_display(other, oz)
+                    orow = int(np.argmin(np.abs(oy - py)))
+                    ocol = int(np.argmin(np.abs(ox - px)))
+                    other_z = float(oz[orow, ocol])
+                    self._selected_plot_point["secondary_z"] = other_z
+                    values.append(
+                        f"{self._detector_label(other.detector_id)}="
+                        f"{self._format_inspect_value(other_z)} ({other_source_label})"
+                    )
             self._update_point_readout(
                 f"Point readout: x={self._format_inspect_value(px)}, "
-                f"y={self._format_inspect_value(py)}, z={self._format_inspect_value(z)}"
+                f"y={self._format_inspect_value(py)}, " + ", ".join(values)
             )
         else:
             nearest = self._nearest_trace_point(float(xdata))
             if nearest is None:
                 return
             _, px, py = nearest
-            if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px):
-                self.clear_selected_marker(refresh=refresh)
-                return
-            self._selected_plot_point = {"x": px, "y": py}
-            self.clear_marker_btn.setVisible(True)
-            iter_text = self._point_iteration_readout(px)
+            point = {"x": px, "y": py}
             secondary = self._nearest_secondary_point(float(xdata))
             if secondary is not None:
                 _, sx, sy, sec_label = secondary
-                self._selected_plot_point["secondary_x"] = sx
-                self._selected_plot_point["secondary_y"] = sy
-                self._selected_plot_point["secondary_label"] = sec_label
-                readout = (
-                    f"Point readout: x={self._format_inspect_value(px)}, "
-                    f"primary={self._format_inspect_value(py)}, "
-                    f"secondary={self._format_inspect_value(sy)}"
+                point["secondary_x"] = sx
+                point["secondary_y"] = sy
+                point["secondary_label"] = sec_label
+
+            # A plain click retains the original pin/toggle interaction. A
+            # Ctrl/Shift/Command click toggles only this nearest sample in the
+            # ordered selection so several points can remain highlighted.
+            if multi_select:
+                points = self._selected_points_for_plot()
+                match_index = next(
+                    (
+                        index
+                        for index, selected in enumerate(points)
+                        if np.isclose(float(selected.get("x", np.nan)), px)
+                    ),
+                    None,
                 )
-                if iter_text:
-                    readout += f", {iter_text}"
-                self._update_point_readout(readout)
+                if match_index is None:
+                    points.append(point)
+                else:
+                    points.pop(match_index)
+                self._selected_plot_points = points
+                self._selected_plot_point = points[-1] if points else None
             else:
-                readout = f"Point readout: x={self._format_inspect_value(px)}, y={self._format_inspect_value(py)}"
-                if iter_text:
-                    readout += f", {iter_text}"
-                self._update_point_readout(readout)
-            if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
-                self.scan_cursor_lbl.setText(f"Cursor: x={self._format_inspect_value(px)}, y={self._format_inspect_value(py)}")
+                if self._selected_plot_point is not None and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px):
+                    self.clear_selected_marker(refresh=refresh)
+                    return
+                self._selected_plot_points = [point]
+                self._selected_plot_point = point
+            self._update_1d_selection_readout()
         if refresh:
             self._refresh_plot_only()
+
+    def _selected_points_for_plot(self) -> list[dict[str, Any]]:
+        return list(self._selected_plot_points or (
+            [self._selected_plot_point] if self._selected_plot_point is not None else []
+        ))
+
+    def _update_1d_selection_readout(self) -> None:
+        """Refresh the point readout after a single or additive 1D pick."""
+        points = self._selected_points_for_plot()
+        current = self._selected_plot_point
+        if current is None or "x" not in current or "y" not in current:
+            self._scan_cursor = None
+            if hasattr(self, "clear_marker_btn"):
+                self.clear_marker_btn.setVisible(False)
+            self._update_point_readout("Point readout: none")
+            if hasattr(self, "scan_cursor_lbl"):
+                self.scan_cursor_lbl.setText("Cursor: none")
+            return
+        self.clear_marker_btn.setVisible(True)
+        px = float(current["x"])
+        py = float(current["y"])
+        count = len(points)
+        prefix = f"{count} points selected · " if count > 1 else ""
+        readout = (
+            f"Point readout: {prefix}x={self._format_inspect_value(px)}, "
+            f"primary={self._format_inspect_value(py)}"
+        )
+        if "secondary_y" in current:
+            readout += f", secondary={self._format_inspect_value(float(current['secondary_y']))}"
+        iter_text = self._point_iteration_readout(px)
+        if iter_text:
+            readout += f", {iter_text}"
+        self._update_point_readout(readout)
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
+            self.scan_cursor_lbl.setText(
+                f"{prefix}last x={self._format_inspect_value(px)}, y={self._format_inspect_value(py)}"
+            )
+
+    def _draw_selected_1d_markers(self, primary_series: list[np.ndarray]) -> None:
+        self._draw_selection_markers(self.ax_main, primary_series=primary_series)
+
+    def _draw_selected_secondary_markers(self) -> None:
+        if self._ax_secondary is not None:
+            self._draw_selection_markers(self._ax_secondary, secondary=True)
+
+    def _draw_selection_markers(self, axis, *, secondary=False, primary_series=None) -> None:
+        """Render numbered selections consistently on either y-axis."""
+        points = self._selected_points_for_plot()
+        for index, point in enumerate(points, start=1):
+            if secondary and "secondary_y" not in point:
+                continue
+            x = float(point.get("secondary_x", point["x"]) if secondary else point["x"])
+            y = float(point["secondary_y"] if secondary else point["y"])
+            displayed_y = y if secondary else float(self._display_y(np.asarray([y]))[0][0])
+            if not np.isfinite(x) or not np.isfinite(displayed_y):
+                continue
+            if primary_series is not None:
+                primary_series.append(np.asarray([displayed_y]))
+            current = point is self._selected_plot_point
+            color = ("#ff8a65" if current else "#f2a07b") if secondary else (
+                "#ffeb3b" if current else "#ffd166"
+            )
+            axis.plot(
+                [x], [displayed_y], "s" if secondary else "o",
+                ms=8 if current and not secondary else 7, mec=color, mfc="none",
+                mew=1.6 if secondary else 1.8, label="_nolegend_", zorder=12,
+            )
+            text = f"#{index}" if len(points) > 1 else ""
+            if secondary:
+                text = f"{text} {self._format_inspect_value(y)}".strip()
+            elif current or len(points) == 1:
+                prefix = f"{text} · " if text else ""
+                text = f"{prefix}x={self._format_inspect_value(x)}\ny={self._format_inspect_value(y)}"
+            axis.annotate(
+                text, (x, displayed_y), textcoords="offset points",
+                xytext=(8, -14 if secondary else (8 if current else -12)),
+                fontsize=8, color=color, zorder=13,
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": (0.08, 0.10, 0.15, 0.75),
+                      "edgecolor": color, "alpha": 0.9},
+            )
 
     def clear_selected_marker(self, _checked: bool = False, *, refresh: bool = True):
         """Clear only the pinned inspection marker; measured data is untouched."""
         self._selected_plot_point = None
+        self._selected_plot_points = []
         self._scan_cursor = None
         if hasattr(self, "clear_marker_btn"):
             self.clear_marker_btn.setVisible(False)
@@ -3098,13 +4286,16 @@ class SmartFitterMainWindow(QMainWindow):
         reset_action.setEnabled(self.ctx.trace is not None)
         reset_action.triggered.connect(self._reset_scan_view if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" else self.toolbar.home)
         clear_action = menu.addAction("Clear marker")
-        clear_action.setEnabled(self._selected_plot_point is not None)
+        clear_action.setEnabled(bool(self._selected_points_for_plot()))
         clear_action.triggered.connect(self.clear_selected_marker)
         menu.exec(self.canvas.mapToGlobal(position))
 
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
+        add_files_action = file_menu.addAction("Add Data Files…")
+        add_files_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        add_files_action.triggered.connect(self.on_add_overlays)
         save_session_action = QAction("Save Analysis Session...", self)
         save_session_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_session_action.triggered.connect(self.on_save_session)
@@ -3113,6 +4304,16 @@ class SmartFitterMainWindow(QMainWindow):
         load_session_action.setShortcut(QKeySequence("Ctrl+Alt+O"))
         load_session_action.triggered.connect(self.on_load_session)
         file_menu.addAction(load_session_action)
+        save_results_action = QAction("Save Results...", self)
+        save_results_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_results_action.triggered.connect(self.on_save_results)
+        file_menu.addAction(save_results_action)
+        export_options_action = QAction("Export Options...", self)
+        export_options_action.triggered.connect(self._open_export_options)
+        file_menu.addAction(export_options_action)
+        file_details_action = QAction("File Details...", self)
+        file_details_action.triggered.connect(self._open_file_details)
+        file_menu.addAction(file_details_action)
         file_menu.addSeparator()
         recent_action = QAction("Open Recent...", self)
         recent_action.triggered.connect(self.on_open_recent)
@@ -3140,6 +4341,37 @@ class SmartFitterMainWindow(QMainWindow):
         copy_figure_action.triggered.connect(self.copy_export_figure)
         edit_menu.addAction(copy_figure_action)
 
+        view_menu = self.menuBar().addMenu("View")
+        reset_plot_action = view_menu.addAction("Reset Plot View")
+        reset_plot_action.setShortcut(QKeySequence("Ctrl+Home"))
+        reset_plot_action.triggered.connect(
+            lambda: self._reset_scan_view() if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" else self.toolbar.home()
+        )
+        view_menu.addSeparator()
+        self.view_files_action = QAction("Project Explorer", self)
+        self.view_files_action.setCheckable(True)
+        self.view_files_action.setChecked(self.left_panel.isVisible())
+        self.view_files_action.toggled.connect(self.files_drawer_btn.setChecked)
+        self.files_drawer_btn.toggled.connect(self.view_files_action.setChecked)
+        view_menu.addAction(self.view_files_action)
+        self.view_inspector_action = QAction("Properties Inspector", self)
+        self.view_inspector_action.setCheckable(True)
+        self.view_inspector_action.setChecked(self.right_panel.isVisible())
+        self.view_inspector_action.toggled.connect(self.inspector_drawer_btn.setChecked)
+        self.inspector_drawer_btn.toggled.connect(self.view_inspector_action.setChecked)
+        view_menu.addAction(self.view_inspector_action)
+        view_menu.addSeparator()
+        plot_properties_action = QAction("Plot Properties", self)
+        plot_properties_action.triggered.connect(lambda: self._show_inspector_page("plot"))
+        view_menu.addAction(plot_properties_action)
+        processing_action = QAction("Processing Properties", self)
+        processing_action.triggered.connect(self._open_analysis_tools)
+        view_menu.addAction(processing_action)
+        view_menu.addSeparator()
+        reset_layout_action = QAction("Reset Workspace Layout", self)
+        reset_layout_action.triggered.connect(self._reset_workspace_layout)
+        view_menu.addAction(reset_layout_action)
+
 
         preset_menu = self.menuBar().addMenu("Presets")
         save_preset_action = QAction("Save Analysis Preset...", self)
@@ -3159,6 +4391,37 @@ class SmartFitterMainWindow(QMainWindow):
         save_pref_action = QAction("Save Current Preferences", self)
         save_pref_action.triggered.connect(self._save_preferences)
         menu.addAction(save_pref_action)
+        self.reduce_motion_action = QAction("Reduce motion", self)
+        self.reduce_motion_action.setCheckable(True)
+        self.reduce_motion_action.setChecked(self._reduce_motion)
+        self.reduce_motion_action.toggled.connect(self._set_reduce_motion)
+        menu.addAction(self.reduce_motion_action)
+
+    def _set_reduce_motion(self, checked: bool) -> None:
+        self._reduce_motion = bool(checked)
+        self.settings.setValue("ui/reduce_motion", self._reduce_motion)
+
+    def _make_group_static(self, box: QGroupBox, *, title: str | None = None) -> None:
+        """Remove legacy disclosure behavior and reveal the group's content."""
+        animation = getattr(box, "_drawer_anim", None)
+        if animation is not None:
+            animation.stop()
+        box.blockSignals(True)
+        box.setChecked(True)
+        box.setCheckable(False)
+        box.blockSignals(False)
+        box.setTitle(title or str(getattr(box, "_drawer_title", box.title())).lstrip("▾▸ "))
+        box.setMaximumHeight(16777215)
+        layout = box.layout()
+        if layout is not None:
+            for index in range(layout.count()):
+                item = layout.itemAt(index)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setVisible(not bool(widget.property("drawerHidden")))
+                elif item.layout() is not None:
+                    item.layout().setEnabled(True)
+        box.setVisible(True)
 
     def _set_group_collapsible(self, box: QGroupBox, checked: bool = True):
         base_title = box.title()
@@ -3168,8 +4431,8 @@ class SmartFitterMainWindow(QMainWindow):
         box.setTitle(f"{'▾' if checked else '▸'}  {base_title}")
         box.setToolTip(f"Click the title to {'collapse' if checked else 'expand'} this section.")
         box._drawer_anim = QPropertyAnimation(box, b"maximumHeight", box)
-        box._drawer_anim.setDuration(0)
-        box._drawer_anim.setEasingCurve(QEasingCurve.Linear)
+        box._drawer_anim.setDuration(0 if self._reduce_motion else 160)
+        box._drawer_anim.setEasingCurve(QEasingCurve.OutCubic)
         box._drawer_finish_connected = False
 
         def set_children_visible(state: bool):
@@ -3189,6 +4452,7 @@ class SmartFitterMainWindow(QMainWindow):
             box.setToolTip(f"Click the title to {'collapse' if state else 'expand'} this section.")
             collapsed_h = 30
             box._drawer_anim.stop()
+            box._drawer_anim.setDuration(0 if self._reduce_motion else 160)
             if getattr(box, "_drawer_finish_connected", False):
                 try:
                     box._drawer_anim.finished.disconnect()
@@ -3246,6 +4510,9 @@ class SmartFitterMainWindow(QMainWindow):
             self.scan_linecut_combo: "For 2D scans, draw a horizontal or vertical linecut through the cursor or best point.",
             self.scan_secondary_combo: "For 1D scans, overlay a second observable on the right axis.",
             self.batch_mode_combo: "Observable used for every file in a batch run.",
+            self.batch_detector_combo: "Process both available detector streams by default, or restrict the batch to one stable detector ID.",
+            self.batch_detector1_label_edit: "Presentation label written to Detector 1 plots, JSON, and CSV outputs.",
+            self.batch_detector2_label_edit: "Presentation label written to Detector 2 plots, JSON, and CSV outputs.",
             self.batch_model_combo: "Force one model family for batch files, or leave on Auto-detect.",
             self.batch_run_btn: "Run batch fitting on the input folder and write outputs to the output folder.",
         }
@@ -3256,8 +4523,34 @@ class SmartFitterMainWindow(QMainWindow):
     def _apply_figure_size(self):
         self.plot_opts.fig_width = float(self.fig_w_spin.value())
         self.plot_opts.fig_height = float(self.fig_h_spin.value())
+        if not self._loading_preferences and self.sender() in {self.fig_w_spin, self.fig_h_spin}:
+            self.plot_opts.export_size_mode = "custom"
         self.fig.set_size_inches(self.plot_opts.fig_width, self.plot_opts.fig_height, forward=True)
         self.canvas.draw_idle()
+
+    def _automatic_export_size(self) -> tuple[float, float]:
+        trace = self.ctx.trace
+        if trace is not None and trace.scan_dim == "scan2d":
+            return (11.0, 5.5) if self._comparison_trace() is not None else (6.5, 6.0)
+        return PRESENTATION_FIGURE_WIDTH, PRESENTATION_FIGURE_HEIGHT
+
+    def _resolved_export_size(self) -> tuple[float, float]:
+        if self.plot_opts.export_size_mode == "auto":
+            return self._automatic_export_size()
+        return float(self.plot_opts.fig_width), float(self.plot_opts.fig_height)
+
+    def _restore_automatic_export_size(self) -> None:
+        self.plot_opts.export_size_mode = "auto"
+        width, height = self._automatic_export_size()
+        self._loading_preferences = True
+        try:
+            self.fig_w_spin.setValue(width)
+            self.fig_h_spin.setValue(height)
+        finally:
+            self._loading_preferences = False
+        self.plot_opts.fig_width = width
+        self.plot_opts.fig_height = height
+        self.statusBar().showMessage(f"Automatic figure size: {width:g} × {height:g} in", 3000)
 
     def _apply_plot_controls_to_state(self):
         self.plot_opts.show_data = self.show_data_chk.isChecked()
@@ -3310,15 +4603,23 @@ class SmartFitterMainWindow(QMainWindow):
                 ),
                 (self.quick_signal_btn, self.show_signal_layer_chk.isChecked()),
                 (self.quick_reference_btn, self.show_reference_layer_chk.isChecked()),
+                (self.quick_compare_detectors_btn, self.compare_detectors_chk.isChecked()),
                 (self.quick_difference_btn, self.show_difference_layer_chk.isChecked()),
                 (self.quick_iterations_btn, self.show_iteration_layer_chk.isChecked()),
                 (self.quick_mean_btn, self.show_iteration_mean_chk.isChecked()),
                 (self.quick_std_btn, self.show_iteration_std_chk.isChecked()),
+                (self.quick_residual_btn, self.show_residual_chk.isChecked()),
+                (self.quick_confidence_btn, self.show_confidence_chk.isChecked()),
+                (self.quick_peaks_btn, self.show_peaks_chk.isChecked()),
+                (self.quick_envelope_btn, self.show_rabi_envelope_chk.isChecked()),
+                (self.quick_fft_btn, self.show_fft_panel_chk.isChecked()),
             )
             for button, checked in pairs:
                 button.setChecked(bool(checked))
             self.quick_std_mode_combo.setCurrentText(self.iteration_std_mode_combo.currentText())
             has_iterations = self._iteration_count() > 0
+            has_dual_detectors = bool(self._primary_dataset is not None and len(self._primary_dataset.available_detectors) > 1)
+            self.quick_compare_detectors_btn.setEnabled(has_dual_detectors)
             for widget in (
                 self.quick_iterations_btn,
                 self.quick_mean_btn,
@@ -3329,6 +4630,47 @@ class SmartFitterMainWindow(QMainWindow):
                 widget.setEnabled(has_iterations)
         finally:
             self._syncing_plot_controls = False
+        self._update_plot_more_menu()
+        self._update_plot_quick_visibility()
+
+    def _update_plot_quick_visibility(self) -> None:
+        """Keep every relevant plot control visible without showing inapplicable chrome."""
+        if not hasattr(self, "quick_data_btn"):
+            return
+        trace = self.ctx.trace
+        loaded = trace is not None
+        fit_allowed = bool(loaded and trace.fit_allowed)
+        is_scan2d = bool(loaded and trace.scan_dim == "scan2d")
+        is_rabi = bool(loaded and trace.experiment_type in {"Rabi", "DEERDuration"})
+        is_odmr = bool(loaded and trace.experiment_type in {"ODMR", "DEERFrequency"})
+        has_iterations = bool(loaded and self._iteration_count() > 0 and not is_scan2d)
+        has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        visibility = {
+            self.quick_data_btn: loaded,
+            self.quick_fit_btn: fit_allowed,
+            self.quick_smooth_btn: loaded and not is_scan2d,
+            self.quick_legend_btn: loaded,
+            self.quick_annotation_btn: fit_allowed,
+            self.quick_residual_btn: fit_allowed,
+            self.quick_confidence_btn: fit_allowed,
+            self.quick_signal_btn: loaded and not is_scan2d,
+            self.quick_reference_btn: loaded and not is_scan2d,
+            self.quick_difference_btn: loaded and not is_scan2d,
+            self.quick_compare_detectors_btn: loaded and has_dual,
+            self.quick_iterations_btn: has_iterations,
+            self.quick_mean_btn: has_iterations,
+            self.quick_std_btn: has_iterations,
+            self.quick_iteration_select_btn: has_iterations,
+            self.quick_peaks_btn: is_odmr,
+            self.quick_envelope_btn: is_rabi,
+            self.quick_fft_btn: fit_allowed,
+            self.quick_edit_plot_btn: loaded,
+            self.copy_figure_btn: loaded,
+        }
+        for widget, visible in visibility.items():
+            widget.setVisible(bool(visible))
+        self.quick_more_btn.setVisible(False)
+        self._relayout_plot_quick_toolbar()
 
     def _on_quick_data_toggled(self, checked: bool):
         if not self._syncing_plot_controls:
@@ -3357,6 +4699,10 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_quick_reference_toggled(self, checked: bool):
         if not self._syncing_plot_controls:
             self.show_reference_layer_chk.setChecked(checked)
+
+    def _on_quick_compare_detectors_toggled(self, checked: bool):
+        if not self._syncing_plot_controls:
+            self.compare_detectors_chk.setChecked(checked)
 
     def _on_quick_difference_toggled(self, checked: bool):
         if not self._syncing_plot_controls:
@@ -3409,6 +4755,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.plot_opts.annotation_mode = mode
         self.presentation_state.annotation_style.mode = mode
         self.presentation_state.annotation_style.visible = bool(visible)
+        if visible and not self._annotation_lines(context="plot") and self.ctx.trace is not None:
+            file_override = self.presentation_state.annotations.setdefault("file", AnnotationOverride())
+            file_override.show_plot = True
         self._sync_quick_toolbar_from_state()
         if refresh and self.ctx.trace is not None:
             self._refresh_plot_only()
@@ -3512,6 +4861,8 @@ class SmartFitterMainWindow(QMainWindow):
         warnings = metadata.get("warnings")
         lines = [
             trace.file_name,
+            f"Active detector: {self._detector_label(trace.detector_id)} ({trace.detector_id})",
+            "Available detectors: " + ", ".join(self._detector_label(value) for value in trace.available_detectors),
             f"Detected experiment: {self._experiment_display_name(trace.experiment_type)}",
             f"Scan type: {trace.scan_dim}",
             f"Axes: {', '.join(trace.scan_axes) if trace.scan_axes else trace.x_label}",
@@ -3551,7 +4902,16 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is None:
             return
         self._update_metadata_status_panel(self.ctx.trace)
-        self.summary_text.setPlainText("\n".join(self._trace_summary_lines(self.ctx.trace)))
+        trace = self.ctx.trace
+        if trace.fit_allowed:
+            self.summary_text.setPlainText(
+                f"Ready to fit {self._detector_label(trace.detector_id)}.\n"
+                f"{self._experiment_display_name(trace.experiment_type)} · "
+                f"{self._friendly_mode_name(self._current_data_mode()).title()} · {len(trace.x_ns)} points\n"
+                "Choose the model and fit range below, then run Fit or Robust Fit."
+            )
+        else:
+            self.summary_text.clear()
 
     def _update_metadata_status_panel(self, trace: ExperimentTrace):
         metadata = trace.metadata or {}
@@ -3561,7 +4921,7 @@ class SmartFitterMainWindow(QMainWindow):
         save_type = str(metadata.get("save_type", "unknown"))
         scan_state = "fit" if trace.fit_allowed else "plot-only"
         bits = [
-            f"{self._experiment_display_name(trace.experiment_type)} | {trace.scan_dim} | {scan_state}",
+            f"{self._detector_label(trace.detector_id)} | {self._experiment_display_name(trace.experiment_type)} | {trace.scan_dim} | {scan_state}",
             f"run={run_status}",
             f"save={save_type}",
         ]
@@ -3575,6 +4935,41 @@ class SmartFitterMainWindow(QMainWindow):
         else:
             self.metadata_progress_bar.setValue(0)
             self.metadata_progress_bar.setFormat("iterations unavailable")
+        self._update_data_info_strip()
+
+    def _update_data_info_strip(self) -> None:
+        if not hasattr(self, "data_info_lbl"):
+            return
+        trace = self.ctx.trace
+        if trace is None:
+            self.data_info_lbl.setText("No file loaded")
+            self.data_info_lbl.setToolTip("")
+            return
+        metadata = trace.metadata or {}
+        if trace.scan_dim == "scan2d" and trace.z2d is not None:
+            shape = np.asarray(trace.z2d).shape
+            size_text = f"{shape[1]} × {shape[0]} map" if len(shape) == 2 else "2D map"
+        else:
+            size_text = f"{len(trace.x_ns)} points"
+        completed = metadata.get("completed_iterations")
+        target = metadata.get("target_iterations")
+        iteration_text = ""
+        if completed is not None or target is not None:
+            iteration_text = f" · iterations {completed if completed is not None else '?'} / {target if target is not None else '?'}"
+        has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        scope = ""
+        if has_dual:
+            scope = " · both detectors" if self._detector_scope_is_both() else f" · {self._detector_label(trace.detector_id)}"
+        run_status = str(metadata.get("run_status", "unknown"))
+        status_text = self.ctx.status
+        if self.ctx.status in {"WARN", "FAIL"} and self.ctx.status_reason:
+            status_text += f": {self.ctx.status_reason}"
+        self.data_info_lbl.setText(
+            f"{trace.file_name}  ·  {self._experiment_display_name(trace.experiment_type)}  ·  "
+            f"{self._friendly_mode_name(self._current_data_mode()).title()}  ·  {size_text}{scope}  ·  "
+            f"{run_status}{iteration_text}  ·  {status_text}"
+        )
+        self.data_info_lbl.setToolTip("\n".join(self._trace_summary_lines(trace)))
 
     def _recommended_mode_for_profile(self, profile: FitProfile) -> str:
         if profile.name == "ODMR":
@@ -3590,6 +4985,291 @@ class SmartFitterMainWindow(QMainWindow):
     def _friendly_mode_name(self, mode: str) -> str:
         return "signal" if mode == "raw_signal" else mode
 
+    def _active_detector_id(self) -> str:
+        if hasattr(self, "detector_combo") and self.detector_combo.currentData():
+            return str(self.detector_combo.currentData())
+        if self.ctx.trace is not None:
+            return str(getattr(self.ctx.trace, "detector_id", "detector1"))
+        return "detector1"
+
+    def _detector_label(self, detector_id: str) -> str:
+        return self._detector_labels.get(detector_id, DETECTOR_LABELS.get(detector_id, detector_id))
+
+    def _apply_detector_labels(self) -> None:
+        for dataset in self._loaded_datasets.values():
+            for detector_id, trace in dataset.detectors.items():
+                label = self._detector_label(detector_id)
+                trace.detector_label = label
+                metadata = dict(trace.metadata or {})
+                metadata["detector_label"] = label
+                metadata["detector_labels"] = dict(self._detector_labels)
+                trace.metadata = metadata
+
+    def _refresh_detector_controls(self, preferred: str | None = None) -> None:
+        if not hasattr(self, "detector_combo"):
+            return
+        detector_ids = self._primary_dataset.available_detectors if self._primary_dataset is not None else ("detector1",)
+        current = preferred or self._active_detector_id()
+        self._syncing_detector_controls = True
+        try:
+            self.detector_combo.clear()
+            for detector_id in detector_ids:
+                label = self._detector_label(detector_id)
+                suffix = "" if self._primary_dataset is None or detector_id in self._primary_dataset.detectors else " (no valid data)"
+                self.detector_combo.addItem(label + suffix, detector_id)
+                index = self.detector_combo.count() - 1
+                self.detector_combo.model().item(index).setEnabled(
+                    self._primary_dataset is None or detector_id in self._primary_dataset.detectors
+                )
+            index = self.detector_combo.findData(current)
+            if index < 0 or (self._primary_dataset is not None and current not in self._primary_dataset.detectors):
+                index = next(
+                    (i for i in range(self.detector_combo.count()) if self._primary_dataset is None or str(self.detector_combo.itemData(i)) in self._primary_dataset.detectors),
+                    0,
+                )
+            self.detector_combo.setCurrentIndex(index)
+            has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+            self.detector_combo.setEnabled(has_dual)
+            self.edit_detector_labels_btn.setEnabled(has_dual)
+            self.compare_detectors_chk.setEnabled(has_dual and self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+            if hasattr(self, "detector_scope_combo"):
+                self.detector_scope_combo.setEnabled(has_dual and self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+                if not self.detector_scope_combo.isEnabled():
+                    self.detector_scope_combo.setCurrentIndex(0)
+            if not self.compare_detectors_chk.isEnabled():
+                self.compare_detectors_chk.setChecked(False)
+        finally:
+            self._syncing_detector_controls = False
+        detector_visible = bool(has_dual and self._responsive_layout_mode != "plot")
+        expanded = self._responsive_layout_mode == "expanded"
+        self.detector_combo.setVisible(detector_visible)
+        self.detector_strip_label.setVisible(detector_visible and expanded)
+        if hasattr(self, "detector_scope_combo"):
+            self.detector_scope_combo.setVisible(detector_visible)
+            self.detector_scope_label.setVisible(detector_visible and expanded)
+        self.edit_detector_labels_btn.setVisible(has_dual)
+        self.compare_detectors_chk.setVisible(has_dual)
+        if hasattr(self, "detector_labels_btn"):
+            self.detector_labels_btn.setVisible(False)
+        self._sync_quick_toolbar_from_state()
+
+    def _comparison_trace(self) -> ExperimentTrace | None:
+        if (
+            self._primary_dataset is None
+            or not hasattr(self, "compare_detectors_chk")
+            or not self.compare_detectors_chk.isChecked()
+        ):
+            return None
+        active = self._active_detector_id()
+        for detector_id in self._primary_dataset.available_detectors:
+            if detector_id != active and detector_id in self._primary_dataset.detectors:
+                return self._primary_dataset.detectors[detector_id]
+        return None
+
+    def _canonical_scan_traces(self) -> tuple[ExperimentTrace, ExperimentTrace | None]:
+        """Return plot traces in stable detector order, independent of focus."""
+        active = self.ctx.trace
+        if active is None or self._primary_dataset is None:
+            return active, None
+        if not self.compare_detectors_chk.isChecked():
+            return active, None
+        ordered = [
+            self._primary_dataset.detectors[detector_id]
+            for detector_id in self._primary_dataset.available_detectors
+            if detector_id in self._primary_dataset.detectors
+            and self._primary_dataset.detectors[detector_id].scan_dim == "scan2d"
+        ]
+        if len(ordered) >= 2 and active.scan_dim == "scan2d":
+            return ordered[0], ordered[1]
+        return active, self._comparison_trace()
+
+    def _scan_trace_for_axis(self, axis) -> ExperimentTrace | None:
+        if self.ctx.trace is None:
+            return None
+        primary, secondary = self._canonical_scan_traces()
+        if axis is self.ax_main:
+            return primary
+        if axis is self._detector_compare_ax:
+            return secondary
+        return self.ctx.trace
+
+    def _counterpart_scan_trace(self, trace: ExperimentTrace | None) -> ExperimentTrace | None:
+        """Return the other plotted detector for a source map/readout."""
+        if trace is None or not self.compare_detectors_chk.isChecked():
+            return self._comparison_trace()
+        primary, secondary = self._canonical_scan_traces()
+        if primary is not None and secondary is not None:
+            if trace.detector_id == primary.detector_id:
+                return secondary
+            if trace.detector_id == secondary.detector_id:
+                return primary
+        other = self._comparison_trace()
+        return None if other is not None and other.detector_id == trace.detector_id else other
+
+    def _edit_detector_labels(self) -> None:
+        detector_ids = self._primary_dataset.available_detectors if self._primary_dataset is not None else ("detector1",)
+        dialog = DetectorLabelsDialog(self, self._detector_labels, detector_ids)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        active = self._active_detector_id()
+        self._detector_labels.update(dialog.labels())
+        self._apply_detector_labels()
+        self._refresh_detector_controls(active)
+        self.ctx.dirty = True
+        self._show_loaded_trace_summary()
+        self._populate_spot_table()
+        self._refresh_plot_only()
+
+    def _sync_loaded_traces_for_detector(self, detector_id: str) -> list[str]:
+        warnings: list[str] = []
+        traces: dict[str, ExperimentTrace] = {}
+        for name, dataset in self._loaded_datasets.items():
+            trace = dataset.detectors.get(detector_id)
+            if trace is None:
+                if dataset is not self._primary_dataset:
+                    warnings.append(f"{name} has no valid {self._detector_label(detector_id)} stream and was skipped.")
+                continue
+            traces[name] = trace
+        self.ctx.loaded_traces = traces
+        return warnings
+
+    def _detector_scope_is_both(self) -> bool:
+        return bool(
+            hasattr(self, "detector_scope_combo")
+            and self.detector_scope_combo.currentData() == "both"
+            and self._primary_dataset is not None
+            and len(self._primary_dataset.detectors) > 1
+        )
+
+    def _on_detector_scope_changed(self, _index: int) -> None:
+        if self._detector_scope_is_both() and self._primary_dataset is not None:
+            self.compare_detectors_chk.setChecked(True)
+            self.statusBar().showMessage("Shared analysis will apply to both detector streams", 4000)
+        else:
+            self.statusBar().showMessage("Analysis will apply to the active detector", 3000)
+        self._update_data_info_strip()
+
+    def _store_active_detector_state(self) -> None:
+        trace = self.ctx.trace
+        if trace is None:
+            return
+        self._detector_analysis_states[trace.detector_id] = DetectorAnalysisState(
+            fit_result=self.ctx.fit_result,
+            fit_target=None if self.ctx.fit_target is None else np.asarray(self.ctx.fit_target, dtype=float).copy(),
+            fit_signature=self.ctx.fit_signature,
+            status=self.ctx.status,
+            status_reason=self.ctx.status_reason,
+            odmr_peaks=None if self.ctx.odmr_peaks is None else np.asarray(self.ctx.odmr_peaks, dtype=float).copy(),
+            pending_locks=dict(self.ctx.pending_locks),
+            summary=self.summary_text.toPlainText() if hasattr(self, "summary_text") else "",
+        )
+
+    def _restore_detector_state(self, detector_id: str) -> bool:
+        state = self._detector_analysis_states.get(detector_id)
+        if state is None:
+            self.ctx.fit_result = None
+            self.ctx.fit_target = None
+            self.ctx.fit_signature = None
+            self.ctx.odmr_peaks = None
+            self.ctx.status = "N/A"
+            self.ctx.status_reason = ""
+            return False
+        self.ctx.fit_result = state.fit_result
+        self.ctx.fit_target = None if state.fit_target is None else state.fit_target.copy()
+        self.ctx.fit_signature = state.fit_signature
+        self.ctx.odmr_peaks = None if state.odmr_peaks is None else state.odmr_peaks.copy()
+        self.ctx.pending_locks = dict(state.pending_locks or {})
+        self.ctx.status = state.status
+        self.ctx.status_reason = state.status_reason
+        if state.summary:
+            self.summary_text.setPlainText(state.summary)
+        self._set_status(state.status, state.status_reason)
+        if state.fit_result is not None:
+            self._populate_param_table(state.fit_result.param_names, state.fit_result.params)
+            self._plot_fit(state.fit_result, self.ctx.fit_target if self.ctx.fit_target is not None else self.ctx.y)
+            return True
+        return False
+
+    def _invalidate_detector_states(self, detector_ids: list[str] | tuple[str, ...] | None = None) -> None:
+        ids = list(detector_ids) if detector_ids is not None else list(self._detector_analysis_states)
+        for detector_id in ids:
+            self._detector_analysis_states.pop(detector_id, None)
+
+    def _activate_detector(self, detector_id: str, *, refresh: bool = True) -> bool:
+        if self._primary_dataset is None or detector_id not in self._primary_dataset.detectors:
+            return False
+        target_trace = self._primary_dataset.detectors[detector_id]
+        if hasattr(self, "detector_combo") and self.detector_combo.currentData() != detector_id:
+            index = self.detector_combo.findData(detector_id)
+            if index >= 0:
+                self.detector_combo.blockSignals(True)
+                self.detector_combo.setCurrentIndex(index)
+                self.detector_combo.blockSignals(False)
+        target_is_reference_only = self._trace_is_reference_only(target_trace)
+        current_mode = self._current_data_mode()
+        if (
+            (current_mode == "contrast" and target_is_reference_only)
+            or (current_mode == "reference" and self._auto_reference_fallback and not target_is_reference_only)
+        ):
+            return bool(
+                self._load_file(
+                    target_trace.source_path,
+                    preserve_analysis=True,
+                    preferred_detector_id=detector_id,
+                )
+            )
+        if self.ctx.trace is not None and self.ctx.trace.detector_id != detector_id:
+            self._store_active_detector_state()
+        if hasattr(self, "scan_vmin_edit") and self.ctx.trace is not None:
+            self._detector_map_limits[self.ctx.trace.detector_id] = (self.scan_vmin_edit.text(), self.scan_vmax_edit.text())
+        checked_overlays = self._checked_overlay_names() if hasattr(self, "overlay_list") else set()
+        self.ctx.trace = self._primary_dataset.detectors[detector_id]
+        overlay_warnings = self._sync_loaded_traces_for_detector(detector_id)
+        self.ctx.fit_result = None
+        self.ctx.fit_target = None
+        self.ctx.fit_signature = None
+        self.ctx.odmr_peaks = None
+        self._active_fit_request = None
+        self._iteration_selection_source = None
+        self._update_overlay_widgets(checked_overlays)
+        self._update_iteration_controls()
+        limits = self._detector_map_limits.get(detector_id)
+        if limits is not None:
+            self.scan_vmin_edit.setText(limits[0])
+            self.scan_vmax_edit.setText(limits[1])
+        self._update_contextual_visibility()
+        self._update_profile_hint()
+        self._show_loaded_trace_summary()
+        if refresh:
+            self._activating_detector = True
+            try:
+                self._refresh_processed()
+            finally:
+                self._activating_detector = False
+            if not self._restore_detector_state(detector_id):
+                self._plot_raw()
+        self._populate_spot_table()
+        if overlay_warnings:
+            self.statusBar().showMessage(overlay_warnings[0], 6000)
+            self._message("Overlay warnings", "\n".join(overlay_warnings))
+        return True
+
+    def _on_detector_changed(self, _index: int) -> None:
+        if self._syncing_detector_controls or self._is_loading or self._primary_dataset is None:
+            return
+        detector_id = self._active_detector_id()
+        if self._activate_detector(detector_id):
+            self.ctx.dirty = True
+            self.statusBar().showMessage(f"Active detector: {self._detector_label(detector_id)}", 4000)
+
+    def _on_compare_detectors_toggled(self, _checked: bool) -> None:
+        if self._syncing_detector_controls:
+            return
+        self._sync_quick_toolbar_from_state()
+        if self.ctx.trace is not None:
+            self.ctx.dirty = True
+            self._refresh_plot_only()
+
     def _experiment_display_name(self, experiment_type: str) -> str:
         return {"Scan2D": "2D Scan", "LineScan": "1D Scan"}.get(experiment_type, experiment_type)
 
@@ -3602,7 +5282,9 @@ class SmartFitterMainWindow(QMainWindow):
         recommended_model = profile.candidate_models[0] if profile.candidate_models else "n/a"
         current_mode = self._friendly_mode_name(self._current_data_mode())
         override_note = "manual override" if self._mode_override_active else "profile default"
-        self.profile_hint_lbl.setText(f"Detected {self._experiment_display_name(self.ctx.trace.experiment_type)} • {current_mode} • {recommended_model}")
+        self.profile_hint_lbl.setText(
+            f"{self._detector_label(self.ctx.trace.detector_id)} • Detected {self._experiment_display_name(self.ctx.trace.experiment_type)} • {current_mode} • {recommended_model}"
+        )
         self.profile_hint_lbl.setToolTip(
             f"Recommended mode: {recommended_mode}. Recommended model: {recommended_model}. Current mode uses {override_note}."
         )
@@ -3694,7 +5376,11 @@ class SmartFitterMainWindow(QMainWindow):
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
         is_fit_trace = bool(self.ctx.trace is not None and self.ctx.trace.fit_allowed)
         fit_enabled = bool(is_fit_trace and self.ctx.trace is not None and self._active_fit_request is None)
+        if hasattr(self, "file_details_btn"):
+            self.file_details_btn.setVisible(self.ctx.trace is not None and self._responsive_layout_mode == "expanded")
         self.strategy_box.setVisible(is_fit_trace)
+        if hasattr(self, "fit_actions"):
+            self.fit_actions.setVisible(is_fit_trace)
         self.command_fit_btn.setVisible(is_fit_trace)
         self.command_fit_btn.setEnabled(fit_enabled)
         self.btn_fit.setEnabled(fit_enabled)
@@ -3702,6 +5388,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_save.setEnabled(self.ctx.trace is not None)
         self.scan_tools_box.setVisible(is_scan)
         self.param_box.setVisible(is_fit_trace)
+        self.results_box.setVisible(is_fit_trace)
         self.scan_help_lbl.setVisible(False)
         self.scan_linecut_lbl.setVisible(is_scan2d)
         self.scan_linecut_combo.setVisible(is_scan2d)
@@ -3709,6 +5396,65 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_secondary_combo.setVisible(is_scan1d)
         if hasattr(self, "scan_quick_bar"):
             self.scan_quick_bar.setVisible(is_scan2d)
+        if hasattr(self, "scan_spot_box"):
+            self.scan_spot_box.setVisible(is_scan2d)
+        if hasattr(self, "spot_compare_btn"):
+            has_dual_scan = bool(
+                self._primary_dataset is not None
+                and len(self._primary_dataset.available_detectors) > 1
+                and any(
+                    trace.scan_dim == "scan2d"
+                    for trace in self._primary_dataset.detectors.values()
+                )
+            )
+            self.spot_compare_btn.setEnabled(has_dual_scan)
+        if hasattr(self, "plot_box"):
+            is_rabi = bool(self.ctx.trace is not None and self.ctx.trace.experiment_type in {"Rabi", "DEERDuration"})
+            is_odmr = bool(self.ctx.trace is not None and self.ctx.trace.experiment_type in {"ODMR", "DEERFrequency"})
+            has_iterations = bool(self.ctx.trace is not None and self._iteration_count() > 0 and not is_scan2d)
+            self.plot_box.setVisible(self.ctx.trace is not None)
+            self.annotation_box.setVisible(is_fit_trace)
+            for widget, visible in (
+                (self.show_data_chk, self.ctx.trace is not None),
+                (self.show_smoothed_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_fit_chk, is_fit_trace),
+                (self.show_rabi_envelope_chk, is_fit_trace and is_rabi),
+                (self.show_peaks_chk, is_odmr),
+                (self.show_residual_chk, is_fit_trace),
+                (self.show_fft_panel_chk, is_fit_trace),
+                (self.show_confidence_chk, is_fit_trace),
+                (self.show_signal_layer_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_reference_layer_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_difference_layer_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_iteration_layer_chk, has_iterations),
+                (self.show_iteration_mean_chk, has_iterations),
+                (self.show_iteration_std_chk, has_iterations),
+                (self.iteration_select_btn, has_iterations),
+                (self.iteration_summary_lbl, has_iterations),
+                (self.hide_failed_iterations_chk, has_iterations),
+                (self.iteration_std_mode_combo, has_iterations),
+                (self.iteration_control_label, has_iterations),
+                (self.iteration_std_mode_label, has_iterations),
+            ):
+                widget.setVisible(bool(visible))
+        if hasattr(self, "inspector_tabs"):
+            visible_tabs = {
+                "setup": is_fit_trace,
+                "processing": self.ctx.trace is not None,
+                "parameters": is_fit_trace,
+                "results": is_fit_trace,
+                "plot": self.ctx.trace is not None,
+                "map": is_scan,
+                "export": self.ctx.trace is not None,
+            }
+            for name, visible in visible_tabs.items():
+                self.inspector_tabs.setTabVisible(self.inspector_tab_indices[name], bool(visible))
+            current = self.inspector_tabs.currentIndex()
+            if current < 0 or not self.inspector_tabs.isTabVisible(current):
+                preferred = "map" if is_scan else ("setup" if is_fit_trace else "processing")
+                index = self.inspector_tab_indices[preferred]
+                if self.inspector_tabs.isTabVisible(index):
+                    self.inspector_tabs.setCurrentIndex(index)
         for widget in getattr(self, "fit_export_widgets", []):
             widget.setVisible(False if widget.property("drawerHidden") else is_fit_trace)
         if is_scan2d:
@@ -3717,6 +5463,11 @@ class SmartFitterMainWindow(QMainWindow):
         else:
             self.exp_report_png_chk.setVisible(is_fit_trace)
             self.exp_report_pdf_chk.setVisible(is_fit_trace)
+        self._update_report_controls_visibility()
+        self._update_plot_more_menu()
+        self._update_plot_quick_visibility()
+        self._update_plot_surface_ratio()
+        self._update_data_info_strip()
 
     def _effective_trace_metadata(self) -> dict[str, object]:
         if self.ctx.trace is None:
@@ -3728,6 +5479,7 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_mode_changed(self, *_args):
         if self.ctx.trace is None or self._is_loading:
             return
+        self._auto_reference_fallback = False
         self._mode_override_active = True
         self._update_profile_hint()
         self._reload_current_file()
@@ -3738,8 +5490,8 @@ class SmartFitterMainWindow(QMainWindow):
         elif self.ctx.trace is not None:
             self._show_loaded_trace_summary()
 
-    def _refresh_plot_only(self):
-        view_state = None if self._overlay_view_dirty else self._capture_view_state()
+    def _refresh_plot_only(self, *, preserve_view: bool = True):
+        view_state = None if self._overlay_view_dirty or not preserve_view else self._capture_view_state()
         self._apply_plot_controls_to_state()
         if self.ctx.fit_result is not None and self.ctx.y is not None:
             plot_y = self.ctx.fit_target if self.ctx.fit_target is not None else self.ctx.y
@@ -3828,10 +5580,18 @@ class SmartFitterMainWindow(QMainWindow):
         state.annotation_style.location = str(self.plot_opts.annotation_loc)
         state.annotation_style.font_size = int(self.plot_opts.annotation_font_size)
 
-    def _open_plot_editor(self, _checked: bool = False, *, section: str = "series", axis_role: str | None = None, dimension: str | None = None) -> None:
+    def _open_plot_editor(
+        self,
+        _checked: bool = False,
+        *,
+        section: str = "series",
+        axis_role: str | None = None,
+        dimension: str | None = None,
+        series_id: str | None = None,
+    ) -> None:
         if self.plot_editor is None:
             self.plot_editor = PlotEditorDialog(self)
-        self.plot_editor.open_for(section, axis_role=axis_role, dimension=dimension)
+        self.plot_editor.open_for(section, axis_role=axis_role, dimension=dimension, series_id=series_id)
 
     def _on_presentation_changed(self) -> None:
         self._applying_presentation_change = True
@@ -3909,6 +5669,10 @@ class SmartFitterMainWindow(QMainWindow):
             roles.append(self._detail_axis_role)
         if self._scan_colorbar_ax is not None and self._scan_colorbar_ax.get_visible():
             roles.append("colorbar")
+        if self._detector_compare_ax is not None and self._detector_compare_ax.get_visible():
+            roles.append("detector_compare")
+        if self._detector_compare_colorbar_ax is not None and self._detector_compare_colorbar_ax.get_visible():
+            roles.append("detector_compare_colorbar")
         return list(dict.fromkeys(roles))
 
     def _save_preferences(self):
@@ -3916,9 +5680,13 @@ class SmartFitterMainWindow(QMainWindow):
         if self.main_splitter is not None:
             self.settings.setValue("layout/main_splitter_sizes", self.main_splitter.sizes())
         s = self.settings
-        s.setValue("ui/version", 7)
+        s.setValue("ui/version", 9)
+        s.setValue("ui/reduce_motion", self._reduce_motion)
+        s.setValue("ui/files_drawer_open", self._preferred_files_open)
+        s.setValue("ui/inspector_drawer_open", self._preferred_inspector_open)
         s.setValue("plot/fig_width", self.plot_opts.fig_width)
         s.setValue("plot/fig_height", self.plot_opts.fig_height)
+        s.setValue("plot/export_size_mode", self.plot_opts.export_size_mode)
         s.setValue("plot/save_dpi", self.plot_opts.save_dpi)
         s.setValue("plot/show_residual", self.plot_opts.show_residual)
         s.setValue("plot/show_legend", self.plot_opts.show_legend)
@@ -3952,7 +5720,7 @@ class SmartFitterMainWindow(QMainWindow):
         s.setValue("scan/color_scale", self.scan_scale_combo.currentText())
         s.setValue("scan/reverse_colormap", self.scan_reverse_chk.isChecked())
         s.setValue("scan/swap_axes", self.scan_swap_axes_chk.isChecked())
-        s.setValue("scan/equal_aspect", self.scan_equal_aspect_chk.isChecked())
+        s.setValue("scan/pixel_geometry", self.scan_pixel_geometry_combo.currentText())
         s.setValue("scan/color_min", self.scan_vmin_edit.text())
         s.setValue("scan/color_max", self.scan_vmax_edit.text())
         s.setValue("scan/lower_percentile", self.scan_low_percentile_spin.value())
@@ -3971,6 +5739,10 @@ class SmartFitterMainWindow(QMainWindow):
     def _load_preferences(self):
         s = self.settings
         ui_version = int(s.value("ui/version", 0))
+        self._loading_preferences = True
+        self._reduce_motion = str(s.value("ui/reduce_motion", "false")).lower() == "true"
+        self._preferred_files_open = str(s.value("ui/files_drawer_open", "true")).lower() != "false"
+        self._preferred_inspector_open = str(s.value("ui/inspector_drawer_open", "true")).lower() != "false"
         # Migrate the old factory plot defaults without overwriting a user's
         # deliberate figure-size, DPI, or trace-style choice.
         if ui_version < 5:
@@ -4011,6 +5783,23 @@ class SmartFitterMainWindow(QMainWindow):
                 s.setValue("plot/plot_style", "Line + scatter")
             if str(s.value("plot/show_rabi_envelope", "true")).lower() == "true":
                 s.setValue("plot/show_rabi_envelope", False)
+        if ui_version < 8:
+            # Equal physical scaling is now the factory map default. Earlier
+            # releases stored the old default (False), so migrate it once.
+            s.setValue("scan/equal_aspect", True)
+        if ui_version < 9:
+            try:
+                saved_width = float(s.value("plot/fig_width", PRESENTATION_FIGURE_WIDTH))
+                saved_height = float(s.value("plot/fig_height", PRESENTATION_FIGURE_HEIGHT))
+                migrated_mode = (
+                    "auto"
+                    if np.isclose(saved_width, PRESENTATION_FIGURE_WIDTH) and np.isclose(saved_height, PRESENTATION_FIGURE_HEIGHT)
+                    else "custom"
+                )
+            except (TypeError, ValueError):
+                migrated_mode = "auto"
+            s.setValue("plot/export_size_mode", migrated_mode)
+        self.plot_opts.export_size_mode = str(s.value("plot/export_size_mode", "auto"))
         self.fig_w_spin.setValue(float(s.value("plot/fig_width", self.plot_opts.fig_width)))
         self.fig_h_spin.setValue(float(s.value("plot/fig_height", self.plot_opts.fig_height)))
         self.save_dpi_spin.setValue(int(s.value("plot/save_dpi", self.plot_opts.save_dpi)))
@@ -4053,19 +5842,18 @@ class SmartFitterMainWindow(QMainWindow):
             scan_scale = "Robust percentiles"
         scan_reverse = str(s.value("scan/reverse_colormap", "false")).lower() == "true"
         scan_swap = str(s.value("scan/swap_axes", "true")).lower() != "false" if ui_version >= 4 else True
-        scan_equal = str(s.value("scan/equal_aspect", "false")).lower() == "true" if ui_version >= 3 else False
+        saved_geometry = s.value("scan/pixel_geometry", None)
+        if saved_geometry is None:
+            saved_geometry = "Physical pixel size" if str(s.value("scan/equal_aspect", "true")).lower() != "false" else "Square pixels"
         if ui_version < 4:
-            s.setValue("ui/version", 7)
             s.setValue("scan/swap_axes", True)
-        if ui_version < 3:
-            s.setValue("scan/equal_aspect", False)
         self._syncing_scan_controls = True
         try:
             self.scan_colormap_combo.setCurrentText(scan_cmap)
             self.scan_scale_combo.setCurrentText(scan_scale)
             self.scan_reverse_chk.setChecked(scan_reverse)
             self.scan_swap_axes_chk.setChecked(scan_swap)
-            self.scan_equal_aspect_chk.setChecked(scan_equal)
+            self.scan_pixel_geometry_combo.setCurrentText(str(saved_geometry))
             self.scan_vmin_edit.setText(str(s.value("scan/color_min", "")))
             self.scan_vmax_edit.setText(str(s.value("scan/color_max", "")))
             self.scan_low_percentile_spin.setValue(float(s.value("scan/lower_percentile", 2.0)))
@@ -4095,8 +5883,11 @@ class SmartFitterMainWindow(QMainWindow):
         self.exp_report_pdf_chk.setChecked(False)
         self._update_contextual_visibility()
         self._sync_quick_toolbar_from_state()
-        if ui_version < 7:
-            s.setValue("ui/version", 7)
+        self._loading_preferences = False
+        if hasattr(self, "reduce_motion_action"):
+            self.reduce_motion_action.setChecked(self._reduce_motion)
+        if ui_version < 9:
+            s.setValue("ui/version", 9)
 
     def _update_contextual_visibility(self):
         model = self.model_combo.currentText()
@@ -4110,11 +5901,15 @@ class SmartFitterMainWindow(QMainWindow):
         self.t1_container.setVisible(is_fit_trace and is_t1)
         self.odmr_container.setVisible(is_fit_trace and is_odmr)
         self.custom_container.setVisible(is_fit_trace and is_custom)
-        self.eq_preview_canvas.setVisible(is_fit_trace or is_t1)
-        self.equation_display.setVisible(is_fit_trace or is_t1)
+        self.eq_preview_canvas.setVisible(is_fit_trace)
+        self.eq_preview_canvas.setMaximumHeight(38)
+        self.equation_source_label.setVisible(is_fit_trace and is_custom)
+        self.equation_display.setVisible(is_fit_trace and is_custom)
+        self.equation_display.setMaximumHeight(54)
         self.quality_gate_chk.setVisible(is_fit_trace)
         self.fit_smoothed_chk.setVisible(is_fit_trace)
         self._update_rabi_model_help()
+        self.rabi_model_help_lbl.setVisible(False)
         self._update_trace_mode_visibility()
         self._update_equation_display()
 
@@ -4135,6 +5930,8 @@ class SmartFitterMainWindow(QMainWindow):
         else:
             text = "Auto compare fits phase-ramp, long damped, constant-frequency, and chirped candidates and keeps the strongest result by the built-in acceptance rules."
         self.rabi_model_help_lbl.setText(text)
+        if hasattr(self, "rabi_mode_combo"):
+            self.rabi_mode_combo.setToolTip(text)
 
     def _update_equation_display(self):
         m = self.model_combo.currentText()
@@ -4232,6 +6029,20 @@ class SmartFitterMainWindow(QMainWindow):
         return {
             **self._analysis_snapshot(),
             "locks": self._collect_locks() if hasattr(self, "param_table") else {},
+            "presentation": self.presentation_state.to_json() if hasattr(self, "presentation_state") else "",
+            # Spot curation is an analysis edit too.  Keep it in the same
+            # chronological history as ROI/exclusion and plot edits so a
+            # removed false positive can be restored with Ctrl+Z.
+            "scan_spots": self._clone_spot_results() if hasattr(self, "_scan_spot_results") else {},
+            "scan_spot_diagnostics": json_safe(self._scan_spot_diagnostics)
+            if hasattr(self, "_scan_spot_diagnostics")
+            else {},
+            "spot_comparison_pair": (
+                [list(key) for key in self._spot_comparison_pair]
+                if getattr(self, "_spot_comparison_pair", None) is not None
+                else None
+            ),
+            "spot_comparison_metrics": json_safe(getattr(self, "_spot_comparison_metrics", {})),
         }
 
     def _record_analysis_state(self, label: str = "Analysis change") -> None:
@@ -4252,10 +6063,48 @@ class SmartFitterMainWindow(QMainWindow):
         try:
             self._restore_analysis_state(snapshot)
             self._restore_param_snapshot(dict(snapshot.get("locks") or {}))
+            presentation = snapshot.get("presentation")
+            if presentation:
+                self.presentation_state = PlotPresentationState.from_json(presentation)
+                self._on_presentation_changed()
+            restored_spots: dict[str, list[SpotFit]] = {}
+            for detector_id, raw_spots in dict(snapshot.get("scan_spots") or {}).items():
+                parsed: list[SpotFit] = []
+                for raw_spot in raw_spots or []:
+                    try:
+                        values = raw_spot.to_dict() if isinstance(raw_spot, SpotFit) else dict(raw_spot)
+                        parsed.append(SpotFit.from_dict(values))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if parsed:
+                    restored_spots[str(detector_id)] = parsed
+            self._scan_spot_results = restored_spots
+            self._scan_spot_diagnostics = {
+                str(key): dict(value)
+                for key, value in dict(snapshot.get("scan_spot_diagnostics") or {}).items()
+                if isinstance(value, dict)
+            }
+            raw_pair = snapshot.get("spot_comparison_pair")
+            pair: list[tuple[str, int]] = []
+            if isinstance(raw_pair, (list, tuple)):
+                for value in raw_pair[:2]:
+                    if isinstance(value, (list, tuple)) and len(value) == 2:
+                        try:
+                            pair.append((str(value[0]), int(value[1])))
+                        except (TypeError, ValueError):
+                            pass
+            self._spot_comparison_pair = tuple(pair) if len(pair) == 2 else None
+            self._spot_comparison_metrics = dict(snapshot.get("spot_comparison_metrics") or {})
+            self._clear_invalid_spot_comparison()
+            self._update_spot_comparison_label()
+            if hasattr(self, "spot_results_table"):
+                self._populate_spot_table()
             self._last_param_history_snapshot = self._history_snapshot()
         finally:
             self._restoring_history = False
         self.ctx.dirty = True
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            self._refresh_plot_only()
 
     def _undo(self) -> None:
         entry = self._history.undo(self._history_snapshot())
@@ -4404,6 +6253,19 @@ class SmartFitterMainWindow(QMainWindow):
         value = item.data(Qt.ItemDataRole.UserRole)
         return str(value) if value is not None else item.text()
 
+    @staticmethod
+    def _trace_dimension_label(trace: ExperimentTrace) -> str:
+        return "2D" if trace.scan_dim == "scan2d" else "1D"
+
+    def _overlay_is_compatible(self, trace: ExperimentTrace | None) -> bool:
+        primary = self.ctx.trace
+        if primary is None or trace is None:
+            return False
+        # File overlays are line plots. Keep 2D maps independently selectable
+        # in the registry, but never feed them into the line-overlay or
+        # baseline pipelines.
+        return primary.scan_dim != "scan2d" and trace.scan_dim != "scan2d"
+
     def _checked_overlay_names(self) -> set[str]:
         if not hasattr(self, "overlay_list"):
             return set(self._overlay_visible_names)
@@ -4413,6 +6275,11 @@ class SmartFitterMainWindow(QMainWindow):
             for index in range(self.overlay_list.count())
             if self.overlay_list.item(index).checkState() == Qt.Checked
             and self._overlay_item_name(self.overlay_list.item(index)) != current
+            and self._overlay_is_compatible(
+                self.ctx.loaded_traces.get(self._overlay_item_name(self.overlay_list.item(index)))
+                if self.ctx.loaded_traces
+                else None
+            )
         }
 
     def _update_overlay_widgets(self, checked_names: set[str] | None = None):
@@ -4428,24 +6295,93 @@ class SmartFitterMainWindow(QMainWindow):
         self.baseline_combo.addItem("None")
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
+        self.overlay_box.setTitle(f"Project Explorer — {len(self.ctx.loaded_traces)} file{'s' if len(self.ctx.loaded_traces) != 1 else ''}")
         for name in sorted(self.ctx.loaded_traces.keys()):
             is_primary = name == current
-            item = QListWidgetItem(f"{name}  • PRIMARY" if is_primary else name)
+            trace = self.ctx.loaded_traces[name]
+            dimension = self._trace_dimension_label(trace)
+            detector_count = 1
+            dataset = self._loaded_datasets.get(name)
+            if dataset is not None:
+                detector_count = max(1, len(dataset.detectors))
+            detector_text = "dual detector" if detector_count > 1 else self._detector_label(trace.detector_id)
+            experiment = trace.experiment_type or "Unknown"
+            primary_text = "◆ PRIMARY · " if is_primary else ""
+            item = QListWidgetItem(f"{primary_text}{name}\n{experiment} · {dimension} · {detector_text}")
             item.setData(Qt.ItemDataRole.UserRole, name)
-            item.setCheckState(Qt.Checked if (is_primary or name in checked_names) else Qt.Unchecked)
+            compatible = self._overlay_is_compatible(trace)
+            item.setCheckState(Qt.Checked if (is_primary or (compatible and name in checked_names)) else Qt.Unchecked)
             if is_primary:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
+                item.setToolTip("Current primary plot")
+            elif not compatible:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                item.setToolTip(
+                    f"This {dimension} file cannot overlay the active {self._trace_dimension_label(self.ctx.trace)} view. "
+                    "Single-click to highlight it or double-click to make it primary."
+                )
+            else:
+                item.setToolTip("Check to overlay this compatible trace. Single-click highlights; double-click makes it primary.")
+            item.setToolTip(f"{trace.source_path}\n\n{item.toolTip()}\nEnter makes this file primary.")
             self.overlay_list.addItem(item)
-            self.baseline_combo.addItem(name)
+            if is_primary:
+                self.overlay_list.setCurrentItem(item)
+            if compatible and not is_primary:
+                self.baseline_combo.addItem(name)
         if self.baseline_combo.findText(baseline_name) >= 0:
             self.baseline_combo.setCurrentText(baseline_name)
         self.baseline_combo.blockSignals(False)
         self.overlay_list.blockSignals(False)
         self._updating_overlay_list = False
-        self._overlay_visible_names = checked_names & set(self.ctx.loaded_traces.keys())
+        self._overlay_visible_names = {
+            name
+            for name in checked_names
+            if name in self.ctx.loaded_traces and self._overlay_is_compatible(self.ctx.loaded_traces[name])
+        }
+        self._filter_project_files()
+
+    def _activate_filtered_file(self) -> None:
+        item = next((self.overlay_list.item(i) for i in range(self.overlay_list.count())
+                     if not self.overlay_list.item(i).isHidden()), None)
+        if item is not None:
+            self.overlay_list.setCurrentItem(item)
+            self.overlay_list.setFocus()
+            self.on_plot_selected_file()
+
+    def _filter_project_files(self, *_args) -> None:
+        if not hasattr(self, "file_filter_edit"):
+            return
+        query = self.file_filter_edit.text().strip().casefold()
+        for index in range(self.overlay_list.count()):
+            item = self.overlay_list.item(index)
+            item.setHidden(bool(query and query not in item.text().casefold()))
+
+    def _show_file_context_menu(self, position) -> None:
+        item = self.overlay_list.itemAt(position)
+        if item is not None and not item.isSelected():
+            self.overlay_list.setCurrentItem(item)
+        menu = QMenu(self.overlay_list)
+        make_primary = menu.addAction("Make Primary")
+        make_primary.setEnabled(item is not None and self.ctx.trace is not None and self._overlay_item_name(item) != self.ctx.trace.file_name)
+        make_primary.triggered.connect(self.on_plot_selected_file)
+        if item is not None and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            show_trace = menu.addAction("Show on Plot" if item.checkState() != Qt.Checked else "Hide from Plot")
+            show_trace.triggered.connect(lambda: item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked))
+        menu.addSeparator()
+        add_files = menu.addAction("Add Files…")
+        add_files.triggered.connect(self.on_add_overlays)
+        remove_files = menu.addAction("Remove Selected")
+        remove_files.setEnabled(bool(self.overlay_list.selectedItems()))
+        remove_files.triggered.connect(self.on_remove_overlays)
+        menu.addSeparator()
+        show_all = menu.addAction("Show All Compatible")
+        show_all.triggered.connect(self.on_show_all_overlays)
+        primary_only = menu.addAction("Primary Only")
+        primary_only.triggered.connect(self.on_show_primary_only)
+        menu.exec(self.overlay_list.mapToGlobal(position))
 
     def _on_overlay_item_changed(self, _item: QListWidgetItem):
         if self._updating_overlay_list:
@@ -4458,7 +6394,11 @@ class SmartFitterMainWindow(QMainWindow):
         if not self.ctx.loaded_traces:
             return
         current = self.ctx.trace.file_name if self.ctx.trace is not None else None
-        self._overlay_visible_names = {name for name in self.ctx.loaded_traces if name != current}
+        self._overlay_visible_names = {
+            name
+            for name, trace in self.ctx.loaded_traces.items()
+            if name != current and self._overlay_is_compatible(trace)
+        }
         self._overlay_view_dirty = True
         self._update_overlay_widgets(self._overlay_visible_names)
         self._refresh_plot_only()
@@ -4470,18 +6410,28 @@ class SmartFitterMainWindow(QMainWindow):
         self._refresh_plot_only()
 
     def on_add_overlays(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select overlay MAT files", "", "MAT files (*.mat)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add Data Files", str(self.settings.value("session/last_open_dir", "")), "MAT files (*.mat)")
         if not paths:
             return
+        self.settings.setValue("session/last_open_dir", str(Path(paths[0]).parent))
         mode: DataMode = self._current_data_mode()  # type: ignore[assignment]
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
         checked = self._checked_overlay_names()
+        detector_id = self._active_detector_id()
+        skipped: list[str] = []
         for p in paths:
             try:
-                tr = load_saved_data_mat(p, mode=mode)
-            except Exception:
+                dataset = load_experiment_dataset(p, mode=mode)
+                tr = dataset.detectors.get(detector_id)
+                if tr is None:
+                    skipped.append(f"{Path(p).name}: no valid {self._detector_label(detector_id)} stream")
+                    continue
+            except Exception as exc:
+                skipped.append(f"{Path(p).name}: {exc}")
                 continue
+            self._loaded_datasets[dataset.file_name] = dataset
+            self._apply_detector_labels()
             self.ctx.loaded_traces[tr.file_name] = tr
             if self.ctx.trace is None or tr.file_name != self.ctx.trace.file_name:
                 checked.add(tr.file_name)
@@ -4489,6 +6439,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._overlay_view_dirty = True
         self._update_overlay_widgets(checked)
         self._refresh_plot_only()
+        if skipped:
+            self._message("Overlay warnings", "\n".join(skipped))
 
     def on_remove_overlays(self):
         if not self.ctx.loaded_traces:
@@ -4501,6 +6453,7 @@ class SmartFitterMainWindow(QMainWindow):
             if nm == current_name:
                 continue
             self.ctx.loaded_traces.pop(nm, None)
+            self._loaded_datasets.pop(nm, None)
             self._overlay_visible_names.discard(nm)
         self._overlay_view_dirty = True
         self._update_overlay_widgets(self._overlay_visible_names)
@@ -4514,6 +6467,11 @@ class SmartFitterMainWindow(QMainWindow):
         if current and current in self.ctx.loaded_traces:
             keep[current] = self.ctx.loaded_traces[current]
         self.ctx.loaded_traces = keep
+        self._loaded_datasets = {
+            name: dataset
+            for name, dataset in self._loaded_datasets.items()
+            if name == current
+        }
         self._overlay_visible_names.clear()
         self._overlay_view_dirty = True
         self._update_overlay_widgets(set())
@@ -4607,32 +6565,31 @@ class SmartFitterMainWindow(QMainWindow):
         if previous_primary and previous_primary != nm:
             checked.add(previous_primary)
         checked.discard(nm)
-        self.ctx.trace = self.ctx.loaded_traces[nm]
-        self.command_file_lbl.setText(self.ctx.trace.file_name)
-        self.command_file_lbl.setToolTip(str(Path(self.ctx.trace.source_path).resolve()))
-        self._reset_presentation_for_source(self.ctx.trace.source_path)
-        self._set_annotation_visible(False, refresh=False)
-        self.ctx.fit_result = None
-        self.ctx.fit_target = None
-        self.ctx.odmr_peaks = None
-        self._selected_plot_point = None
-        self._scan_cursor = None
-        self._scan_view_limits = None
-        self.clear_marker_btn.setVisible(False)
-        tr = self.ctx.trace
-        if len(tr.x_ns) == 0:
-            self._message("Overlay", "Selected overlay trace is empty in the current observable mode.")
+        target = self.ctx.loaded_traces[nm]
+        if not self._load_file(
+            target.source_path,
+            preserve_analysis=True,
+            preferred_detector_id=target.detector_id,
+        ):
             return
-        self.roi_min.setText(f"{np.min(tr.x_ns):.6g}")
-        self.roi_max.setText(f"{np.max(tr.x_ns):.6g}")
-        self.rabi_dead_time_ns.setValue(float((tr.metadata or {}).get("rabi_dead_time_ns", 0.0) or 0.0))
-        self._iteration_selection_source = None
-        self.apply_profile_defaults(reload_data=False)
-        self._update_iteration_controls()
+        self._overlay_visible_names = {
+            name
+            for name in checked
+            if name in self.ctx.loaded_traces and self._overlay_is_compatible(self.ctx.loaded_traces[name])
+        }
         self._overlay_view_dirty = True
-        self._update_overlay_widgets(checked)
-        self._refresh_processed()
-        self._show_loaded_trace_summary()
+        self._update_overlay_widgets(self._overlay_visible_names)
+        self._refresh_plot_only()
+
+    def on_plot_selected_file(self):
+        item = self.overlay_list.currentItem()
+        if item is None:
+            selected = self.overlay_list.selectedItems()
+            item = selected[0] if selected else None
+        if item is None:
+            self.statusBar().showMessage("Select a loaded file to plot", 4000)
+            return
+        self.on_overlay_set_primary(item)
 
     def on_add_exclusion_range(self):
         if self.ctx.exclusion_ranges is None:
@@ -4736,10 +6693,9 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _on_plot_click(self, event):
         if bool(getattr(event, "dblclick", False)):
-            target = self._editable_plot_target(event)
-            if target is not None:
-                section, role, dimension = target
-                self._open_plot_editor(section=section, axis_role=role, dimension=dimension)
+            element = self._editable_plot_element(event)
+            if element is not None:
+                self._open_plot_element_popover(element)
                 return
         if str(getattr(self.toolbar, "mode", "")):
             return
@@ -4749,41 +6705,270 @@ class SmartFitterMainWindow(QMainWindow):
         if event.xdata is None:
             return
         if mode == "Inspect point":
-            self._select_point_from_plot(float(event.xdata), float(event.ydata) if event.ydata is not None else None)
+            source_trace = self._scan_trace_for_axis(event.inaxes)
+            self._select_point_from_plot(
+                float(event.xdata),
+                float(event.ydata) if event.ydata is not None else None,
+                detector_id=None if source_trace is None else source_trace.detector_id,
+                multi_select=self._multi_point_modifier(event),
+            )
+
+    @staticmethod
+    def _multi_point_modifier(event) -> bool:
+        """Return whether a plot click requests additive point selection."""
+        key = str(getattr(event, "key", "") or "").strip().lower()
+        if key:
+            tokens = {
+                token
+                for token in key.replace("+", " ").replace("-", " ").split()
+                if token
+            }
+            if tokens & {"control", "ctrl", "shift", "command", "cmd", "super", "meta"}:
+                return True
+        try:
+            modifier_source = getattr(event, "modifiers", None)
+            modifiers = modifier_source() if callable(modifier_source) else modifier_source
+            if modifiers is None:
+                return False
+            return bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.MetaModifier))
+        except Exception:
+            return False
 
     def _editable_plot_target(self, event) -> tuple[str, str | None, str | None] | None:
+        element = self._editable_plot_element(event)
+        return None if element is None else element["route"]
+
+    def _editable_plot_element(self, event) -> dict[str, Any] | None:
         if self._active_legend is not None:
             try:
                 if self._active_legend.contains(event)[0]:
-                    return "series", None, None
+                    return {"kind": "legend", "route": ("series", None, None)}
             except Exception:
                 pass
         if self._plot_annotation_artist is not None:
             try:
                 if self._plot_annotation_artist.contains(event)[0]:
-                    return "annotation", None, None
+                    return {"kind": "annotation", "route": ("annotation", None, None)}
             except Exception:
                 pass
+        for descriptor in reversed(self._series_registry):
+            for artist in descriptor.artists:
+                try:
+                    if artist.get_visible() and artist.contains(event)[0]:
+                        return {
+                            "kind": "series",
+                            "descriptor": descriptor,
+                            "route": ("series", descriptor.axis_role, None),
+                        }
+                except Exception:
+                    continue
         for role, ax in self._presentation_axis_map().items():
             for artist, field in ((ax.title, "title"), (ax.xaxis.label, "xlabel"), (ax.yaxis.label, "ylabel")):
                 try:
                     if artist.get_visible() and artist.contains(event)[0]:
-                        return "axes", role, field
+                        return {"kind": "axis_text", "role": role, "field": field, "route": ("axes", role, field)}
                 except Exception:
                     continue
             for label in ax.get_xticklabels():
                 try:
                     if label.get_visible() and label.contains(event)[0]:
-                        return "axes", role, "x"
+                        return {"kind": "ticks", "role": role, "dimension": "x", "route": ("axes", role, "x")}
                 except Exception:
                     continue
             for label in ax.get_yticklabels():
                 try:
                     if label.get_visible() and label.contains(event)[0]:
-                        return "axes", role, "y"
+                        return {"kind": "ticks", "role": role, "dimension": "y", "route": ("axes", role, "y")}
                 except Exception:
                     continue
+            if event.inaxes is ax and role in {"colorbar", "detector_compare_colorbar"}:
+                return {"kind": "ticks", "role": role, "dimension": "y", "route": ("axes", role, "y")}
         return None
+
+    def _open_plot_element_popover(self, element: dict[str, Any]) -> None:
+        """Open a compact, live property editor next to the clicked plot element."""
+        if self._plot_element_popover is not None:
+            self._plot_element_popover.close()
+        dialog = QDialog(self, Qt.WindowType.Popup if self.isVisible() else Qt.WindowType.Tool)
+        dialog.setObjectName("PlotElementPopover")
+        dialog.setWindowTitle("Plot properties")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(8)
+        changed = {"recorded": False}
+
+        def commit(mutator) -> None:
+            if not changed["recorded"]:
+                self._history.push("plot property edit", self._history_snapshot())
+                changed["recorded"] = True
+            mutator()
+            self._mark_document_dirty()
+            self._on_presentation_changed()
+
+        def color_control(current: str, apply_color) -> QPushButton:
+            button = QPushButton(current)
+
+            def style_swatch(value: str) -> None:
+                color = QColor(value)
+                luminance = (0.2126 * color.redF()) + (0.7152 * color.greenF()) + (0.0722 * color.blueF())
+                text_color = "#101317" if luminance > 0.55 else "#ffffff"
+                button.setStyleSheet(
+                    f"QPushButton {{ background-color: {value}; color: {text_color}; "
+                    "border: 1px solid #7b8795; font-weight: 600; }}"
+                )
+
+            style_swatch(current)
+
+            def choose() -> None:
+                color = QColorDialog.getColor(QColor(button.text()), dialog, "Choose plot color")
+                if color.isValid():
+                    value = color.name()
+                    button.setText(value)
+                    style_swatch(value)
+                    commit(lambda: apply_color(value))
+
+            button.clicked.connect(choose)
+            return button
+
+        kind = str(element["kind"])
+        title = QLabel()
+        title.setObjectName("PaneTitle")
+        form.addRow(title)
+        if kind == "series":
+            descriptor: SeriesDescriptor = element["descriptor"]
+            title.setText(descriptor.default_label or descriptor.series_id)
+            override = self.presentation_state.series.setdefault(descriptor.series_id, SeriesOverride())
+            values = resolved_series(descriptor, override)
+
+            def set_series_value(attribute: str, value: Any) -> None:
+                targets = [descriptor.series_id]
+                family = None
+                if descriptor.series_id in {"data", "smoothed", "fit"}:
+                    family = descriptor.series_id
+                elif descriptor.series_id.startswith("detector:"):
+                    suffix = descriptor.series_id.split(":", 2)
+                    family = suffix[2] if len(suffix) == 3 else "data"
+                if family in {"data", "smoothed", "fit"} and self._detector_scope_is_both() and self._primary_dataset is not None:
+                    targets = [family]
+                    for detector_id in self._primary_dataset.available_detectors:
+                        targets.append(f"detector:{detector_id}" + ("" if family == "data" else f":{family}"))
+                for series_id in dict.fromkeys(targets):
+                    target_override = self.presentation_state.series.setdefault(series_id, SeriesOverride())
+                    setattr(target_override, attribute, value)
+
+            label_edit = QLineEdit(str(values["label"]))
+            label_edit.editingFinished.connect(lambda: commit(lambda: set_series_value("label", label_edit.text())))
+            form.addRow("Label", label_edit)
+            visible = QCheckBox("Show series")
+            visible.setChecked(bool(values["show_series"]))
+            visible.toggled.connect(lambda value: commit(lambda: set_series_value("show_series", bool(value))))
+            form.addRow("Visibility", visible)
+            color = str(values["color"] or "#26332d")
+            form.addRow("Color", color_control(color, lambda value: set_series_value("color", value)))
+            if descriptor.supports_line:
+                line = NoScrollComboBox()
+                line.addItems(["-", "--", ":", "-.", "None"])
+                line.setCurrentText(str(values["linestyle"] or "None"))
+                line.currentTextChanged.connect(lambda value: commit(lambda: set_series_value("linestyle", value)))
+                form.addRow("Line style", line)
+            if descriptor.supports_marker:
+                marker = NoScrollComboBox()
+                marker.addItems(["None", "o", "s", "^", "D", "x", "+", "."])
+                marker.setCurrentText(str(values["marker"] or "None"))
+                marker.currentTextChanged.connect(lambda value: commit(lambda: set_series_value("marker", value)))
+                form.addRow("Marker", marker)
+        elif kind == "legend":
+            title.setText("Legend")
+            style = self.presentation_state.legend
+            text = QLineEdit(style.title)
+            text.setPlaceholderText("Optional legend title")
+            text.editingFinished.connect(lambda: commit(lambda: setattr(style, "title", text.text())))
+            form.addRow("Title", text)
+            visible = QCheckBox("Show legend")
+            visible.setChecked(style.visible)
+            visible.toggled.connect(lambda value: commit(lambda: setattr(style, "visible", bool(value))))
+            form.addRow("Visibility", visible)
+            size = NoScrollSpinBox(); size.setRange(8, 30); size.setValue(style.font_size)
+            size.valueChanged.connect(lambda value: commit(lambda: setattr(style, "font_size", int(value))))
+            form.addRow("Font size", size)
+            location = NoScrollComboBox(); location.addItems(["best", "upper right", "upper left", "lower right", "lower left", "center right", "center left", "upper center", "lower center"])
+            location.setCurrentText(style.location)
+            location.currentTextChanged.connect(lambda value: commit(lambda: setattr(style, "location", value)))
+            form.addRow("Location", location)
+            form.addRow("Text color", color_control(style.text_color, lambda value: setattr(style, "text_color", value)))
+        elif kind == "annotation":
+            title.setText("Annotation")
+            style = self.presentation_state.annotation_style
+            visible = QCheckBox("Show annotation")
+            visible.setChecked(style.visible)
+            visible.toggled.connect(lambda value: commit(lambda: setattr(style, "visible", bool(value))))
+            form.addRow("Visibility", visible)
+            size = NoScrollSpinBox(); size.setRange(8, 30); size.setValue(style.font_size)
+            size.valueChanged.connect(lambda value: commit(lambda: setattr(style, "font_size", int(value))))
+            form.addRow("Font size", size)
+            location = NoScrollComboBox(); location.addItems(["upper right", "upper left", "lower right", "lower left"])
+            location.setCurrentText(style.location)
+            location.currentTextChanged.connect(lambda value: commit(lambda: setattr(style, "location", value)))
+            form.addRow("Location", location)
+            form.addRow("Text color", color_control(style.text_color, lambda value: setattr(style, "text_color", value)))
+        elif kind == "axis_text":
+            role, field = str(element["role"]), str(element["field"])
+            title.setText(f"{role.replace('_', ' ').title()} {field.replace('label', ' label').title()}")
+            style = getattr(self.presentation_state.axis(role), field)
+            current_text = self._presentation_axis_text(role, field)
+            text = QLineEdit(style.text if style.mode != "Auto" else current_text)
+
+            def set_text() -> None:
+                style.mode = "Custom"
+                style.text = text.text()
+
+            text.editingFinished.connect(lambda: commit(set_text))
+            form.addRow("Text", text)
+            visible = QCheckBox("Show text"); visible.setChecked(style.visible)
+            visible.toggled.connect(lambda value: commit(lambda: setattr(style, "visible", bool(value))))
+            form.addRow("Visibility", visible)
+            size = NoScrollSpinBox(); size.setRange(8, 36); size.setValue(style.font_size)
+            size.valueChanged.connect(lambda value: commit(lambda: setattr(style, "font_size", int(value))))
+            form.addRow("Font size", size)
+            form.addRow("Color", color_control(style.color, lambda value: setattr(style, "color", value)))
+        else:
+            role, dimension = str(element["role"]), str(element["dimension"])
+            title.setText(f"{role.replace('_', ' ').title()} {dimension.upper()} ticks")
+            style = getattr(self.presentation_state.axis(role), f"{dimension}_ticks")
+            visible = QCheckBox("Show tick labels")
+            visible.setChecked(style.label_bottom or style.label_top if dimension == "x" else style.label_left or style.label_right)
+
+            def set_tick_visibility(value: bool) -> None:
+                if dimension == "x":
+                    style.label_bottom = bool(value)
+                    style.label_top = False
+                else:
+                    style.label_left = bool(value)
+                    style.label_right = False
+
+            visible.toggled.connect(lambda value: commit(lambda: set_tick_visibility(value)))
+            form.addRow("Visibility", visible)
+            size = NoScrollSpinBox(); size.setRange(8, 30); size.setValue(style.label_size)
+            size.valueChanged.connect(lambda value: commit(lambda: setattr(style, "label_size", int(value))))
+            form.addRow("Font size", size)
+            form.addRow("Color", color_control(style.label_color, lambda value: setattr(style, "label_color", value)))
+
+        more = QPushButton("More…")
+        section, role, dimension = element["route"]
+
+        def open_more() -> None:
+            dialog.close()
+            series_id = element["descriptor"].series_id if kind == "series" else None
+            self._open_plot_editor(section=section, axis_role=role, dimension=dimension, series_id=series_id)
+
+        more.clicked.connect(open_more)
+        form.addRow(more)
+        dialog.finished.connect(lambda _result: setattr(self, "_plot_element_popover", None))
+        self._plot_element_popover = dialog
+        dialog.adjustSize()
+        pos = QCursor.pos()
+        dialog.move(pos.x() + 12, pos.y() + 12)
+        dialog.show()
 
     def on_save_preset(self):
         out, _ = QFileDialog.getSaveFileName(self, "Save analysis preset", "", "Preset JSON (*.json)")
@@ -4831,16 +7016,28 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is None:
             self._message("Copy figure", "Load data before copying a figure.")
             return
+        original_size = tuple(float(v) for v in self.fig.get_size_inches())
+        export_size = self._resolved_export_size()
         buffer = BytesIO()
-        self.fig.savefig(
-            buffer,
-            format="png",
-            dpi=max(300, int(self.plot_opts.save_dpi)),
-            bbox_inches="tight",
-            pad_inches=0.10,
-            facecolor="#ffffff",
-            edgecolor="#ffffff",
-        )
+        try:
+            self.fig.set_size_inches(*export_size, forward=False)
+            # Rebuild axes after changing the physical figure size. The map
+            # comparison layout is computed from figure aspect and otherwise
+            # labels/colorbars can overlap in clipboard output.
+            self._refresh_plot_only()
+            self.canvas.draw()
+            self.fig.savefig(
+                buffer,
+                format="png",
+                dpi=max(300, int(self.plot_opts.save_dpi)),
+                bbox_inches=None,
+                pad_inches=0.0,
+                facecolor="#ffffff",
+                edgecolor="#ffffff",
+            )
+        finally:
+            self.fig.set_size_inches(*original_size, forward=False)
+            self._refresh_plot_only()
         image = QImage.fromData(buffer.getvalue(), "PNG")
         if image.isNull():
             self._message("Copy figure", "The figure could not be rendered for the clipboard.")
@@ -4852,6 +7049,7 @@ class SmartFitterMainWindow(QMainWindow):
         if self.ctx.trace is None:
             raise ValueError("Load data before saving a session.")
         trace = self.ctx.trace
+        self._store_active_detector_state()
         checked = self._checked_overlay_names()
         overlays = [
             {
@@ -4866,6 +7064,10 @@ class SmartFitterMainWindow(QMainWindow):
         return {
             "primary_source": source_descriptor(trace.source_path, session_path), "profile": self.profile_combo.currentText(),
             "mode": self.mode_combo.currentText(), "model": self.model_combo.currentText(),
+            "active_detector_id": trace.detector_id,
+            "compare_detectors": self.compare_detectors_chk.isChecked(),
+            "detector_scope": "both" if self._detector_scope_is_both() else "active",
+            "detector_labels": dict(self._detector_labels),
             "roi": [self.roi_min.text(), self.roi_max.text()], "bin_size": self.bin_spin.value(), "smooth_window": self.smooth_spin.value(),
             "excluded_raw_indices": sorted(self.ctx.excluded_points or set()), "exclusion_ranges": list(self.ctx.exclusion_ranges or []),
             "analysis_steps": [step.to_dict() for step in self.ctx.analysis_steps], "plot_options": json_safe(self.plot_opts.__dict__),
@@ -4881,12 +7083,43 @@ class SmartFitterMainWindow(QMainWindow):
                 "color_min": self.scan_vmin_edit.text(),
                 "color_max": self.scan_vmax_edit.text(),
                 "swap_axes": self.scan_swap_axes_chk.isChecked(),
-                "equal_aspect": self.scan_equal_aspect_chk.isChecked(),
+                "pixel_geometry": self.scan_pixel_geometry_combo.currentText(),
                 "linecut": self.scan_linecut_combo.currentText(),
                 "secondary": self.scan_secondary_combo.currentText(),
+                "detector_compare_scale": self.scan_compare_scale_combo.currentText(),
+                "detector_color_limits": json_safe(self._detector_map_limits),
+                "spot_source": self.spot_source_combo.currentText(),
+                "spot_polarity": self.spot_polarity_combo.currentText(),
+                "spot_threshold_sigma": self.spot_threshold_spin.value(),
+                "spot_background_window": self.spot_background_spin.value(),
+                "spot_min_pixels": self.spot_min_pixels_spin.value(),
+                "spot_max_count": self.spot_max_count_spin.value(),
+                "spot_overlay": self.spot_overlay_chk.isChecked(),
+                "spot_labels": self.spot_labels_chk.isChecked(),
+                "spot_display_source": self.spot_display_source_chk.isChecked(),
+                "spot_compare_highlight": self.spot_compare_highlight_chk.isChecked(),
             },
+            "scan_spots": {
+                detector_id: [spot.to_dict() for spot in spots]
+                for detector_id, spots in self._scan_spot_results.items()
+            },
+            "scan_spot_diagnostics": json_safe(self._scan_spot_diagnostics),
+            "scan_spot_comparison": self._spot_comparison_payload(),
             "fit_state": fit_result_to_dict(self.ctx.fit_result),
             "fit_signature": fit_signature,
+            "detector_fit_states": {
+                detector_id: {
+                    "fit_state": fit_result_to_dict(state.fit_result),
+                    "fit_target": json_safe(state.fit_target),
+                    "fit_signature": state.fit_signature,
+                    "status": state.status,
+                    "status_reason": state.status_reason,
+                    "odmr_peaks": json_safe(state.odmr_peaks),
+                    "pending_locks": json_safe(state.pending_locks or {}),
+                    "summary": state.summary,
+                }
+                for detector_id, state in self._detector_analysis_states.items()
+            },
             "view": {"xlim": list(self.ax_main.get_xlim()), "ylim": list(self.ax_main.get_ylim()), "scan_view_limits": json_safe(self._scan_view_limits)},
         }
 
@@ -4920,8 +7153,13 @@ class SmartFitterMainWindow(QMainWindow):
         }
         for widget, value in widget_values.items():
             widget.setChecked(bool(value))
-        self.fig_w_spin.setValue(float(self.plot_opts.fig_width))
-        self.fig_h_spin.setValue(float(self.plot_opts.fig_height))
+        previous_loading = self._loading_preferences
+        self._loading_preferences = True
+        try:
+            self.fig_w_spin.setValue(float(self.plot_opts.fig_width))
+            self.fig_h_spin.setValue(float(self.plot_opts.fig_height))
+        finally:
+            self._loading_preferences = previous_loading
         self.save_dpi_spin.setValue(int(self.plot_opts.save_dpi))
         self.legend_font_spin.setValue(int(self.plot_opts.legend_font_size))
         self.legend_loc_combo.setCurrentText(str(self.plot_opts.legend_loc))
@@ -4960,6 +7198,11 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Open session", str(exc))
             return
         saved_mode = str(document.get("mode", "contrast"))
+        saved_detector_id = str(document.get("active_detector_id", "detector1"))
+        saved_detector_labels = {
+            **DETECTOR_LABELS,
+            **{str(key): str(value) for key, value in dict(document.get("detector_labels") or {}).items()},
+        }
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentText(saved_mode)
         self.mode_combo.blockSignals(False)
@@ -4968,8 +7211,12 @@ class SmartFitterMainWindow(QMainWindow):
         if source is None:
             replacement, _ = QFileDialog.getOpenFileName(self, "Locate the session's primary MAT file", str(Path(path).parent), "MAT files (*.mat)")
             source = Path(replacement) if replacement else None
-        if source is None or not self._load_file(str(source)):
+        if source is None or not self._load_file(str(source), preferred_detector_id=saved_detector_id):
             return
+        self._detector_labels = saved_detector_labels
+        self._apply_detector_labels()
+        self._refresh_detector_controls(saved_detector_id)
+        self._activate_detector(saved_detector_id, refresh=False)
         overlay_states: dict[str, bool] = {}
         overlay_warnings: list[str] = []
         for saved_overlay in document.get("overlay_sources") or []:
@@ -4991,7 +7238,12 @@ class SmartFitterMainWindow(QMainWindow):
             if overlay_path.resolve() == source.resolve():
                 continue
             try:
-                overlay = load_saved_data_mat(str(overlay_path), mode=self._current_data_mode())
+                overlay_dataset = load_experiment_dataset(str(overlay_path), mode=self._current_data_mode())
+                overlay = overlay_dataset.detectors.get(saved_detector_id)
+                if overlay is None:
+                    raise ValueError(f"No valid {self._detector_label(saved_detector_id)} stream")
+                self._loaded_datasets[overlay.file_name] = overlay_dataset
+                self._apply_detector_labels()
                 self.ctx.loaded_traces[overlay.file_name] = overlay
                 overlay_states[overlay.file_name] = expected_checked
                 if overlay_changed:
@@ -5023,11 +7275,52 @@ class SmartFitterMainWindow(QMainWindow):
             self.scan_vmin_edit.setText(str(map_options.get("color_min", "")))
             self.scan_vmax_edit.setText(str(map_options.get("color_max", "")))
             self.scan_swap_axes_chk.setChecked(bool(map_options.get("swap_axes", True)))
-            self.scan_equal_aspect_chk.setChecked(bool(map_options.get("equal_aspect", self.scan_equal_aspect_chk.isChecked())))
+            pixel_geometry = map_options.get("pixel_geometry")
+            if pixel_geometry is None:
+                pixel_geometry = "Physical pixel size" if bool(map_options.get("equal_aspect", True)) else "Square pixels"
+            self.scan_pixel_geometry_combo.setCurrentText(str(pixel_geometry))
             self.scan_linecut_combo.setCurrentText(str(map_options.get("linecut", "None")))
             self.scan_secondary_combo.setCurrentText(str(map_options.get("secondary", "None")))
+            self.scan_compare_scale_combo.setCurrentText(str(map_options.get("detector_compare_scale", "Independent")))
+            self.spot_source_combo.setCurrentText(str(map_options.get("spot_source", "Auto fluorescence")))
+            self.spot_polarity_combo.setCurrentText(str(map_options.get("spot_polarity", "Auto")))
+            self.spot_threshold_spin.setValue(float(map_options.get("spot_threshold_sigma", 3.0)))
+            self.spot_background_spin.setValue(int(map_options.get("spot_background_window", 0)))
+            self.spot_min_pixels_spin.setValue(int(map_options.get("spot_min_pixels", 4)))
+            self.spot_max_count_spin.setValue(int(map_options.get("spot_max_count", 12)))
+            self.spot_overlay_chk.setChecked(bool(map_options.get("spot_overlay", True)))
+            self.spot_labels_chk.setChecked(bool(map_options.get("spot_labels", True)))
+            self.spot_display_source_chk.setChecked(bool(map_options.get("spot_display_source", True)))
+            self.spot_compare_highlight_chk.setChecked(bool(map_options.get("spot_compare_highlight", True)))
+            self._detector_map_limits = {
+                str(key): tuple(str(part) for part in value[:2])
+                for key, value in dict(map_options.get("detector_color_limits") or {}).items()
+                if isinstance(value, (list, tuple)) and len(value) >= 2
+            }
         finally:
             self._syncing_scan_controls = False
+        restored_spots: dict[str, list[SpotFit]] = {}
+        for detector_id, raw_spots in dict(document.get("scan_spots") or {}).items():
+            parsed: list[SpotFit] = []
+            for raw_spot in raw_spots or []:
+                try:
+                    parsed.append(SpotFit.from_dict(dict(raw_spot)))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if parsed:
+                restored_spots[str(detector_id)] = parsed
+        self._scan_spot_results = restored_spots
+        self._scan_spot_diagnostics = {
+            str(key): dict(value)
+            for key, value in dict(document.get("scan_spot_diagnostics") or {}).items()
+            if isinstance(value, dict)
+        }
+        self._restore_spot_comparison_payload(document.get("scan_spot_comparison"))
+        self._populate_spot_table()
+        self.compare_detectors_chk.setChecked(bool(document.get("compare_detectors", False)))
+        if hasattr(self, "detector_scope_combo"):
+            scope_index = self.detector_scope_combo.findData(str(document.get("detector_scope", "active")))
+            self.detector_scope_combo.setCurrentIndex(max(0, scope_index))
         self._on_scan_scale_changed(self.scan_scale_combo.currentText())
         for key, value in dict(document.get("sample_metadata") or {}).items():
             widget = getattr(self, f"meta_{key}", None)
@@ -5042,12 +7335,29 @@ class SmartFitterMainWindow(QMainWindow):
             self._scan_view_limits = (tuple(float(value) for value in scan_view[0]), tuple(float(value) for value in scan_view[1]))
         if view.get("xlim") and view.get("ylim"):
             self.ax_main.set_xlim(*view["xlim"]); self.ax_main.set_ylim(*view["ylim"]); self.canvas.draw_idle()
+        detector_state_payload = dict(document.get("detector_fit_states") or {})
+        if detector_state_payload and not changed:
+            restored_states: dict[str, DetectorAnalysisState] = {}
+            for detector_id, raw_state in detector_state_payload.items():
+                raw = dict(raw_state or {})
+                restored_states[str(detector_id)] = DetectorAnalysisState(
+                    fit_result=fit_result_from_dict(raw.get("fit_state")),
+                    fit_target=None if raw.get("fit_target") is None else np.asarray(raw.get("fit_target"), dtype=float),
+                    fit_signature=str(raw.get("fit_signature")) if raw.get("fit_signature") else None,
+                    status=str(raw.get("status", "N/A")),
+                    status_reason=str(raw.get("status_reason", "")),
+                    odmr_peaks=None if raw.get("odmr_peaks") is None else np.asarray(raw.get("odmr_peaks"), dtype=float),
+                    pending_locks={str(key): tuple(value) for key, value in dict(raw.get("pending_locks") or {}).items()},
+                    summary=str(raw.get("summary", "")),
+                )
+            self._detector_analysis_states = restored_states
+            self._restore_detector_state(saved_detector_id)
         saved_fit = fit_result_from_dict(document.get("fit_state"))
         saved_fit_signature = document.get("fit_signature")
-        if saved_fit is not None and not changed and saved_fit_signature == self._current_fit_signature():
+        if not detector_state_payload and saved_fit is not None and not changed and saved_fit_signature == self._current_fit_signature():
             self.ctx.fit_signature = str(saved_fit_signature)
             self.on_fit_finished(saved_fit)
-        elif saved_fit is not None:
+        elif not detector_state_payload and saved_fit is not None:
             overlay_warnings.append("Saved fit was invalidated because the source or analysis settings changed.")
         self._history.clear()
         self.ctx.dirty = False
@@ -5177,28 +7487,103 @@ class SmartFitterMainWindow(QMainWindow):
         self.settings.setValue("session/last_open_dir", str(Path(file_path).parent))
         self._load_file(file_path)
 
-    def _load_file(self, file_path: str, *, preserve_analysis: bool = False):
+    @staticmethod
+    def _trace_is_reference_only(trace: ExperimentTrace) -> bool:
+        signal = np.asarray(trace.signal, dtype=float).ravel()
+        reference = np.asarray(trace.reference, dtype=float).ravel()
+        count = min(signal.size, reference.size)
+        if count == 0:
+            return False
+        signal = signal[:count]
+        reference = reference[:count]
+        valid = np.isfinite(signal) & np.isfinite(reference)
+        if not np.any(valid):
+            return False
+        signal = signal[valid]
+        reference = reference[valid]
+        reference_scale = float(np.nanmax(np.abs(reference))) if reference.size else 0.0
+        if not np.isfinite(reference_scale) or reference_scale <= 0:
+            return False
+        zero_tolerance = max(1e-12, reference_scale * 1e-12)
+        return bool(np.all(np.abs(signal) <= zero_tolerance))
+
+    def _load_file(
+        self,
+        file_path: str,
+        *,
+        preserve_analysis: bool = False,
+        preferred_detector_id: str | None = None,
+    ):
         if self._active_fit_request is not None:
             self._message("Fit in progress", "Cancel or wait for the current fit before loading another file.")
             return False
         if self._is_loading:
             return False
         preserve_mode_override = self._mode_override_active
+        preferred_detector = preferred_detector_id or self._active_detector_id()
         checked_overlays = self._checked_overlay_names() if preserve_analysis else set()
-        prior_overlays = list((self.ctx.loaded_traces or {}).items()) if preserve_analysis else []
+        prior_datasets = list(self._loaded_datasets.items())
+        requested_mode: DataMode = self._current_data_mode()  # type: ignore[assignment]
+        if self._auto_reference_fallback and requested_mode == "reference":
+            requested_mode = "contrast"
+        resolved_mode: DataMode = requested_mode
+        auto_reference_fallback = False
         self._is_loading = True
         try:
-            mode: DataMode = self._current_data_mode()  # type: ignore[assignment]
-            trace = load_saved_data_mat(file_path, mode=mode)
+            dataset = load_experiment_dataset(file_path, mode=requested_mode)
+            if not dataset.detectors:
+                failures = "\n".join(f"- {failure.message}" for failure in dataset.detector_errors.values())
+                raise ValueError(f"No detector stream contains valid measurements.\n{failures}")
+            detector_id = preferred_detector if preferred_detector in dataset.detectors else (
+                "detector1" if "detector1" in dataset.detectors else next(iter(dataset.detectors))
+            )
+            trace = dataset.detectors[detector_id]
+            if requested_mode == "contrast" and self._trace_is_reference_only(trace):
+                resolved_mode = "reference"
+                auto_reference_fallback = True
+                dataset = load_experiment_dataset(file_path, mode=resolved_mode)
+                trace = dataset.detectors[detector_id]
         except Exception as exc:
             self._is_loading = False
             self._message("Load error", str(exc))
             return False
         if len(trace.x_ns) == 0 or len(trace.y) == 0:
             self._is_loading = False
-            self._message("Load error", f"Loaded trace is empty after applying observable mode '{self._friendly_mode_name(mode)}'.")
+            self._message("Load error", f"Loaded trace is empty after applying observable mode '{self._friendly_mode_name(resolved_mode)}'.")
             return False
+        if not preserve_analysis:
+            self._scan_spot_results.clear()
+            self._scan_spot_diagnostics.clear()
+            self._scan_spot_removed_backup = None
+            self._scan_spot_removed_diagnostics_backup = None
+            self._scan_spot_removed_pair_backup = None
+            self._scan_spot_removed_metrics_backup = {}
+            self._spot_comparison_pair = None
+            self._spot_comparison_metrics = {}
+            if hasattr(self, "spot_compare_lbl"):
+                self.spot_compare_lbl.setText("Detector comparison: not selected")
+            if hasattr(self, "spot_restore_btn"):
+                self.spot_restore_btn.setEnabled(False)
+            if hasattr(self, "spot_results_table"):
+                self._populate_spot_table()
         self._reset_presentation_for_source(trace.source_path)
+        if not preserve_analysis:
+            self._detector_labels = dict(DETECTOR_LABELS)
+            self._detector_map_limits = {}
+            self._detector_analysis_states = {}
+            self._last_processing_signature = None
+        self._primary_dataset = dataset
+        self._loaded_datasets[dataset.file_name] = dataset
+        for name, prior_dataset in prior_datasets:
+            if Path(prior_dataset.source_path).resolve() == Path(dataset.source_path).resolve():
+                continue
+            prior_modes = {str(prior_trace.mode) for prior_trace in prior_dataset.detectors.values()}
+            if preserve_analysis or prior_modes != {str(resolved_mode)}:
+                try:
+                    self._loaded_datasets[name] = load_experiment_dataset(prior_dataset.source_path, mode=resolved_mode)
+                except Exception:
+                    self._loaded_datasets[name] = prior_dataset
+        self._apply_detector_labels()
         self.ctx.trace = trace
         self._set_annotation_visible(False, refresh=False)
         if hasattr(self, "plot_stack"):
@@ -5212,7 +7597,13 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.fit_target = None
         self.ctx.odmr_peaks = None
         self._selected_plot_point = None
+        self._selected_plot_points = []
         self._scan_cursor = None
+        self._update_point_readout(
+            "Point readout: click the map to pin a cell"
+            if trace.scan_dim == "scan2d"
+            else "Point readout: click a sample · Ctrl/Shift-click for multiple"
+        )
         self._scan_view_limits = None
         if hasattr(self, "clear_marker_btn"):
             self.clear_marker_btn.setVisible(False)
@@ -5223,20 +7614,11 @@ class SmartFitterMainWindow(QMainWindow):
             self.ctx.pending_locks = {}
             self._history.clear()
             self._iteration_selection_source = None
-        if self.ctx.loaded_traces is None:
-            self.ctx.loaded_traces = {}
-        self.ctx.loaded_traces[trace.file_name] = trace
-        if preserve_analysis:
-            for name, prior in prior_overlays:
-                if Path(prior.source_path).resolve() == Path(trace.source_path).resolve():
-                    continue
-                try:
-                    self.ctx.loaded_traces[name] = load_saved_data_mat(prior.source_path, mode=mode)
-                except Exception:
-                    self.ctx.loaded_traces[name] = prior
-        else:
+        overlay_warnings = self._sync_loaded_traces_for_detector(detector_id)
+        if not preserve_analysis:
             self._overlay_visible_names.clear()
         self._overlay_view_dirty = not preserve_analysis
+        self._refresh_detector_controls(detector_id)
         self._update_overlay_widgets(checked_overlays)
         self._update_recent_files(str(Path(file_path).resolve()))
         self.roi_min.setText(f"{np.min(trace.x_ns):.6g}")
@@ -5247,12 +7629,21 @@ class SmartFitterMainWindow(QMainWindow):
         # analysis mode (often Ramsey) until the user noticed the stale choice.
         self._mode_override_active = preserve_mode_override
         self.apply_profile_defaults(reload_data=False)
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentText(str(resolved_mode))
+        self.mode_combo.blockSignals(False)
+        self._auto_reference_fallback = auto_reference_fallback
         self._update_iteration_controls()
         self._update_contextual_visibility()
         self._refresh_processed()
         self.rabi_dead_time_ns.setValue(float((trace.metadata or {}).get("rabi_dead_time_ns", 0.0) or 0.0))
         self._update_profile_hint()
         self._show_loaded_trace_summary()
+        if auto_reference_fallback:
+            self.statusBar().showMessage("Reference-only acquisition detected; plotting Reference", 6000)
+        if overlay_warnings:
+            self.statusBar().showMessage(overlay_warnings[0], 6000)
+            self._message("Overlay warnings", "\n".join(overlay_warnings))
         self._is_loading = False
         return True
 
@@ -5436,6 +7827,117 @@ class SmartFitterMainWindow(QMainWindow):
             self._ax_secondary.set_xlim(self.ax_main.get_xlim())
             self._set_axis_ylim_from_series(self._ax_secondary, self._secondary_series)
             self._secondary_plot_data = (secondary_layers[0][0], secondary_layers[0][1], secondary_layers[0][2])
+
+    def _add_detector_comparison_layer(self, primary_series: list[np.ndarray]) -> None:
+        other = self._comparison_trace()
+        if other is None or other.scan_dim == "scan2d":
+            return
+        mode = self._friendly_mode_name(self._current_data_mode())
+        y_full, observable_label = self._series_for_mode(other, mode)
+        processed = process_series(
+            other.x_ns,
+            y_full,
+            bin_size=self.bin_spin.value(),
+            roi=self._parse_roi(),
+            excluded_raw_indices=self.ctx.excluded_points,
+            exclusion_ranges=self.ctx.exclusion_ranges,
+            steps=self.ctx.analysis_steps,
+        )
+        x_values = processed.analysis_x
+        y_values = processed.analysis_y
+        if len(x_values) == 0:
+            return
+        label = f"{self._detector_label(other.detector_id)} · {observable_label.split(' [')[0]}"
+        scoped_both = self._detector_scope_is_both()
+        smoothed_values = smooth_trace(y_values, self.smooth_spin.value()) if scoped_both else None
+        detector_state = self._detector_analysis_states.get(other.detector_id) if scoped_both else None
+        if mode == "contrast":
+            primary_series.append(np.asarray(y_values, dtype=float))
+            self._plot_series(
+                self.ax_main,
+                x_values,
+                y_values,
+                self._legend_label(label, self._detector_label(other.detector_id)),
+                role="overlay",
+                series_id=f"detector:{other.detector_id}",
+                color="#e06c75",
+                alpha=0.82,
+            )
+            if self.plot_opts.show_smoothed and smoothed_values is not None and self.smooth_spin.value() > 1:
+                primary_series.append(np.asarray(smoothed_values, dtype=float))
+                self._plot_series(
+                    self.ax_main,
+                    x_values,
+                    smoothed_values,
+                    self._legend_label(f"{self._detector_label(other.detector_id)} smoothed", f"{self._detector_label(other.detector_id)} smooth"),
+                    role="smoothed",
+                    series_id=f"detector:{other.detector_id}:smoothed",
+                    color="#e06c75",
+                    alpha=0.9,
+                )
+            if detector_state is not None and detector_state.fit_result is not None and self.plot_opts.show_fit:
+                fit_result = detector_state.fit_result
+                fit_x = x_values[: len(fit_result.y_fit)]
+                fit_y = np.asarray(fit_result.y_fit, dtype=float)[: len(fit_x)]
+                primary_series.append(fit_y)
+                self._plot_series(
+                    self.ax_main,
+                    fit_x,
+                    fit_y,
+                    f"{self._detector_label(other.detector_id)} fit",
+                    role="fit",
+                    series_id=f"detector:{other.detector_id}:fit",
+                    color="#f28e8e",
+                    alpha=1.0,
+                )
+            return
+        if self._ax_secondary is None:
+            self._ax_secondary = self.ax_main.twinx()
+        self._secondary_series.append(np.asarray(y_values, dtype=float))
+        self._plot_series(
+            self._ax_secondary,
+            x_values,
+            y_values,
+            self._legend_label(label, self._detector_label(other.detector_id)),
+            role="overlay",
+            series_id=f"detector:{other.detector_id}",
+            color="#e06c75",
+            alpha=0.82,
+        )
+        self._ax_secondary.set_ylabel(f"{self._detector_label(other.detector_id)} · {observable_label}")
+        self._ax_secondary.grid(False)
+        self._ax_secondary.set_autoscalex_on(False)
+        self._ax_secondary.set_xlim(self.ax_main.get_xlim())
+        self._set_axis_ylim_from_series(self._ax_secondary, self._secondary_series)
+        self._secondary_plot_data = (np.asarray(x_values), np.asarray(y_values), label)
+        if self.plot_opts.show_smoothed and smoothed_values is not None and self.smooth_spin.value() > 1:
+            self._secondary_series.append(np.asarray(smoothed_values, dtype=float))
+            self._plot_series(
+                self._ax_secondary,
+                x_values,
+                smoothed_values,
+                f"{self._detector_label(other.detector_id)} smoothed",
+                role="smoothed",
+                series_id=f"detector:{other.detector_id}:smoothed",
+                color="#f28e8e",
+                alpha=0.9,
+            )
+        if detector_state is not None and detector_state.fit_result is not None and self.plot_opts.show_fit:
+            fit_result = detector_state.fit_result
+            fit_x = x_values[: len(fit_result.y_fit)]
+            fit_y = np.asarray(fit_result.y_fit, dtype=float)[: len(fit_x)]
+            self._secondary_series.append(fit_y)
+            self._plot_series(
+                self._ax_secondary,
+                fit_x,
+                fit_y,
+                f"{self._detector_label(other.detector_id)} fit",
+                role="fit",
+                series_id=f"detector:{other.detector_id}:fit",
+                color="#ffd0d0",
+                alpha=1.0,
+            )
+            self._set_axis_ylim_from_series(self._ax_secondary, self._secondary_series)
 
     def _add_iteration_layer(self, primary_series: list[np.ndarray]):
         if self.ctx.trace is None or self.ctx.x is None:
@@ -5640,6 +8142,10 @@ class SmartFitterMainWindow(QMainWindow):
             return self._detail_axis_role
         if ax is self._scan_colorbar_ax:
             return "colorbar"
+        if ax is self._detector_compare_ax:
+            return "detector_compare"
+        if ax is self._detector_compare_colorbar_ax:
+            return "detector_compare_colorbar"
         return "main"
 
     def _register_series(
@@ -6030,6 +8536,8 @@ class SmartFitterMainWindow(QMainWindow):
         axes = {self.ax_main}
         if self._ax_secondary is not None:
             axes.add(self._ax_secondary)
+        if self._detector_compare_ax is not None:
+            axes.add(self._detector_compare_ax)
         return axes
 
     def _ensure_crosshairs(self, x: float, y: float):
@@ -6037,12 +8545,25 @@ class SmartFitterMainWindow(QMainWindow):
             self._crosshair_v = self.ax_main.axvline(x, color="#90caf9", lw=0.9, ls="--", alpha=0.7, visible=False)
         if self._crosshair_h is None:
             self._crosshair_h = self.ax_main.axhline(y, color="#90caf9", lw=0.9, ls="--", alpha=0.7, visible=False)
+        if self._detector_compare_ax is not None:
+            if self._detector_compare_crosshair_v is None:
+                self._detector_compare_crosshair_v = self._detector_compare_ax.axvline(
+                    x, color="#90caf9", lw=0.9, ls="--", alpha=0.7, visible=False
+                )
+            if self._detector_compare_crosshair_h is None:
+                self._detector_compare_crosshair_h = self._detector_compare_ax.axhline(
+                    y, color="#90caf9", lw=0.9, ls="--", alpha=0.7, visible=False
+                )
 
     def _clear_crosshairs(self):
         if self._crosshair_v is not None:
             self._crosshair_v.set_visible(False)
         if self._crosshair_h is not None:
             self._crosshair_h.set_visible(False)
+        if self._detector_compare_crosshair_v is not None:
+            self._detector_compare_crosshair_v.set_visible(False)
+        if self._detector_compare_crosshair_h is not None:
+            self._detector_compare_crosshair_h.set_visible(False)
         self.canvas.draw_idle()
 
     def _scan_best_points(self) -> dict[str, tuple[float, ...]]:
@@ -6053,6 +8574,7 @@ class SmartFitterMainWindow(QMainWindow):
             if display is None:
                 return {}
             x_centers, y_centers, z, _x_label, _y_label = display
+            z, _source_label = self._spot_map_for_display(self.ctx.trace, z)
             max_idx = np.unravel_index(int(np.nanargmax(z)), z.shape)
             min_idx = np.unravel_index(int(np.nanargmin(z)), z.shape)
             return {
@@ -6091,6 +8613,746 @@ class SmartFitterMainWindow(QMainWindow):
             return None
         return float(x[idx[-1]] - x[idx[0]])
 
+    def _spot_target_traces(self) -> list[ExperimentTrace]:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return []
+        if self._detector_scope_is_both() and self._primary_dataset is not None:
+            return [
+                self._primary_dataset.detectors[detector_id]
+                for detector_id in self._primary_dataset.available_detectors
+                if detector_id in self._primary_dataset.detectors
+                and self._primary_dataset.detectors[detector_id].scan_dim == "scan2d"
+            ]
+        return [self.ctx.trace]
+
+    @staticmethod
+    def _raw_scan_grid(trace: ExperimentTrace) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        if trace.x2d is None or trace.y2d is None or trace.z2d is None:
+            return None
+        x2d = np.asarray(trace.x2d, dtype=float)
+        y2d = np.asarray(trace.y2d, dtype=float)
+        z2d = np.asarray(trace.z2d, dtype=float)
+        if x2d.ndim != 2 or y2d.ndim != 2 or z2d.ndim != 2 or z2d.shape != x2d.shape or z2d.shape != y2d.shape:
+            return None
+        return np.asarray(x2d[0, :], dtype=float), np.asarray(y2d[:, 0], dtype=float), z2d
+
+    @staticmethod
+    def _scan_source_map(trace: ExperimentTrace, source_key: str) -> tuple[np.ndarray, str] | None:
+        """Return an untransposed 2D observable without reloading the MAT file."""
+        if trace.z2d is None:
+            return None
+        shape = np.asarray(trace.z2d).shape
+        signal = None if trace.signal2d is None else np.asarray(trace.signal2d, dtype=float)
+        reference = None if trace.reference2d is None else np.asarray(trace.reference2d, dtype=float)
+        if signal is not None and signal.shape != shape:
+            signal = None
+        if reference is not None and reference.shape != shape:
+            reference = None
+        key = source_key.strip().lower().replace("raw_signal", "signal")
+        if key == "signal" and signal is not None:
+            return signal, "Signal"
+        if key == "reference" and reference is not None:
+            return reference, "Reference"
+        if key == "difference" and signal is not None and reference is not None:
+            return reference - signal, "Difference"
+        if key == "contrast" and signal is not None and reference is not None:
+            denominator = np.where(reference == 0.0, np.nan, reference)
+            return (reference - signal) / denominator, "Contrast"
+        current_key = str(trace.mode).lower().replace("raw_signal", "signal")
+        if key == current_key:
+            return np.asarray(trace.z2d, dtype=float), key.title()
+        return None
+
+    @staticmethod
+    def _map_has_structure(values: np.ndarray) -> bool:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size < 9:
+            return False
+        low, high = np.nanpercentile(finite, [1.0, 99.0])
+        scale = max(abs(float(np.nanmedian(finite))), abs(float(low)), abs(float(high)), 1.0)
+        return bool(float(high - low) > np.finfo(float).eps * scale * 64.0)
+
+    def _spot_source_map(self, trace: ExperimentTrace) -> tuple[np.ndarray, str, str] | None:
+        selection = self.spot_source_combo.currentText().strip().lower()
+        if selection == "auto fluorescence":
+            # XY fluorescence objects are normally clearest in the raw photon
+            # counts. Contrast may legitimately be constant when signal and
+            # reference were acquired identically.
+            for key in ("signal", "reference"):
+                candidate = self._scan_source_map(trace, key)
+                if candidate is not None and self._map_has_structure(candidate[0]):
+                    return candidate[0], candidate[1], key
+            key = str(trace.mode).lower().replace("raw_signal", "signal")
+        elif selection == "current observable":
+            key = str(trace.mode).lower().replace("raw_signal", "signal")
+        else:
+            key = selection
+        candidate = self._scan_source_map(trace, key)
+        return None if candidate is None else (candidate[0], candidate[1], key)
+
+    def _spot_map_for_display(self, trace: ExperimentTrace, default_z: np.ndarray) -> tuple[np.ndarray, str]:
+        label = self._current_observable_label()
+        if not hasattr(self, "spot_display_source_chk") or not self.spot_display_source_chk.isChecked():
+            return default_z, label
+        diagnostics = self._scan_spot_diagnostics.get(trace.detector_id)
+        if not diagnostics:
+            return default_z, label
+        source = self._scan_source_map(trace, str(diagnostics.get("source_key", "")))
+        if source is None:
+            return default_z, label
+        source_z, source_label = source
+        if self.scan_swap_axes_chk.isChecked():
+            source_z = source_z.T
+        return source_z, source_label
+
+    def _detect_scan_spots(self) -> None:
+        traces = self._spot_target_traces()
+        if not traces:
+            self._message("Fluorescent spots", "Load a two-dimensional XY scan first.")
+            return
+        self._record_analysis_state("Detect fluorescent spots")
+        # A fresh detection replaces the previous result set; do not leave a
+        # stale Restore action that would resurrect an older curation state.
+        self._scan_spot_removed_backup = None
+        self._scan_spot_removed_diagnostics_backup = None
+        self._scan_spot_removed_pair_backup = None
+        self._scan_spot_removed_metrics_backup = {}
+        self.spot_restore_btn.setEnabled(False)
+        failures: list[str] = []
+        self._spot_comparison_pair = None
+        self._spot_comparison_metrics = {}
+        self.spot_compare_lbl.setText("Detector comparison: not selected")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for trace in traces:
+                self._scan_spot_results.pop(trace.detector_id, None)
+                self._scan_spot_diagnostics.pop(trace.detector_id, None)
+                grid = self._raw_scan_grid(trace)
+                if grid is None:
+                    failures.append(f"{self._detector_label(trace.detector_id)}: malformed XY grid")
+                    continue
+                x, y, _current_z = grid
+                source = self._spot_source_map(trace)
+                if source is None:
+                    failures.append(
+                        f"{self._detector_label(trace.detector_id)}: the selected fluorescence source is unavailable"
+                    )
+                    continue
+                z, source_label, source_key = source
+                try:
+                    result = detect_fluorescent_spots(
+                        x,
+                        y,
+                        z,
+                        polarity=self.spot_polarity_combo.currentText(),
+                        threshold_sigma=float(self.spot_threshold_spin.value()),
+                        min_pixels=int(self.spot_min_pixels_spin.value()),
+                        max_spots=int(self.spot_max_count_spin.value()),
+                        background_window_pixels=int(self.spot_background_spin.value()),
+                    )
+                except Exception as exc:
+                    failures.append(f"{self._detector_label(trace.detector_id)}: {exc}")
+                    continue
+                for spot in result.spots:
+                    spot.source = source_label
+                self._scan_spot_results[trace.detector_id] = result.spots
+                self._scan_spot_diagnostics[trace.detector_id] = {
+                    "noise_sigma": result.noise_sigma,
+                    "background_window_pixels": result.background_window_pixels,
+                    "tested_polarities": list(result.tested_polarities),
+                    "source_key": source_key,
+                    "source_label": source_label,
+                }
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.spot_overlay_chk.setChecked(True)
+        self._populate_spot_table()
+        self._mark_document_dirty()
+        self._refresh_plot_only()
+        detected = sum(len(self._scan_spot_results.get(trace.detector_id, [])) for trace in traces)
+        message = f"Detected and fitted {detected} fluorescent spot{'s' if detected != 1 else ''}."
+        if failures:
+            message += " " + " ".join(failures)
+        self.statusBar().showMessage(message, 7000)
+
+    def _clear_scan_spots(self) -> None:
+        targets = self._spot_target_traces()
+        detector_ids = [trace.detector_id for trace in targets] or [self._active_detector_id()]
+        self._record_analysis_state("Clear fluorescent spots")
+        self._backup_spot_state_for_curation()
+        for detector_id in detector_ids:
+            self._scan_spot_results.pop(detector_id, None)
+            self._scan_spot_diagnostics.pop(detector_id, None)
+        self._populate_spot_table()
+        self.spot_restore_btn.setEnabled(True)
+        self._spot_comparison_pair = None
+        self._spot_comparison_metrics = {}
+        self.spot_compare_lbl.setText("Detector comparison: not selected")
+        self._mark_document_dirty()
+        if self.ctx.trace is not None:
+            self._refresh_plot_only()
+
+    def _on_spot_overlay_changed(self, _checked: bool) -> None:
+        if self._syncing_scan_controls:
+            return
+        self._mark_document_dirty()
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            self._refresh_plot_only()
+
+    @staticmethod
+    def _axis_name_tokens(label: Any) -> set[str]:
+        """Normalize a scan-axis label into searchable name tokens."""
+        return {
+            token
+            for token in re.sub(r"[^a-z0-9]+", " ", str(label).strip().lower()).split()
+            if token
+        }
+
+    def _spot_physical_center(self, detector_id: str, spot: SpotFit) -> tuple[float, float]:
+        """Return a spot center as physical X, Y, independent of map storage order.
+
+        Some saved XY runs contain the analysis map with the acquisition axes
+        ordered ``(y, x)``.  The detector trace records that order in
+        ``scan_axes`` and the renderer transposes it for the default X/Y view.
+        Spot fitting intentionally keeps the native grid for compatibility;
+        this adapter makes user-facing tables and comparisons use physical X,
+        Y consistently.
+        """
+        raw_x, raw_y = float(spot.center_x), float(spot.center_y)
+        trace = None
+        if self._primary_dataset is not None:
+            trace = self._primary_dataset.detectors.get(detector_id)
+        if trace is None and self.ctx.trace is not None and self.ctx.trace.detector_id == detector_id:
+            trace = self.ctx.trace
+        labels = tuple(trace.scan_axes) if trace is not None else ()
+        if len(labels) >= 2:
+            first_tokens = self._axis_name_tokens(labels[0])
+            second_tokens = self._axis_name_tokens(labels[1])
+            if "y" in first_tokens and "x" in second_tokens:
+                return raw_y, raw_x
+        return raw_x, raw_y
+
+    def _populate_spot_table(self) -> None:
+        if not hasattr(self, "spot_results_table"):
+            return
+        self.spot_results_table.setRowCount(0)
+        detector_ids = (
+            list(self._primary_dataset.available_detectors)
+            if self._primary_dataset is not None
+            else [self._active_detector_id()]
+        )
+        self.spot_results_table.setColumnHidden(1, len(detector_ids) <= 1)
+        total = 0
+        for detector_id in detector_ids:
+            for spot in self._scan_spot_results.get(detector_id, []):
+                row = self.spot_results_table.rowCount()
+                self.spot_results_table.insertRow(row)
+                values = self._spot_table_row(detector_id, spot)
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, (detector_id, int(spot.spot_id)))
+                    item.setToolTip(
+                        f"{spot.polarity.title()} spot fitted from {spot.source} · amplitude={spot.amplitude:.6g} · "
+                        f"contrast={spot.contrast_percent:.4g}% · SNR={spot.snr:.3g} · axis ratio={spot.axis_ratio:.3g}"
+                    )
+                    self.spot_results_table.setItem(row, column, item)
+                total += 1
+        if total:
+            failed = sum(
+                not spot.fit_success
+                for spots in self._scan_spot_results.values()
+                for spot in spots
+            )
+            sources = sorted(
+                {spot.source for spots in self._scan_spot_results.values() for spot in spots if spot.source}
+            )
+            note = f"{total} fitted spot{'s' if total != 1 else ''}"
+            if sources:
+                note += f" · source {', '.join(sources)}"
+            if failed:
+                note += f" · {failed} moment estimate{'s' if failed != 1 else ''} after fit failure"
+            self.spot_status_lbl.setText(note)
+        else:
+            analyzed_sources = sorted(
+                {
+                    str(values.get("source_label"))
+                    for values in self._scan_spot_diagnostics.values()
+                    if values.get("source_label")
+                }
+            )
+            if analyzed_sources:
+                self.spot_status_lbl.setText(
+                    f"No spots above threshold · analyzed {', '.join(analyzed_sources)}"
+                )
+            else:
+                self.spot_status_lbl.setText("No fitted spots")
+
+    def _selected_spot_keys(self) -> list[tuple[str, int]]:
+        if not hasattr(self, "spot_results_table"):
+            return []
+        keys: list[tuple[str, int]] = []
+        for index in self.spot_results_table.selectionModel().selectedRows(0):
+            item = self.spot_results_table.item(index.row(), 0)
+            value = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                key = (str(value[0]), int(value[1]))
+                if key not in keys:
+                    keys.append(key)
+        return keys
+
+    def _clone_spot_results(self) -> dict[str, list[SpotFit]]:
+        return {
+            detector_id: [SpotFit.from_dict(spot.to_dict()) for spot in spots]
+            for detector_id, spots in self._scan_spot_results.items()
+        }
+
+    def _normalise_spot_ids(self) -> None:
+        for spots in self._scan_spot_results.values():
+            for index, spot in enumerate(spots, start=1):
+                spot.spot_id = index
+
+    def _clear_invalid_spot_comparison(self) -> None:
+        if self._spot_comparison_pair is None:
+            return
+        available = {
+            (detector_id, int(spot.spot_id))
+            for detector_id, spots in self._scan_spot_results.items()
+            for spot in spots
+        }
+        if any(key not in available for key in self._spot_comparison_pair):
+            self._spot_comparison_pair = None
+            self._spot_comparison_metrics = {}
+            self.spot_compare_lbl.setText("Detector comparison: not selected")
+
+    def _backup_spot_state_for_curation(self) -> None:
+        """Keep one recoverable pre-curation snapshot for the Restore button."""
+        self._scan_spot_removed_backup = self._clone_spot_results()
+        self._scan_spot_removed_diagnostics_backup = {
+            str(detector_id): dict(values)
+            for detector_id, values in self._scan_spot_diagnostics.items()
+        }
+        self._scan_spot_removed_pair_backup = self._spot_comparison_pair
+        self._scan_spot_removed_metrics_backup = dict(self._spot_comparison_metrics)
+
+    def _remove_selected_spots(self) -> None:
+        keys = set(self._selected_spot_keys())
+        if not keys:
+            self.statusBar().showMessage("Select one or more fitted spots first", 3000)
+            return
+        self._record_analysis_state("Remove fluorescent spots")
+        self._backup_spot_state_for_curation()
+        for detector_id, spots in list(self._scan_spot_results.items()):
+            self._scan_spot_results[detector_id] = [
+                spot for spot in spots if (detector_id, int(spot.spot_id)) not in keys
+            ]
+            if not self._scan_spot_results[detector_id]:
+                self._scan_spot_results.pop(detector_id, None)
+        self._normalise_spot_ids()
+        self._clear_invalid_spot_comparison()
+        self.spot_restore_btn.setEnabled(True)
+        self._populate_spot_table()
+        self._mark_document_dirty()
+        self._refresh_plot_only()
+        self.statusBar().showMessage(f"Removed {len(keys)} fitted spot{'s' if len(keys) != 1 else ''}", 3000)
+
+    def _keep_selected_spots(self) -> None:
+        keys = self._selected_spot_keys()
+        if not keys:
+            self.statusBar().showMessage("Select the spots to keep first", 3000)
+            return
+        self._record_analysis_state("Keep selected fluorescent spots")
+        selected_by_detector: dict[str, set[int]] = {}
+        for detector_id, spot_id in keys:
+            selected_by_detector.setdefault(detector_id, set()).add(spot_id)
+        self._backup_spot_state_for_curation()
+        removed = 0
+        for detector_id, selected_ids in selected_by_detector.items():
+            spots = self._scan_spot_results.get(detector_id, [])
+            kept = [spot for spot in spots if int(spot.spot_id) in selected_ids]
+            removed += len(spots) - len(kept)
+            if kept:
+                self._scan_spot_results[detector_id] = kept
+            else:
+                self._scan_spot_results.pop(detector_id, None)
+        self._normalise_spot_ids()
+        self._clear_invalid_spot_comparison()
+        self.spot_restore_btn.setEnabled(True)
+        self._populate_spot_table()
+        self._mark_document_dirty()
+        self._refresh_plot_only()
+        self.statusBar().showMessage(f"Kept selected spots; removed {removed}", 3000)
+
+    def _restore_removed_spots(self) -> None:
+        if self._scan_spot_removed_backup is None:
+            return
+        self._record_analysis_state("Restore fluorescent spots")
+        self._scan_spot_results = self._scan_spot_removed_backup
+        self._scan_spot_diagnostics = self._scan_spot_removed_diagnostics_backup or {}
+        self._spot_comparison_pair = self._scan_spot_removed_pair_backup
+        self._spot_comparison_metrics = self._scan_spot_removed_metrics_backup
+        self._scan_spot_removed_backup = None
+        self._scan_spot_removed_diagnostics_backup = None
+        self._scan_spot_removed_pair_backup = None
+        self._scan_spot_removed_metrics_backup = {}
+        self.spot_restore_btn.setEnabled(False)
+        self._clear_invalid_spot_comparison()
+        self._update_spot_comparison_label()
+        self._populate_spot_table()
+        self._mark_document_dirty()
+        self._refresh_plot_only()
+        self.statusBar().showMessage("Restored the previous fitted-spot list", 3000)
+
+    def _spot_for_key(self, key: tuple[str, int]) -> SpotFit | None:
+        detector_id, spot_id = key
+        return next(
+            (spot for spot in self._scan_spot_results.get(detector_id, []) if int(spot.spot_id) == int(spot_id)),
+            None,
+        )
+
+    def _spot_source_map_for_comparison(self, trace: ExperimentTrace) -> np.ndarray | None:
+        diagnostics = self._scan_spot_diagnostics.get(trace.detector_id, {})
+        source_key = str(diagnostics.get("source_key", ""))
+        source = self._scan_source_map(trace, source_key) if source_key else None
+        if source is None:
+            source = self._scan_source_map(trace, str(trace.mode))
+        return None if source is None else np.asarray(source[0], dtype=float)
+
+    def _spot_profile_correlation(
+        self,
+        trace_a: ExperimentTrace,
+        spot_a: SpotFit,
+        trace_b: ExperimentTrace,
+        spot_b: SpotFit,
+    ) -> float:
+        map_a = self._spot_source_map_for_comparison(trace_a)
+        map_b = self._spot_source_map_for_comparison(trace_b)
+        if map_a is None or map_b is None or map_a.shape != map_b.shape:
+            return float("nan")
+        grid_a = self._raw_scan_grid(trace_a)
+        grid_b = self._raw_scan_grid(trace_b)
+        if grid_a is None or grid_b is None:
+            return float("nan")
+        xa, ya, _ = grid_a
+        xb, yb, _ = grid_b
+        if len(xa) != len(xb) or len(ya) != len(yb):
+            return float("nan")
+        if (len(xa) > 1 and not np.allclose(xa, xb)) or (len(ya) > 1 and not np.allclose(ya, yb)):
+            return float("nan")
+        col_a = int(np.argmin(np.abs(xa - spot_a.center_x)))
+        row_a = int(np.argmin(np.abs(ya - spot_a.center_y)))
+        col_b = int(np.argmin(np.abs(xb - spot_b.center_x)))
+        row_b = int(np.argmin(np.abs(yb - spot_b.center_y)))
+        half = 3
+        patch_a = map_a[max(0, row_a - half):min(map_a.shape[0], row_a + half + 1), max(0, col_a - half):min(map_a.shape[1], col_a + half + 1)]
+        patch_b = map_b[max(0, row_b - half):min(map_b.shape[0], row_b + half + 1), max(0, col_b - half):min(map_b.shape[1], col_b + half + 1)]
+        if patch_a.shape != patch_b.shape:
+            return float("nan")
+        values_a, values_b = patch_a.ravel(), patch_b.ravel()
+        valid = np.isfinite(values_a) & np.isfinite(values_b)
+        if np.count_nonzero(valid) < 4:
+            return float("nan")
+        values_a, values_b = values_a[valid], values_b[valid]
+        std_a, std_b = float(np.std(values_a)), float(np.std(values_b))
+        if std_a <= np.finfo(float).eps or std_b <= np.finfo(float).eps:
+            return float("nan")
+        return float(np.corrcoef(values_a, values_b)[0, 1])
+
+    def _update_spot_comparison_label(self) -> None:
+        """Render the compact detector-comparison summary from stored values."""
+        pair = self._spot_comparison_pair
+        if pair is None:
+            self.spot_compare_lbl.setText("Detector comparison: not selected")
+            return
+        spot_a, spot_b = self._spot_for_key(pair[0]), self._spot_for_key(pair[1])
+        if spot_a is None or spot_b is None:
+            self._spot_comparison_pair = None
+            self._spot_comparison_metrics = {}
+            self.spot_compare_lbl.setText("Detector comparison: not selected")
+            return
+        metrics = self._spot_comparison_metrics
+
+        def fmt(value: Any, suffix: str = "") -> str:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "n/a"
+            return "n/a" if not np.isfinite(numeric) else f"{numeric:.4g}{suffix}"
+
+        self.spot_compare_lbl.setText(
+            f"{self._detector_label(pair[0][0])} #{pair[0][1]} ↔ {self._detector_label(pair[1][0])} #{pair[1][1]}\n"
+            f"Center Δ: X {fmt(metrics.get('dx'))}, Y {fmt(metrics.get('dy'))}, "
+            f"separation {fmt(metrics.get('distance'))}\n"
+            f"Radius ratio (major/minor): {fmt(metrics.get('major_ratio'))} / "
+            f"{fmt(metrics.get('minor_ratio'))} · angle Δ {fmt(metrics.get('angle_delta'), '°')} · "
+            f"amplitude ratio {fmt(metrics.get('amplitude_ratio'))}\n"
+            f"Local profile correlation: {fmt(metrics.get('correlation'))}"
+        )
+
+    def _spot_comparison_payload(self) -> dict[str, Any] | None:
+        pair = self._spot_comparison_pair
+        if pair is None:
+            return None
+        return {
+            "pair": [list(key) for key in pair],
+            "metrics": json_safe(self._spot_comparison_metrics),
+        }
+
+    def _restore_spot_comparison_payload(self, payload: Any) -> None:
+        self._spot_comparison_pair = None
+        self._spot_comparison_metrics = {}
+        if isinstance(payload, dict):
+            raw_pair = payload.get("pair")
+            pair: list[tuple[str, int]] = []
+            if isinstance(raw_pair, (list, tuple)):
+                for value in raw_pair[:2]:
+                    if isinstance(value, (list, tuple)) and len(value) == 2:
+                        try:
+                            pair.append((str(value[0]), int(value[1])))
+                        except (TypeError, ValueError):
+                            pass
+            if len(pair) == 2:
+                self._spot_comparison_pair = tuple(pair)
+                self._spot_comparison_metrics = dict(payload.get("metrics") or {})
+        self._clear_invalid_spot_comparison()
+        self._update_spot_comparison_label()
+
+    def _compare_detector_spots(self) -> None:
+        if self._primary_dataset is None:
+            self.spot_compare_lbl.setText("Detector comparison: load a dual-detector XY scan")
+            return
+        detector_ids = [
+            detector_id
+            for detector_id in self._primary_dataset.available_detectors
+            if self._primary_dataset.detectors.get(detector_id) is not None
+            and self._primary_dataset.detectors[detector_id].scan_dim == "scan2d"
+            and self._scan_spot_results.get(detector_id)
+        ]
+        if len(detector_ids) < 2:
+            self.spot_compare_lbl.setText("Detector comparison: fit at least one spot in each detector")
+            return
+        self._record_analysis_state("Compare detector spots")
+        selected = self._selected_spot_keys()
+        by_detector: dict[str, list[tuple[str, int]]] = {}
+        for key in selected:
+            by_detector.setdefault(key[0], []).append(key)
+        pair: list[tuple[str, int]] = []
+        for detector_id in detector_ids[:2]:
+            if by_detector.get(detector_id):
+                pair.append(by_detector[detector_id][0])
+            else:
+                spots = self._scan_spot_results[detector_id]
+                pair.append((detector_id, int(spots[0].spot_id)))
+        # If one detector row was selected, pair it with the closest physical
+        # center in the other detector; otherwise strongest spots are used.
+        if selected and len(pair) == 2:
+            if by_detector.get(detector_ids[0]) and not by_detector.get(detector_ids[1]):
+                anchor = self._spot_for_key(pair[0])
+                if anchor is not None:
+                    anchor_x, anchor_y = self._spot_physical_center(pair[0][0], anchor)
+                    candidate = min(
+                        self._scan_spot_results[detector_ids[1]],
+                        key=lambda spot: (
+                            self._spot_physical_center(detector_ids[1], spot)[0] - anchor_x
+                        ) ** 2
+                        + (self._spot_physical_center(detector_ids[1], spot)[1] - anchor_y) ** 2,
+                    )
+                    pair[1] = (detector_ids[1], int(candidate.spot_id))
+            elif by_detector.get(detector_ids[1]) and not by_detector.get(detector_ids[0]):
+                anchor = self._spot_for_key(pair[1])
+                if anchor is not None:
+                    anchor_x, anchor_y = self._spot_physical_center(pair[1][0], anchor)
+                    candidate = min(
+                        self._scan_spot_results[detector_ids[0]],
+                        key=lambda spot: (
+                            self._spot_physical_center(detector_ids[0], spot)[0] - anchor_x
+                        ) ** 2
+                        + (self._spot_physical_center(detector_ids[0], spot)[1] - anchor_y) ** 2,
+                    )
+                    pair[0] = (detector_ids[0], int(candidate.spot_id))
+        spot_a, spot_b = self._spot_for_key(pair[0]), self._spot_for_key(pair[1])
+        if spot_a is None or spot_b is None:
+            return
+        trace_a = self._primary_dataset.detectors[pair[0][0]]
+        trace_b = self._primary_dataset.detectors[pair[1][0]]
+        center_a_x, center_a_y = self._spot_physical_center(pair[0][0], spot_a)
+        center_b_x, center_b_y = self._spot_physical_center(pair[1][0], spot_b)
+        dx = float(center_b_x - center_a_x)
+        dy = float(center_b_y - center_a_y)
+        distance = float(np.hypot(dx, dy))
+        major_ratio = float(spot_b.half_max_radius_major / spot_a.half_max_radius_major) if spot_a.half_max_radius_major else float("nan")
+        minor_ratio = float(spot_b.half_max_radius_minor / spot_a.half_max_radius_minor) if spot_a.half_max_radius_minor else float("nan")
+        angle_delta = float(((spot_b.angle_deg - spot_a.angle_deg + 90.0) % 180.0) - 90.0)
+        amplitude_ratio = float(abs(spot_b.amplitude) / abs(spot_a.amplitude)) if abs(spot_a.amplitude) > np.finfo(float).eps else float("nan")
+        correlation = self._spot_profile_correlation(trace_a, spot_a, trace_b, spot_b)
+        self._spot_comparison_pair = (pair[0], pair[1])
+        self._spot_comparison_metrics = {
+            "dx": dx, "dy": dy, "distance": distance, "major_ratio": major_ratio,
+            "minor_ratio": minor_ratio, "angle_delta": angle_delta,
+            "amplitude_ratio": amplitude_ratio, "correlation": correlation,
+        }
+        self._update_spot_comparison_label()
+        self._mark_document_dirty()
+        self._refresh_plot_only()
+
+    def _go_to_spot_row(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        key_item = self.spot_results_table.item(row, 0)
+        if key_item is None:
+            return
+        key = key_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(key, (tuple, list)) or len(key) != 2:
+            return
+        detector_id, spot_id = str(key[0]), int(key[1])
+        spot = next((candidate for candidate in self._scan_spot_results.get(detector_id, []) if candidate.spot_id == spot_id), None)
+        if spot is None:
+            return
+        if detector_id != self._active_detector_id():
+            self._activate_detector(detector_id)
+        # The map may display a transposed orientation, but spot records and
+        # copied tables remain physical X, Y. Only the navigation coordinates
+        # are transformed here to land on the visible map cell.
+        x, y = (spot.center_y, spot.center_x) if self.scan_swap_axes_chk.isChecked() else (spot.center_x, spot.center_y)
+        self._select_point_from_plot(float(x), float(y), refresh=True, detector_id=detector_id)
+
+    @staticmethod
+    def _format_spot_number(value: Any, significant: int = 5) -> str:
+        """Format a spot value compactly for tables and presentation paste."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        if not np.isfinite(number):
+            return "n/a"
+        return f"{number:.{int(significant)}g}"
+
+    def _spot_table_row(self, detector_id: str, spot: SpotFit) -> list[str]:
+        x, y = self._spot_physical_center(detector_id, spot)
+        fmt = self._format_spot_number
+        return [
+            str(spot.spot_id), self._detector_label(detector_id),
+            f"{fmt(x)}, {fmt(y)}",
+            f"{fmt(spot.half_max_radius_major, 4)} × {fmt(spot.half_max_radius_minor, 4)} @ {fmt(spot.angle_deg, 3)}°",
+            fmt(spot.r_squared, 4),
+        ]
+
+    def _spot_presentation_rows(self) -> list[list[str]]:
+        return [["#", "Detector", "Center X, Y", "R major × minor", "R²"]] + [
+            self._spot_table_row(detector_id, spot)
+            for detector_id, spots in self._scan_spot_results.items()
+            for spot in spots
+        ]
+
+    @staticmethod
+    def _spot_presentation_html(rows: list[list[str]]) -> str:
+        """Build a styled HTML table understood by PowerPoint and Office."""
+        if not rows:
+            return ""
+        header, *body = rows
+        parts = [
+            '<meta http-equiv="content-type" content="text/html; charset=utf-8">',
+            '<table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;'
+            'font-size:10pt;color:#17202a;background:#ffffff;">',
+            "<thead><tr>",
+        ]
+        for value in header:
+            parts.append(
+                '<th style="border:1px solid #9aa7b5;background:#2f3a46;color:#ffffff;'
+                'font-weight:600;padding:4px 8px;text-align:left;">'
+                f"{_html_escape(str(value))}</th>"
+            )
+        parts.append("</tr></thead><tbody>")
+        for row_index, row in enumerate(body):
+            background = "#ffffff" if row_index % 2 == 0 else "#eef2f6"
+            parts.append("<tr>")
+            for value in row:
+                parts.append(
+                    f'<td style="border:1px solid #c5ced8;background:{background};padding:4px 8px;'
+                    f'text-align:left;">{_html_escape(str(value))}</td>'
+                )
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+
+    def _copy_spot_table(self) -> None:
+        rows = self._spot_presentation_rows()
+        selected = set(self._selected_spot_keys())
+        if selected:
+            rows = rows[:1] + [
+                self._spot_table_row(detector_id, spot)
+                for detector_id, spots in self._scan_spot_results.items()
+                for spot in spots if (detector_id, spot.spot_id) in selected
+            ]
+        if len(rows) == 1:
+            self.statusBar().showMessage("No spot results to copy", 3000)
+            return
+        buffer = StringIO()
+        csv.writer(buffer, delimiter="\t", lineterminator="\r\n").writerows(rows)
+        tsv = buffer.getvalue()
+        clipboard = QApplication.clipboard()
+        # The offscreen/minimal Qt backends do not own a native clipboard and
+        # can crash during interpreter teardown when handed QMimeData. Keep
+        # their deterministic text fallback for tests/headless use; the
+        # Windows desktop path receives both TSV and rich HTML below.
+        if str(QApplication.platformName()).lower() in {"offscreen", "minimal"}:
+            clipboard.setText(tsv)
+        else:
+            mime = QMimeData()
+            # TSV is the universal fallback; Office applications prefer the
+            # HTML representation and paste it as an actual, sensibly styled table.
+            mime.setText(tsv)
+            mime.setHtml(self._spot_presentation_html(rows))
+            clipboard.setMimeData(mime)
+        self.statusBar().showMessage(f"Copied {len(rows) - 1} spot rows for PowerPoint", 3000)
+
+    def _draw_scan_spot_overlays(self, axis, detector_id: str) -> None:
+        if not hasattr(self, "spot_overlay_chk") or not self.spot_overlay_chk.isChecked():
+            return
+        swapped = self.scan_swap_axes_chk.isChecked()
+        highlighted = {
+            tuple(self._spot_comparison_pair[0]) if self._spot_comparison_pair else None,
+            tuple(self._spot_comparison_pair[1]) if self._spot_comparison_pair else None,
+        }
+        for spot in self._scan_spot_results.get(detector_id, []):
+            center_x, center_y = (spot.center_y, spot.center_x) if swapped else (spot.center_x, spot.center_y)
+            angle = 90.0 - spot.angle_deg if swapped else spot.angle_deg
+            ellipse_width, ellipse_height = (
+                (spot.fwhm_minor, spot.fwhm_major)
+                if swapped
+                else (spot.fwhm_major, spot.fwhm_minor)
+            )
+            is_highlighted = (
+                self.spot_compare_highlight_chk.isChecked()
+                and (detector_id, int(spot.spot_id)) in highlighted
+            )
+            color = "#ffcf5a" if is_highlighted else ("#ff3f9b" if spot.polarity == "bright" else "#00c2d7")
+            ellipse = Ellipse(
+                (center_x, center_y),
+                width=ellipse_width,
+                height=ellipse_height,
+                angle=angle,
+                fill=False,
+                edgecolor=color,
+                linewidth=2.8 if is_highlighted else 1.8,
+                linestyle="--" if is_highlighted else "-",
+                zorder=8,
+            )
+            axis.add_patch(ellipse)
+            axis.plot(center_x, center_y, marker="+", ms=9, mew=1.8, color=color, linestyle="None", zorder=9)
+            if self.spot_labels_chk.isChecked():
+                axis.annotate(
+                    str(spot.spot_id),
+                    (center_x, center_y),
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                    color="#ffffff",
+                    fontsize=8,
+                    fontweight="bold",
+                    bbox={"boxstyle": "round,pad=0.15", "facecolor": color, "edgecolor": "#111111", "alpha": 0.9},
+                    zorder=10,
+                )
+
     def _update_scan_summary(self):
         if self.ctx.trace is None or not self._trace_is_scan():
             self.scan_summary_text.setPlainText("")
@@ -6098,7 +9360,13 @@ class SmartFitterMainWindow(QMainWindow):
             return
         trace = self.ctx.trace
         points = self._scan_best_points()
-        lines: list[str] = [f"Observable: {self.mode_combo.currentText()}"]
+        lines: list[str] = [
+            f"Detector: {self._detector_label(trace.detector_id)}",
+            f"Observable: {self.mode_combo.currentText()}",
+        ]
+        other_detector = self._comparison_trace()
+        if other_detector is not None:
+            lines.append(f"Comparison: {self._detector_label(other_detector.detector_id)}")
         if trace.scan_dim == "scan1d":
             secondary = self.scan_secondary_combo.currentText().strip().lower()
             current = self.mode_combo.currentText().strip().lower()
@@ -6110,6 +9378,14 @@ class SmartFitterMainWindow(QMainWindow):
                 lines.append(f"Min point: x={points['min'][0]:.6g}, y={points['min'][1]:.6g}, z={points['min'][2]:.6g}")
                 if self._scan_cursor is None:
                     self.scan_cursor_lbl.setText("Cursor: click the map to pin a cell.")
+                spots = self._scan_spot_results.get(trace.detector_id, [])
+                if spots:
+                    best = spots[0]
+                    center_x, center_y = self._spot_physical_center(trace.detector_id, best)
+                    lines.append(
+                        f"Fluorescent spots ({best.source}): {len(spots)} · strongest center=({center_x:.6g}, {center_y:.6g}) · "
+                        f"half-max radii={best.half_max_radius_major:.4g}, {best.half_max_radius_minor:.4g}"
+                    )
             else:
                 x = self.ctx.x if self.ctx.x is not None else np.array([])
                 y = self.ctx.y if self.ctx.y is not None else np.array([])
@@ -6128,13 +9404,15 @@ class SmartFitterMainWindow(QMainWindow):
                         lines.append(f"Dip width: {w_min:.6g}")
         self.scan_summary_text.setPlainText("\n".join(lines))
 
-    def _extract_scan_linecut(self) -> tuple[np.ndarray, np.ndarray, str] | None:
-        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or self.ctx.trace.z2d is None:
+    def _extract_scan_linecut(self, trace: ExperimentTrace | None = None) -> tuple[np.ndarray, np.ndarray, str] | None:
+        trace = self.ctx.trace if trace is None else trace
+        if trace is None or trace.scan_dim != "scan2d" or trace.z2d is None:
             return None
-        display = self._scan2d_display_data(self.ctx.trace)
+        display = self._scan2d_display_data(trace)
         if display is None:
             return None
         x_centers, y_centers, z2d, _x_label, _y_label = display
+        z2d, _source_label = self._spot_map_for_display(trace, z2d)
         mode = self.scan_linecut_combo.currentText()
         if mode.strip().lower() == "none":
             return None
@@ -6152,27 +9430,59 @@ class SmartFitterMainWindow(QMainWindow):
         return y_centers, z2d[:, col], f"Vertical linecut @ x={x_centers[col]:.6g}"
 
     def _on_plot_motion(self, event):
+        editable = self._editable_plot_element(event)
+        if editable is not None:
+            self.canvas.setCursor(Qt.CursorShape.PointingHandCursor)
+            kind = str(editable["kind"]).replace("_", " ")
+            self.statusBar().showMessage(f"Double-click to edit {kind}", 1200)
+        else:
+            self.canvas.unsetCursor()
         if self.mask_mode_combo.currentText() != "Inspect point" or event.inaxes not in self._inspectable_axes():
             return
         if event.xdata is None:
             return
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" and event.ydata is not None:
+            source_trace = self._scan_trace_for_axis(event.inaxes)
+            if source_trace is None:
+                return
             self._ensure_crosshairs(float(event.xdata), float(event.ydata))
             self._crosshair_v.set_xdata([event.xdata, event.xdata])
             self._crosshair_h.set_ydata([event.ydata, event.ydata])
             self._crosshair_v.set_visible(True)
             self._crosshair_h.set_visible(True)
-            display = self._scan2d_display_data(self.ctx.trace)
+            if self._detector_compare_crosshair_v is not None:
+                self._detector_compare_crosshair_v.set_xdata([event.xdata, event.xdata])
+                self._detector_compare_crosshair_v.set_visible(True)
+            if self._detector_compare_crosshair_h is not None:
+                self._detector_compare_crosshair_h.set_ydata([event.ydata, event.ydata])
+                self._detector_compare_crosshair_h.set_visible(True)
+            display = self._scan2d_display_data(source_trace)
             if display is None:
                 return
             x_centers, y_centers, z2d, _x_label, _y_label = display
+            z2d, source_label = self._spot_map_for_display(source_trace, z2d)
             row = int(np.argmin(np.abs(y_centers - event.ydata)))
             col = int(np.argmin(np.abs(x_centers - event.xdata)))
             z = float(z2d[row, col])
+            values = [
+                f"{self._detector_label(source_trace.detector_id)} {source_label}={self._format_inspect_value(z)}"
+            ]
+            other = self._counterpart_scan_trace(source_trace)
+            if other is not None:
+                other_display = self._scan2d_display_data(other)
+                if other_display is not None:
+                    ox, oy, oz, _ox_label, _oy_label = other_display
+                    oz, other_source_label = self._spot_map_for_display(other, oz)
+                    orow = int(np.argmin(np.abs(oy - event.ydata)))
+                    ocol = int(np.argmin(np.abs(ox - event.xdata)))
+                    values.append(
+                        f"{self._detector_label(other.detector_id)} {other_source_label}="
+                        f"{self._format_inspect_value(float(oz[orow, ocol]))}"
+                    )
             self._update_point_readout(
                 f"Point readout: x={self._format_inspect_value(float(event.xdata))}, "
                 f"y={self._format_inspect_value(float(event.ydata))}, "
-                f"z={self._format_inspect_value(z)}"
+                + ", ".join(values)
             )
         else:
             nearest = self._nearest_trace_point(float(event.xdata))
@@ -6197,6 +9507,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_plot_leave(self, event):
+        self.canvas.unsetCursor()
         if self.mask_mode_combo.currentText() == "Inspect point":
             self._clear_crosshairs()
 
@@ -6253,8 +9564,39 @@ class SmartFitterMainWindow(QMainWindow):
             except Exception:
                 pass
             self._ax_secondary = None
+            # Axes.remove() drops the visible twinx axis but Matplotlib keeps
+            # the surviving main axis as a singleton in its private twin
+            # grouper. A later equal-aspect 2D comparison then rejects
+            # adjustable="box" and the deferred Qt draw leaves a blank canvas.
+            twinned_axes = getattr(self.ax_main, "_twinned_axes", None)
+            if twinned_axes is not None:
+                try:
+                    if self.ax_main in twinned_axes:
+                        twinned_axes.remove(self.ax_main)
+                except Exception:
+                    pass
 
     def _clear_scan_colorbar(self):
+        if self._detector_compare_colorbar is not None:
+            try:
+                self._detector_compare_colorbar.remove()
+            except Exception:
+                pass
+            self._detector_compare_colorbar = None
+        if self._detector_compare_colorbar_ax is not None:
+            try:
+                self._detector_compare_colorbar_ax.remove()
+            except Exception:
+                pass
+            self._detector_compare_colorbar_ax = None
+        if self._detector_compare_ax is not None:
+            try:
+                self._detector_compare_ax.remove()
+            except Exception:
+                pass
+            self._detector_compare_ax = None
+        self._detector_compare_crosshair_v = None
+        self._detector_compare_crosshair_h = None
         if self._scan_colorbar is not None:
             try:
                 self._scan_colorbar.remove()
@@ -6312,6 +9654,10 @@ class SmartFitterMainWindow(QMainWindow):
         y_centers = np.asarray(y2d[:, 0], dtype=float)
         x_label = trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"
         y_label = trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"
+        self.scan_swap_axes_chk.setText(f"Swap {x_label} / {y_label} axes")
+        self.scan_swap_axes_chk.setToolTip(
+            f"Exchange {x_label} and {y_label} between the horizontal and vertical display axes."
+        )
         if self.scan_swap_axes_chk.isChecked():
             return y_centers, x_centers, z2d.T, y_label, x_label
         return x_centers, y_centers, z2d, x_label, y_label
@@ -6347,25 +9693,77 @@ class SmartFitterMainWindow(QMainWindow):
             height = new_height
         return [left, bottom, width, height]
 
-    def _configure_scan2d_layout(self, show_linecut: bool, extent: tuple[float, float, float, float]) -> None:
-        xmin, xmax, ymin, ymax = extent
-        x_span = abs(float(xmax) - float(xmin))
-        y_span = abs(float(ymax) - float(ymin))
-        aspect = x_span / y_span if y_span > 0 else 1.0
+    def _scan2d_geometry(self, x_edges: np.ndarray, y_edges: np.ndarray) -> tuple[float, float]:
+        """Return Matplotlib data aspect and the resulting axes-box aspect."""
+        x_span = abs(float(x_edges[-1]) - float(x_edges[0]))
+        y_span = abs(float(y_edges[-1]) - float(y_edges[0]))
+        physical_box_aspect = x_span / y_span if y_span > 0 else 1.0
+        if self.scan_pixel_geometry_combo.currentText() != "Square pixels":
+            return 1.0, physical_box_aspect
+        nx = max(1, len(x_edges) - 1)
+        ny = max(1, len(y_edges) - 1)
+        x_pixel_size = x_span / nx
+        y_pixel_size = y_span / ny
+        data_aspect = x_pixel_size / y_pixel_size if y_pixel_size > 0 else 1.0
+        return data_aspect, float(nx) / float(ny)
+
+    def _configure_scan2d_layout(self, show_linecut: bool, box_aspect: float) -> None:
         if show_linecut:
             base_rect = [0.09, 0.45, 0.66, 0.42]
-            main_rect = self._fit_axes_box_to_aspect(base_rect, aspect) if self.scan_equal_aspect_chk.isChecked() else base_rect
+            main_rect = self._fit_axes_box_to_aspect(base_rect, box_aspect)
             self.ax_res.set_position([0.09, 0.12, 0.66, 0.20])
             self.ax_res.set_visible(True)
         else:
             base_rect = [0.09, 0.12, 0.66, 0.76]
-            main_rect = self._fit_axes_box_to_aspect(base_rect, aspect) if self.scan_equal_aspect_chk.isChecked() else base_rect
+            main_rect = self._fit_axes_box_to_aspect(base_rect, box_aspect)
             self.ax_res.set_visible(False)
         self.ax_main.set_position(main_rect)
         cbar_pad = 0.016
         cbar_width = 0.018
         cbar_left = min(0.95 - cbar_width, main_rect[0] + main_rect[2] + cbar_pad)
         self._scan_colorbar_ax = self.fig.add_axes([cbar_left, main_rect[1], cbar_width, main_rect[3]])
+
+    def _configure_scan2d_comparison_layout(
+        self,
+        show_linecut: bool,
+        box_aspect: float,
+    ) -> None:
+        stacked = bool(getattr(self, "_dual_map_stacked", False))
+        if stacked:
+            if show_linecut:
+                # Leave a real text gutter between the xlabel of the upper
+                # map and the title of the lower map.  The old 0.06 gutter
+                # was enough for empty axes but clipped/overlapped at the
+                # stable 11 pt label / 13 pt title sizes used by exports.
+                main_base_rect = [0.10, 0.75, 0.72, 0.15]
+                compare_base_rect = [0.10, 0.42, 0.72, 0.15]
+            else:
+                # Keep the two map rows visually balanced while reserving a
+                # 0.17 normalized gap for tick labels and the next title.
+                main_base_rect = [0.10, 0.60, 0.72, 0.27]
+                compare_base_rect = [0.10, 0.16, 0.72, 0.27]
+        else:
+            bottom = 0.45 if show_linecut else 0.14
+            height = 0.42 if show_linecut else 0.72
+            main_base_rect = [0.07, bottom, 0.34, height]
+            compare_base_rect = [0.55, bottom, 0.34, height]
+        main_rect = self._fit_axes_box_to_aspect(main_base_rect, box_aspect)
+        compare_rect = self._fit_axes_box_to_aspect(compare_base_rect, box_aspect)
+        self.ax_main.set_position(main_rect)
+        self._detector_compare_ax = self.fig.add_axes(compare_rect, sharex=self.ax_main, sharey=self.ax_main)
+        cbar_pad = 0.010
+        cbar_width = 0.016
+        self._scan_colorbar_ax = self.fig.add_axes(
+            [main_rect[0] + main_rect[2] + cbar_pad, main_rect[1], cbar_width, main_rect[3]]
+        )
+        self._detector_compare_colorbar_ax = self.fig.add_axes(
+            [compare_rect[0] + compare_rect[2] + cbar_pad, compare_rect[1], cbar_width, compare_rect[3]]
+        )
+        if show_linecut:
+            self.ax_res.set_position([0.10, 0.08, 0.78, 0.18] if stacked else [0.09, 0.10, 0.80, 0.20])
+            self.ax_res.set_visible(True)
+        else:
+            self.ax_res.set_visible(False)
 
     def _current_observable_label(self) -> str:
         if self.ctx.trace is None:
@@ -6380,6 +9778,15 @@ class SmartFitterMainWindow(QMainWindow):
         if mode == "difference":
             return "Difference [counts]"
         return self.ctx.trace.y_label or "Signal"
+
+    def _scan_colorbar_label(self, detector_id: str, observable: str) -> str:
+        """Return a colorbar label that remains legible in stacked maps."""
+        if getattr(self, "_dual_map_stacked", False):
+            # The detector is already identified by the map title.  Omitting
+            # it from the vertical colorbar label prevents the two long
+            # labels from colliding in the narrow stacked export layout.
+            return str(observable)
+        return f"{self._detector_label(detector_id)} · {observable}"
 
     def _plot_scan_secondary_axis(self):
         if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan1d" or self.ctx.x is None:
@@ -6480,7 +9887,14 @@ class SmartFitterMainWindow(QMainWindow):
         self.fig.patch.set_facecolor("#ffffff")
         self.fig.patch.set_edgecolor("#ffffff")
         self.fig.patch.set_linewidth(0.0)
-        axes = [self.ax_main, self.ax_res, self._ax_secondary, self._scan_colorbar_ax]
+        axes = [
+            self.ax_main,
+            self.ax_res,
+            self._ax_secondary,
+            self._scan_colorbar_ax,
+            self._detector_compare_ax,
+            self._detector_compare_colorbar_ax,
+        ]
         for ax in axes:
             if ax is None or not ax.get_visible():
                 continue
@@ -6498,8 +9912,11 @@ class SmartFitterMainWindow(QMainWindow):
                 gridline.set_alpha(0.72)
                 gridline.set_linewidth(0.8)
         if self._scan_colorbar is not None:
-            self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=max(6.0, 8 * self._plot_scale))
+            self._scan_colorbar.ax.tick_params(colors="#526159", labelsize=9.0)
             self._scan_colorbar.ax.yaxis.label.set_color("#26332d")
+        if self._detector_compare_colorbar is not None:
+            self._detector_compare_colorbar.ax.tick_params(colors="#526159", labelsize=9.0)
+            self._detector_compare_colorbar.ax.yaxis.label.set_color("#26332d")
 
     def _presentation_axis_map(self) -> dict[str, Any]:
         axes: dict[str, Any] = {"main": self.ax_main}
@@ -6509,6 +9926,10 @@ class SmartFitterMainWindow(QMainWindow):
             axes[self._detail_axis_role] = self.ax_res
         if self._scan_colorbar_ax is not None and self._scan_colorbar_ax.get_visible():
             axes["colorbar"] = self._scan_colorbar_ax
+        if self._detector_compare_ax is not None and self._detector_compare_ax.get_visible():
+            axes["detector_compare"] = self._detector_compare_ax
+        if self._detector_compare_colorbar_ax is not None and self._detector_compare_colorbar_ax.get_visible():
+            axes["detector_compare_colorbar"] = self._detector_compare_colorbar_ax
         return axes
 
     def _presentation_axis_text(self, role: str, key: str) -> str:
@@ -6633,9 +10054,33 @@ class SmartFitterMainWindow(QMainWindow):
         self.roi_max.setText(f"{x0 + 0.2 * (x1 - x0):.6g}")
         self._refresh_processed()
 
+    def _processing_signature(self) -> str:
+        return state_signature(
+            {
+                "mode": self._current_data_mode(),
+                "bin": self.bin_spin.value(),
+                "smooth": self.smooth_spin.value(),
+                "roi": self._parse_roi(),
+                "excluded": sorted(self.ctx.excluded_points),
+                "ranges": list(self.ctx.exclusion_ranges),
+                "steps": [step.to_dict() for step in self.ctx.analysis_steps],
+                "baseline": self.baseline_combo.currentText(),
+            }
+        )
+
     def _refresh_processed(self):
         if self.ctx.trace is None:
             return
+        processing_signature = self._processing_signature()
+        if (
+            self._last_processing_signature is not None
+            and processing_signature != self._last_processing_signature
+            and self._detector_scope_is_both()
+            and not self._activating_detector
+        ):
+            active_id = self.ctx.trace.detector_id
+            self._invalidate_detector_states([key for key in self._detector_analysis_states if key != active_id])
+        self._last_processing_signature = processing_signature
         tr = self.ctx.trace
         old_x = None if self.ctx.x is None else self.ctx.x.copy()
         old_y = None if self.ctx.y is None else self.ctx.y.copy()
@@ -6709,40 +10154,101 @@ class SmartFitterMainWindow(QMainWindow):
         self._crosshair_h = None
         primary_series: list[np.ndarray] = []
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" and self.ctx.trace.z2d is not None:
-            display = self._scan2d_display_data(self.ctx.trace)
-            scan_extent = self._scan2d_extent(self.ctx.trace)
+            plot_trace, compare_trace = self._canonical_scan_traces()
+            display = self._scan2d_display_data(plot_trace) if plot_trace is not None else None
+            scan_extent = self._scan2d_extent(plot_trace) if plot_trace is not None else None
             if display is None or scan_extent is None:
                 self.summary_text.setPlainText("2D scan map is unavailable because scan axes are malformed.")
                 return
             _x_centers, _y_centers, display_z, display_x_label, display_y_label = display
+            display_z, display_observable_label = self._spot_map_for_display(plot_trace, display_z)
             x_edges, y_edges, extent = scan_extent
             xmin, xmax, ymin, ymax = extent
-            linecut = self._extract_scan_linecut()
+            data_aspect, box_aspect = self._scan2d_geometry(x_edges, y_edges)
+            # Linecuts follow the same canonical detector order as the maps;
+            # changing focus must not swap the first and second curves.
+            linecut = self._extract_scan_linecut(plot_trace)
+            compare_display = self._scan2d_display_data(compare_trace) if compare_trace is not None and compare_trace.scan_dim == "scan2d" else None
+            compare_observable_label = self._current_observable_label()
+            if compare_display is not None and compare_trace is not None:
+                compare_z, compare_observable_label = self._spot_map_for_display(compare_trace, compare_display[2])
+                compare_display = (
+                    compare_display[0], compare_display[1], compare_z, compare_display[3], compare_display[4]
+                )
             if linecut is not None:
                 self._detail_axis_role = "linecut"
-            self._configure_scan2d_layout(show_linecut=linecut is not None, extent=extent)
-            low, high = self._scan_color_limits(display_z)
+            if compare_display is not None:
+                self._configure_scan2d_comparison_layout(show_linecut=linecut is not None, box_aspect=box_aspect)
+            else:
+                self._configure_scan2d_layout(show_linecut=linecut is not None, box_aspect=box_aspect)
+            if compare_display is not None and self.scan_compare_scale_combo.currentText() == "Shared":
+                pooled = np.concatenate([display_z.ravel(), np.asarray(compare_display[2], dtype=float).ravel()])
+                low, high = self._scan_color_limits(
+                    pooled,
+                    plot_trace.detector_id,
+                    update_fields=plot_trace.detector_id == self._active_detector_id(),
+                )
+                compare_low, compare_high = low, high
+            else:
+                low, high = self._scan_color_limits(
+                    display_z,
+                    plot_trace.detector_id,
+                    update_fields=plot_trace.detector_id == self._active_detector_id(),
+                )
+                if compare_display is not None and compare_trace is not None:
+                    compare_low, compare_high = self._scan_color_limits(
+                        compare_display[2],
+                        compare_trace.detector_id,
+                        update_fields=False,
+                    )
+                else:
+                    compare_low, compare_high = low, high
             mesh = self.ax_main.pcolormesh(
                 x_edges, y_edges, display_z, shading="flat",
                 cmap=self._scan_colormap_name(), vmin=low, vmax=high,
             )
-            # The axes box is already fitted to the scan's physical aspect by
-            # _configure_scan2d_layout. Use datalim so a previously removed
-            # twinx axis cannot make Matplotlib reject the deferred Qt draw.
-            if self.scan_equal_aspect_chk.isChecked():
-                self.ax_main.set_aspect("equal", adjustable="datalim")
-            else:
-                self.ax_main.set_aspect("auto", adjustable="datalim")
+            # Both geometry modes preserve pixels. Physical mode uses the
+            # scan-axis spacing; square mode scales the two data dimensions so
+            # one sampled cell has equal screen width and height.
+            self.ax_main.set_aspect(data_aspect, adjustable="box")
             self.ax_main.set_xlabel(self._friendly_axis_label(display_x_label))
             self.ax_main.set_ylabel(self._friendly_axis_label(display_y_label))
-            self.ax_main.set_title(f"{self.ctx.trace.file_name} | 2D scan map")
+            self.ax_main.set_title(self._detector_label(plot_trace.detector_id))
             self._scan_colorbar = self.fig.colorbar(mesh, cax=self._scan_colorbar_ax)
-            self._scan_colorbar.set_label(self._current_observable_label())
+            self._scan_colorbar.set_label(
+                self._scan_colorbar_label(plot_trace.detector_id, display_observable_label)
+            )
+            self._draw_scan_spot_overlays(self.ax_main, plot_trace.detector_id)
+            if compare_display is not None and compare_trace is not None and self._detector_compare_ax is not None:
+                compare_x, compare_y, compare_z, compare_x_label, compare_y_label = compare_display
+                compare_x_edges = self._scan2d_axis_edges(compare_x)
+                compare_y_edges = self._scan2d_axis_edges(compare_y)
+                compare_mesh = self._detector_compare_ax.pcolormesh(
+                    compare_x_edges,
+                    compare_y_edges,
+                    compare_z,
+                    shading="flat",
+                    cmap=self._scan_colormap_name(),
+                    vmin=compare_low,
+                    vmax=compare_high,
+                )
+                self._detector_compare_ax.set_xlabel(self._friendly_axis_label(compare_x_label))
+                self._detector_compare_ax.set_ylabel(self._friendly_axis_label(compare_y_label))
+                self._detector_compare_ax.set_title(self._detector_label(compare_trace.detector_id))
+                self._detector_compare_ax.set_aspect(data_aspect, adjustable="box")
+                self._detector_compare_colorbar = self.fig.colorbar(compare_mesh, cax=self._detector_compare_colorbar_ax)
+                self._detector_compare_colorbar.set_label(
+                    self._scan_colorbar_label(compare_trace.detector_id, compare_observable_label)
+                )
+                self._draw_scan_spot_overlays(self._detector_compare_ax, compare_trace.detector_id)
             self._update_scan_summary()
             if self._scan_cursor is not None:
                 cx, cy = self._scan_cursor
                 self.ax_main.axvline(cx, color="#90caf9", lw=1.0, ls="--")
                 self.ax_main.axhline(cy, color="#90caf9", lw=1.0, ls="--")
+                if self._detector_compare_ax is not None:
+                    self._detector_compare_ax.axvline(cx, color="#90caf9", lw=1.0, ls="--")
+                    self._detector_compare_ax.axhline(cy, color="#90caf9", lw=1.0, ls="--")
                 self.scan_cursor_lbl.setText(f"Cursor: x={cx:.6g}, y={cy:.6g}")
             if self._scan_view_limits is None:
                 view_xlim, view_ylim = (xmin, xmax), (ymin, ymax)
@@ -6750,14 +10256,38 @@ class SmartFitterMainWindow(QMainWindow):
                 view_xlim, view_ylim = self._scan_view_limits
             self.ax_main.set_xlim(*view_xlim)
             self.ax_main.set_ylim(*view_ylim)
+            if self._detector_compare_ax is not None:
+                self._detector_compare_ax.set_xlim(*view_xlim)
+                self._detector_compare_ax.set_ylim(*view_ylim)
             self._update_scan_view_fields(view_xlim, view_ylim)
             self.ax_res.set_visible(linecut is not None)
             if linecut is not None:
                 lx, ly, title = linecut
-                self._plot_series(self.ax_res, lx, ly, "Linecut", role="linecut", series_id="linecut", color="#4fc3f7")
+                self._plot_series(
+                    self.ax_res,
+                    lx,
+                    ly,
+                    self._detector_label(plot_trace.detector_id),
+                    role="linecut",
+                    series_id=f"linecut:{plot_trace.detector_id}",
+                    color="#4fc3f7",
+                )
+                if compare_trace is not None:
+                    compare_linecut = self._extract_scan_linecut(compare_trace)
+                    if compare_linecut is not None:
+                        clx, cly, _ = compare_linecut
+                        self._plot_series(
+                            self.ax_res,
+                            clx,
+                            cly,
+                            self._detector_label(compare_trace.detector_id),
+                            role="linecut",
+                            series_id=f"linecut:{compare_trace.detector_id}",
+                            color="#e06c75",
+                        )
                 self.ax_res.set_title(title)
                 self.ax_res.set_xlabel(self._friendly_axis_label(display_x_label if "horizontal" in title.lower() else display_y_label))
-                self.ax_res.set_ylabel(self._current_observable_label())
+                self.ax_res.set_ylabel(display_observable_label)
                 self.ax_res.grid(True, alpha=0.3)
         else:
             plot_x = self.ctx.analysis_x if self.ctx.analysis_x is not None else self.ctx.x
@@ -6765,10 +10295,16 @@ class SmartFitterMainWindow(QMainWindow):
             y_disp, y_lab = self._display_y(plot_y)
             primary_series.append(np.asarray(y_disp, dtype=float))
             if self.plot_opts.show_data:
-                self._plot_series(self.ax_main, plot_x, y_disp, self._legend_label("Data", "Data"), role="data", series_id="data")
+                data_label = (
+                    self._detector_label(self.ctx.trace.detector_id)
+                    if len(self.ctx.trace.available_detectors) > 1
+                    else "Data"
+                )
+                self._plot_series(self.ax_main, plot_x, y_disp, self._legend_label(data_label, data_label), role="data", series_id="data")
             if not self.ctx.analysis_steps:
                 self._add_observable_layers(primary_series)
                 self._add_iteration_layer(primary_series)
+            self._add_detector_comparison_layer(primary_series)
             if self.ctx.trace is not None and self.ctx.excluded_points:
                 indices = sorted(index for index in self.ctx.excluded_points if 0 <= index < len(self.ctx.trace.x_ns))
                 if indices:
@@ -6786,7 +10322,7 @@ class SmartFitterMainWindow(QMainWindow):
                     if self.ctx.trace is not None and nm == self.ctx.trace.file_name:
                         continue
                     tr = self.ctx.loaded_traces.get(nm)
-                    if tr is None:
+                    if tr is None or not self._overlay_is_compatible(tr):
                         continue
                     # The primary ROI is a fit/preprocessing choice for the
                     # primary trace. Applying it to overlays silently clipped
@@ -6809,36 +10345,12 @@ class SmartFitterMainWindow(QMainWindow):
                 ysm_disp, _ = self._display_y(self.ctx.y_smooth)
                 primary_series.append(np.asarray(ysm_disp, dtype=float))
                 self._plot_series(self.ax_main, self.ctx.x, ysm_disp, self._legend_label("Smoothed", "Smooth"), role="smoothed", series_id="smoothed")
-            if self._selected_plot_point is not None and "x" in self._selected_plot_point and "y" in self._selected_plot_point:
-                py_disp, _ = self._display_y(np.asarray([self._selected_plot_point["y"]], dtype=float))
-                primary_series.append(np.asarray(py_disp, dtype=float))
-                self.ax_main.plot([self._selected_plot_point["x"]], py_disp, "o", ms=8, mec="#ffeb3b", mfc="none", mew=1.8, label="_nolegend_")
-                self.ax_main.annotate(
-                    f"x={self._format_inspect_value(float(self._selected_plot_point['x']))}\ny={self._format_inspect_value(float(self._selected_plot_point['y']))}",
-                    (self._selected_plot_point["x"], float(py_disp[0])),
-                    textcoords="offset points",
-                    xytext=(8, 8),
-                    fontsize=8,
-                    color="#ffeb3b",
-                    bbox={"boxstyle": "round,pad=0.2", "facecolor": (0.08, 0.10, 0.15, 0.75), "edgecolor": "#ffeb3b"},
-                )
+            self._draw_selected_1d_markers(primary_series)
             self.ax_main.set_xlabel(self._friendly_axis_label(self.ctx.trace.x_label if self.ctx.trace else "X"))
             self.ax_main.set_ylabel(y_lab)
             if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
                 self._plot_scan_secondary_axis()
-                if self._ax_secondary is not None and self._selected_plot_point is not None and "secondary_y" in self._selected_plot_point:
-                    sx = float(self._selected_plot_point.get("secondary_x", self._selected_plot_point["x"]))
-                    sy = float(self._selected_plot_point["secondary_y"])
-                    self._ax_secondary.plot([sx], [sy], "s", ms=7, mec="#ff8a65", mfc="none", mew=1.6)
-                    self._ax_secondary.annotate(
-                        self._format_inspect_value(sy),
-                        (sx, sy),
-                        textcoords="offset points",
-                        xytext=(8, -14),
-                        fontsize=8,
-                        color="#ff8a65",
-                        bbox={"boxstyle": "round,pad=0.2", "facecolor": (0.08, 0.10, 0.15, 0.75), "edgecolor": "#ff8a65"},
-                    )
+                self._draw_selected_secondary_markers()
             self._set_axis_ylim_from_series(self.ax_main, primary_series)
             self.ax_main.grid(True, alpha=0.3)
             self._apply_combined_legend()
@@ -7026,7 +10538,7 @@ class SmartFitterMainWindow(QMainWindow):
     def on_robust_fit(self):
         self._start_fit(robust=True)
 
-    def _start_fit(self, robust: bool = False):
+    def _start_fit(self, robust: bool = False, *, _detector_chain: bool = False):
         if self._active_fit_request is not None:
             return
         if self.ctx.x is None or self.ctx.y is None:
@@ -7037,6 +10549,16 @@ class SmartFitterMainWindow(QMainWindow):
             self._set_status("N/A", "scan data plotted only; fitting disabled")
             self.summary_text.setPlainText("\n".join(self._trace_summary_lines(self.ctx.trace) + ["No fit performed for spatial scan data."]))
             return
+        if not _detector_chain and self._detector_scope_is_both() and self._primary_dataset is not None:
+            active = self._active_detector_id()
+            self._dual_fit_origin = active
+            self._dual_fit_robust = robust
+            self._dual_fit_summaries = {}
+            self._dual_fit_queue = [
+                detector_id
+                for detector_id in self._primary_dataset.available_detectors
+                if detector_id != active and detector_id in self._primary_dataset.detectors
+            ]
         x = self.ctx.x
         y_raw = self.ctx.y
         y_target = self.ctx.y_smooth if (self.fit_smoothed_chk.isChecked() and self.ctx.y_smooth is not None) else y_raw
@@ -7085,6 +10607,10 @@ class SmartFitterMainWindow(QMainWindow):
                     "ODMR multi-peak detection (no single-peak fit)\n"
                     f"Detected peak locations ({len(peak_x)}):\n" + "\n".join([f"  {v:.6g}" for v in peak_x])
                 )
+                if self.ctx.trace is not None:
+                    self._store_active_detector_state()
+                    self._dual_fit_summaries[self.ctx.trace.detector_id] = self.summary_text.toPlainText()
+                self._continue_dual_fit()
                 return
 
         # Disable UI during fit
@@ -7143,6 +10669,11 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_load.setEnabled(not busy)
         self.model_combo.setEnabled(not busy)
         self.profile_combo.setEnabled(not busy)
+        self.detector_combo.setEnabled(not busy and self._primary_dataset is not None and len(self._primary_dataset.available_detectors) > 1)
+        if hasattr(self, "detector_scope_combo"):
+            self.detector_scope_combo.setEnabled(not busy and self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        self.compare_detectors_chk.setEnabled(not busy and self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        self.edit_detector_labels_btn.setEnabled(not busy and self._primary_dataset is not None and len(self._primary_dataset.available_detectors) > 1)
         self.command_fit_btn.setEnabled(not busy and self.ctx.trace is not None)
         self.btn_cancel_fit.setProperty("drawerHidden", not busy)
         self.btn_cancel_fit.setVisible(busy)
@@ -7162,8 +10693,13 @@ class SmartFitterMainWindow(QMainWindow):
             worker.finished.connect(lambda _result, w=worker: self._retired_fit_workers.remove(w) if w in self._retired_fit_workers else None)
             worker.error.connect(lambda _message, w=worker: self._retired_fit_workers.remove(w) if w in self._retired_fit_workers else None)
         self.fit_worker = None
+        self._dual_fit_queue = []
+        origin = self._dual_fit_origin
+        self._dual_fit_origin = None
         self._set_ui_busy(False)
         self._set_status("N/A", "Fit cancelled; any late result will be ignored")
+        if origin is not None and self._primary_dataset is not None and origin in self._primary_dataset.detectors:
+            self._activate_detector(origin, refresh=True)
 
     def _make_fit_signature(self, model_name: str, x: np.ndarray, y: np.ndarray, locks: dict, config: dict) -> str:
         digest = hashlib.sha256()
@@ -7171,6 +10707,7 @@ class SmartFitterMainWindow(QMainWindow):
         digest.update(np.ascontiguousarray(y, dtype=float).tobytes())
         payload = {
             "source": "" if self.ctx.trace is None else str(Path(self.ctx.trace.source_path).resolve()),
+            "detector_id": "" if self.ctx.trace is None else self.ctx.trace.detector_id,
             "mode": self._current_data_mode(),
             "model": model_name,
             "profile": self.profile_combo.currentText(),
@@ -7212,11 +10749,17 @@ class SmartFitterMainWindow(QMainWindow):
         else:
             text = f"FIT ERROR: {msg}\nNo fitted values were produced by any optimizer attempt."
         self.summary_text.setPlainText(text)
+        if self.ctx.trace is not None:
+            self._store_active_detector_state()
+            self._dual_fit_summaries[self.ctx.trace.detector_id] = text
         QTimer.singleShot(0, self._reveal_results_summary)
         self._message("Fit error", f"Fit failed:\n{msg}")
+        self._continue_dual_fit()
 
     def _set_status(self, status: str, reason: str = ""):
         """Set the status label text with color coding."""
+        self.ctx.status = status
+        self.ctx.status_reason = reason
         color_map = {
             "PASS": "#4caf50",   # green
             "WARN": "#ff9800",   # orange
@@ -7238,6 +10781,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.command_state_lbl.setToolTip(reason)
             self.command_state_lbl.setStyleSheet(f"QLabel {{ color: {color}; font-weight: 600; }}")
         self.statusBar().showMessage(f"{status}: {reason}" if reason else status, 5000)
+        self._update_data_info_strip()
 
     def _drag_paths_from_event(self, event) -> list[str]:
         if not event.mimeData().hasUrls():
@@ -7264,7 +10808,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_drop_active(False)
         primary = paths[0]
         try:
-            preview = load_saved_data_mat(primary, mode=self._current_data_mode())
+            preview_dataset = load_experiment_dataset(primary, mode=self._current_data_mode())
+            preview = preview_dataset.detectors.get(self._active_detector_id()) or next(iter(preview_dataset.detectors.values()))
         except Exception as exc:
             self._message("Drop ignored", f"Failed to load dropped file:\n{exc}")
             return
@@ -7278,11 +10823,17 @@ class SmartFitterMainWindow(QMainWindow):
             return
         added = 0
         checked: set[str] = set()
+        detector_id = self._active_detector_id()
         for extra in extras:
             try:
-                trace = load_saved_data_mat(extra, mode=self._current_data_mode())
+                dataset = load_experiment_dataset(extra, mode=self._current_data_mode())
+                trace = dataset.detectors.get(detector_id)
+                if trace is None:
+                    continue
             except Exception:
                 continue
+            self._loaded_datasets[trace.file_name] = dataset
+            self._apply_detector_labels()
             self.ctx.loaded_traces[trace.file_name] = trace
             checked.add(trace.file_name)
             added += 1
@@ -7349,6 +10900,10 @@ class SmartFitterMainWindow(QMainWindow):
                 self._active_fit_request = None
                 self._set_ui_busy(False)
                 self._set_status("WARN", "Fit result discarded because the analysis changed")
+                if self.ctx.trace is not None:
+                    self._store_active_detector_state()
+                    self._dual_fit_summaries[self.ctx.trace.detector_id] = "Fit result discarded because the analysis changed."
+                self._continue_dual_fit()
                 return
             result_obj = outcome.result
             self.ctx.fit_signature = outcome.request.signature
@@ -7384,6 +10939,10 @@ class SmartFitterMainWindow(QMainWindow):
         
         if result is None:
              self._set_status("FAIL", "No result")
+             if self.ctx.trace is not None:
+                 self._store_active_detector_state()
+                 self._dual_fit_summaries[self.ctx.trace.detector_id] = "No fit result was produced."
+             self._continue_dual_fit()
              return
 
         self.ctx.fit_result = result
@@ -7397,6 +10956,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.fit_target = display_y
 
         self._populate_param_table(result.param_names, result.params)
+        if isinstance(result.extras, dict) and result.extras.get("rabi_envelope"):
+            self.show_rabi_envelope_chk.setChecked(True)
+            self.plot_opts.show_rabi_envelope = True
         self._set_annotation_visible(True, refresh=False)
         self._plot_fit(result, display_y)
 
@@ -7491,6 +11053,27 @@ class SmartFitterMainWindow(QMainWindow):
         self.summary_text.setPlainText("\n".join(lines))
         QTimer.singleShot(0, self._reveal_results_summary)
         self.ctx.fit_signature = self._current_fit_signature()
+        if self.ctx.trace is not None:
+            self._store_active_detector_state()
+            self._dual_fit_summaries[self.ctx.trace.detector_id] = self.summary_text.toPlainText()
+        self._continue_dual_fit()
+
+    def _continue_dual_fit(self) -> None:
+        if self._dual_fit_queue:
+            detector_id = self._dual_fit_queue.pop(0)
+            if self._activate_detector(detector_id, refresh=True):
+                QTimer.singleShot(0, lambda: self._start_fit(self._dual_fit_robust, _detector_chain=True))
+                return
+        origin = self._dual_fit_origin
+        self._dual_fit_origin = None
+        if origin is not None and self._primary_dataset is not None and origin in self._primary_dataset.detectors:
+            self._activate_detector(origin, refresh=True)
+            labels = [self._detector_label(detector_id) for detector_id in self._dual_fit_summaries]
+            self.statusBar().showMessage(
+                f"Finished fitting {len(labels)} detector streams: {', '.join(labels)}",
+                6000,
+            )
+            self._refresh_plot_only()
 
     def _run_single_fit_background(self, model_name, x, y, locks, config):
         rng = np.random.default_rng(22)
@@ -7657,10 +11240,16 @@ class SmartFitterMainWindow(QMainWindow):
             yfit_disp, _ = self._display_y(fit_for_display)
         primary_series.append(np.asarray(y_disp, dtype=float))
         if self.plot_opts.show_data:
-            self._plot_series(self.ax_main, x, y_disp, self._legend_label("Data", "Data"), role="data", series_id="data")
+            data_label = (
+                self._detector_label(self.ctx.trace.detector_id)
+                if self.ctx.trace is not None and len(self.ctx.trace.available_detectors) > 1
+                else "Data"
+            )
+            self._plot_series(self.ax_main, x, y_disp, self._legend_label(data_label, data_label), role="data", series_id="data")
         if not self.ctx.analysis_steps:
             self._add_observable_layers(primary_series)
             self._add_iteration_layer(primary_series)
+        self._add_detector_comparison_layer(primary_series)
         if self.ctx.loaded_traces:
             for i in range(self.overlay_list.count()):
                 item = self.overlay_list.item(i)
@@ -7723,19 +11312,22 @@ class SmartFitterMainWindow(QMainWindow):
             if peak_indices:
                 peaks_line = self.ax_main.plot(x[peak_indices], y_disp[peak_indices], "rx", ms=8, mew=1.8, label=self._legend_label("Detected peaks", "Peaks"))[0]
                 self._register_series("odmr:peaks", self._legend_label("Detected peaks", "Peaks"), [peaks_line], handle=peaks_line, axis=self.ax_main, x_values=[x[peak_indices]], y_values=[y_disp[peak_indices]])
-        if self._selected_plot_point is not None and "x" in self._selected_plot_point and "y" in self._selected_plot_point:
-            py_disp, _ = self._display_y(np.asarray([self._selected_plot_point["y"]], dtype=float))
-            primary_series.append(np.asarray(py_disp, dtype=float))
-            self.ax_main.plot([self._selected_plot_point["x"]], py_disp, "o", ms=8, mec="#ffeb3b", mfc="none", mew=1.8, label="_nolegend_")
+        self._draw_selected_1d_markers(primary_series)
         self.ax_main.set_xlabel(self._friendly_axis_label(self.ctx.trace.x_label if self.ctx.trace else "X"))
         self.ax_main.set_ylabel(y_lab)
         if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
             self._plot_scan_secondary_axis()
+            self._draw_selected_secondary_markers()
         self._set_axis_ylim_from_series(self.ax_main, primary_series)
         self.ax_main.grid(True, alpha=0.3)
         self._draw_plot_annotation(fit_result)
         self._apply_combined_legend()
-        self.ax_main.set_title(f"{self.ctx.trace.file_name if self.ctx.trace else ''} | " + rf"$R^2$={fit_result.r2:.3f}")
+        detector_title = (
+            f" | {self._detector_label(self.ctx.trace.detector_id)}"
+            if self.ctx.trace is not None and len(self.ctx.trace.available_detectors) > 1
+            else ""
+        )
+        self.ax_main.set_title(f"{self.ctx.trace.file_name if self.ctx.trace else ''}{detector_title} | " + rf"$R^2$={fit_result.r2:.3f}")
 
         fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else raw_y
         residual = fit_target - fit_result.y_fit
@@ -7774,29 +11366,38 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Save", "Load data first.")
             return
         self._apply_plot_controls_to_state()
+        self._store_active_detector_state()
         out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder")
         if not out_dir:
             return
         out = Path(out_dir)
-        stem = Path(self.ctx.trace.file_name).stem
+        base_stem = Path(self.ctx.trace.file_name).stem
+        is_dual = len(self.ctx.trace.available_detectors) > 1
+        stem = f"{base_stem}__{self.ctx.trace.detector_id}" if is_dual else base_stem
+        figure_stem = f"{stem}__comparison" if is_dual and self._comparison_trace() is not None else stem
 
         # Save current figure snapshot (works for 1D and 2D scan displays).
-        fit_png = out / f"{stem}_gui_fit.png"
-        self.fig.set_size_inches(self.plot_opts.fig_width, self.plot_opts.fig_height, forward=True)
-        if self.ctx.trace.scan_dim != "scan2d":
-            self.fig.tight_layout(pad=0.5)
+        fit_png = out / f"{figure_stem}_gui_fit.png"
+        original_size = tuple(float(v) for v in self.fig.get_size_inches())
+        self.fig.set_size_inches(*self._resolved_export_size(), forward=False)
+        self._refresh_plot_only()
+        self.canvas.draw()
         saved_paths: list[Path] = []
-        if self.exp_png_chk.isChecked():
-            self.fig.savefig(fit_png, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
-            saved_paths.append(fit_png)
-        fit_pdf = out / f"{stem}_gui_fit.pdf"
-        fit_svg = out / f"{stem}_gui_fit.svg"
-        if self.exp_pdf_chk.isChecked():
-            self.fig.savefig(fit_pdf, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
-            saved_paths.append(fit_pdf)
-        if self.exp_svg_chk.isChecked():
-            self.fig.savefig(fit_svg, dpi=self.plot_opts.save_dpi, bbox_inches="tight", pad_inches=0.10, facecolor="#ffffff", edgecolor="#ffffff")
-            saved_paths.append(fit_svg)
+        fit_pdf = out / f"{figure_stem}_gui_fit.pdf"
+        fit_svg = out / f"{figure_stem}_gui_fit.svg"
+        try:
+            if self.exp_png_chk.isChecked():
+                self.fig.savefig(fit_png, dpi=self.plot_opts.save_dpi, bbox_inches=None, pad_inches=0.0, facecolor="#ffffff", edgecolor="#ffffff")
+                saved_paths.append(fit_png)
+            if self.exp_pdf_chk.isChecked():
+                self.fig.savefig(fit_pdf, dpi=self.plot_opts.save_dpi, bbox_inches=None, pad_inches=0.0, facecolor="#ffffff", edgecolor="#ffffff")
+                saved_paths.append(fit_pdf)
+            if self.exp_svg_chk.isChecked():
+                self.fig.savefig(fit_svg, dpi=self.plot_opts.save_dpi, bbox_inches=None, pad_inches=0.0, facecolor="#ffffff", edgecolor="#ffffff")
+                saved_paths.append(fit_svg)
+        finally:
+            self.fig.set_size_inches(*original_size, forward=False)
+            self._refresh_plot_only()
 
         profile = self._active_profile()
         result = self.ctx.fit_result
@@ -7805,7 +11406,7 @@ class SmartFitterMainWindow(QMainWindow):
         sample_md = self._collect_sample_metadata()
         provenance = {
             "app_name": "SmartFitterPy",
-            "app_version": "2026.02",
+            "app_version": "2026.08",
             "timestamp_utc": _now_utc_iso(),
             "preset_name": self.ctx.active_preset_name,
             "baseline_trace": self.baseline_combo.currentText(),
@@ -7814,9 +11415,21 @@ class SmartFitterMainWindow(QMainWindow):
             "rabi_dead_time_ns": float(self.rabi_dead_time_ns.value()),
             "analysis_steps": [step.to_dict() for step in self.ctx.analysis_steps],
             "analysis_provenance": ([] if self.ctx.processed is None else self.ctx.processed.provenance),
+            "active_detector_id": self.ctx.trace.detector_id,
+            "active_detector_label": self._detector_label(self.ctx.trace.detector_id),
+            "available_detectors": list(self.ctx.trace.available_detectors),
+            "detector_labels": dict(self._detector_labels),
+            "compare_detectors": self.compare_detectors_chk.isChecked(),
         }
         payload = {
             "file": self.ctx.trace.file_name,
+            "detector": {
+                "id": self.ctx.trace.detector_id,
+                "label": self._detector_label(self.ctx.trace.detector_id),
+                "available_ids": list(self.ctx.trace.available_detectors),
+                "labels": dict(self._detector_labels),
+                "comparison_enabled": self.compare_detectors_chk.isChecked(),
+            },
             "profile": profile.name,
             "scan_dim": self.ctx.trace.scan_dim,
             "scan_axes": list(self.ctx.trace.scan_axes),
@@ -7844,6 +11457,22 @@ class SmartFitterMainWindow(QMainWindow):
             "sample_metadata": sample_md,
             "trace_metadata": trace_metadata,
             "provenance": provenance,
+            "detector_results": {
+                detector_id: {
+                    "label": self._detector_label(detector_id),
+                    "status": state.status,
+                    "status_reason": state.status_reason,
+                    "fit": fit_result_to_dict(state.fit_result),
+                    "odmr_peak_locations": json_safe(state.odmr_peaks),
+                }
+                for detector_id, state in self._detector_analysis_states.items()
+            },
+            "scan_spots": {
+                detector_id: [spot.to_dict() for spot in spots]
+                for detector_id, spots in self._scan_spot_results.items()
+            },
+            "scan_spot_diagnostics": json_safe(self._scan_spot_diagnostics),
+            "scan_spot_comparison": self._spot_comparison_payload(),
             "series": {
                 "x_processed": json_safe(self.ctx.x),
                 "y_processed": json_safe(self.ctx.y),
@@ -7863,6 +11492,20 @@ class SmartFitterMainWindow(QMainWindow):
                 writer = csv.writer(f)
                 writer.writerow(["metric", "value"])
                 writer.writerow(["file", self.ctx.trace.file_name])
+                writer.writerow(["detector_id", self.ctx.trace.detector_id])
+                writer.writerow(["detector_label", self._detector_label(self.ctx.trace.detector_id)])
+                writer.writerow(["available_detectors", ",".join(self.ctx.trace.available_detectors)])
+                for detector_id, state in self._detector_analysis_states.items():
+                    writer.writerow([f"{detector_id}.status", state.status])
+                    if state.fit_result is not None:
+                        writer.writerow([f"{detector_id}.model", state.fit_result.model_name])
+                        writer.writerow([f"{detector_id}.r2", state.fit_result.r2])
+                        writer.writerow([f"{detector_id}.rmse", state.fit_result.rmse])
+                writer.writerow(["compare_detectors", self.compare_detectors_chk.isChecked()])
+                if self._spot_comparison_pair is not None:
+                    writer.writerow(["spot_comparison_pair", json.dumps([list(key) for key in self._spot_comparison_pair])])
+                    for key, value in self._spot_comparison_metrics.items():
+                        writer.writerow([f"spot_comparison.{key}", value])
                 writer.writerow(["profile", profile.name])
                 writer.writerow(["scan_dim", self.ctx.trace.scan_dim])
                 writer.writerow(["scan_axes", ",".join(self.ctx.trace.scan_axes)])
@@ -7891,6 +11534,30 @@ class SmartFitterMainWindow(QMainWindow):
                     writer.writerow([f"provenance:{k}", json.dumps(v) if isinstance(v, (list, dict)) else v])
             saved_paths.append(csv_path)
 
+            if any(self._scan_spot_results.values()):
+                spot_csv_path = out / f"{base_stem}__spots.csv"
+                spot_fields = [
+                    "detector_id", "detector_label", "source", "spot_id", "polarity", "center_x", "center_y",
+                    "sigma_major", "sigma_minor", "half_max_radius_major", "half_max_radius_minor",
+                    "equivalent_half_max_radius", "fwhm_major", "fwhm_minor", "angle_deg", "axis_ratio",
+                    "amplitude", "background", "contrast_percent", "snr", "r_squared", "integrated_signal",
+                    "component_pixels", "fit_success", "fit_message",
+                ]
+                with spot_csv_path.open("w", newline="", encoding="utf-8") as spot_file:
+                    spot_writer = csv.DictWriter(spot_file, fieldnames=spot_fields)
+                    spot_writer.writeheader()
+                    for detector_id, spots in self._scan_spot_results.items():
+                        for spot in spots:
+                            values = spot.to_dict()
+                            spot_writer.writerow(
+                                {
+                                    "detector_id": detector_id,
+                                    "detector_label": self._detector_label(detector_id),
+                                    **{key: values.get(key, "") for key in spot_fields if key not in {"detector_id", "detector_label"}},
+                                }
+                            )
+                saved_paths.append(spot_csv_path)
+
         # Save an annotated report figure with key extracted metrics.
         if self.ctx.trace.fit_allowed and (self.exp_report_png_chk.isChecked() or self.exp_report_pdf_chk.isChecked()):
             report_png = out / f"{stem}_gui_report.png"
@@ -7918,8 +11585,13 @@ class SmartFitterMainWindow(QMainWindow):
             else:
                 y_disp, y_lab = self._display_y(y)
             if self.plot_opts.show_data:
-                data_line = ax.plot(x, y_disp, "o", ms=4, alpha=0.65, label="Data")[0]
-                self._style_external_series("data", "Data", [data_line], handle=data_line, axis=ax)
+                report_data_label = (
+                    self._detector_label(self.ctx.trace.detector_id)
+                    if len(self.ctx.trace.available_detectors) > 1
+                    else "Data"
+                )
+                data_line = ax.plot(x, y_disp, "o", ms=4, alpha=0.65, label=report_data_label)[0]
+                self._style_external_series("data", report_data_label, [data_line], handle=data_line, axis=ax)
             if result is not None:
                 if transformed:
                     fit_x, fit_series, _ = apply_steps(self.ctx.x, result.y_fit, self.ctx.analysis_steps)
@@ -8063,6 +11735,65 @@ class SmartFitterMainWindow(QMainWindow):
                 json.dump({"sample_metadata": sample_md, "trace_metadata": trace_metadata, "provenance": provenance, "nv_metrics": nv}, f, indent=2)
             saved_paths += [origin_csv, origin_meta]
 
+            if self._primary_dataset is not None and len(self._primary_dataset.available_detectors) > 1:
+                detectors_raw = out / f"{base_stem}__detectors_raw.csv"
+                with detectors_raw.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "detector_id",
+                        "detector_label",
+                        "x",
+                        "y",
+                        "signal",
+                        "reference",
+                        "contrast",
+                        "difference",
+                        "valid",
+                    ])
+                    for detector_id in self._primary_dataset.available_detectors:
+                        detector_trace = self._primary_dataset.detectors.get(detector_id)
+                        if detector_trace is None:
+                            continue
+                        if (
+                            detector_trace.scan_dim == "scan2d"
+                            and detector_trace.x2d is not None
+                            and detector_trace.y2d is not None
+                            and detector_trace.signal2d is not None
+                            and detector_trace.reference2d is not None
+                        ):
+                            x_values = np.asarray(detector_trace.x2d, dtype=float).ravel()
+                            y_values = np.asarray(detector_trace.y2d, dtype=float).ravel()
+                            signal_values = np.asarray(detector_trace.signal2d, dtype=float).ravel()
+                            reference_values = np.asarray(detector_trace.reference2d, dtype=float).ravel()
+                        else:
+                            x_values = np.asarray(detector_trace.x_ns, dtype=float).ravel()
+                            y_values = np.full(len(x_values), np.nan, dtype=float)
+                            signal_values = np.asarray(detector_trace.signal, dtype=float).ravel()
+                            reference_values = np.asarray(detector_trace.reference, dtype=float).ravel()
+                        count = min(len(x_values), len(y_values), len(signal_values), len(reference_values))
+                        for index in range(count):
+                            signal_value = float(signal_values[index])
+                            reference_value = float(reference_values[index])
+                            valid = bool(np.isfinite(signal_value) and np.isfinite(reference_value))
+                            contrast_value = (
+                                (reference_value - signal_value) / reference_value
+                                if valid and reference_value != 0
+                                else np.nan
+                            )
+                            difference_value = reference_value - signal_value if valid else np.nan
+                            writer.writerow([
+                                detector_id,
+                                self._detector_label(detector_id),
+                                float(x_values[index]),
+                                "" if not np.isfinite(y_values[index]) else float(y_values[index]),
+                                signal_value,
+                                reference_value,
+                                contrast_value,
+                                difference_value,
+                                valid,
+                            ])
+                saved_paths.append(detectors_raw)
+
         self._save_preferences()
         msg = "Saved:\n" + "\n".join([str(p) for p in saved_paths]) if saved_paths else "No export files selected."
         self._message("Save complete", msg)
@@ -8072,7 +11803,7 @@ def run_gui():
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-    print("--- Launching SmartFitter v2026.02 (Refactored) ---")
+    print("--- Launching SmartFitter v2026.08 (Dual Detector) ---")
     win = SmartFitterMainWindow()
     win.show()
     sys.exit(app.exec())

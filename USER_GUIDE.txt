@@ -1,5 +1,7 @@
 SmartFitter User Guide
 ======================
+Application version: 2026.08
+Analysis session schema: v3
 
 What this tool does
 -------------------
@@ -8,6 +10,7 @@ SmartFitter loads MATLAB `.mat` files from NV-center experiments, plots the data
 Supported inputs include:
 - Legacy MATLAB files with a `savedData` root structure
 - New MATLAB files with `data` + `scanInfo` root structures
+- Snapshot files with `Data` + `scanInfo`, including independent Detector 1 and Detector 2 streams
 
 The tool can be used in two ways:
 - GUI: best for loading one file, checking plots, adjusting settings, and exporting results
@@ -88,17 +91,30 @@ Basic GUI workflow:
 - Leave `Profile` on `Auto` unless you want to force a specific analysis preset
 - Choose the observable mode:
   - `contrast` for `(reference - signal) / reference`
-  - `raw_signal` for raw counts
+  - `signal` for raw counts (`raw_signal` remains accepted by the CLI/API)
   - `difference` for `reference - signal`
+- For a dual-detector file, use the Detector selector to choose the active stream, then choose `Apply to: Active detector` or `Both detectors`
+- In `Both detectors` mode, shared preprocessing and display choices are applied to both streams, fits run independently for both channels with the same model/settings, and both results are retained in sessions and JSON exports
+- Use `Labels...` to give the detectors session-local presentation names; these labels are exported but never written into the MAT file
+- Enable `Compare detectors` to show the inactive stream; choosing `Both detectors` enables comparison automatically
 - Adjust ROI, binning, or smoothing if needed
 - Click fit controls to run the fit
 - Use `Save Results` to export plots and JSON/CSV outputs
 - Use `Copy figure` (or `Ctrl+Shift+C`) in the plot toolbar to paste the current high-resolution export figure directly into slides or documents
-- Use the quick toggles above the plot for Data, Fit, Smooth, Legend, Annotations, Signal, Reference, and Iterations. Annotations start off for raw data and turn on after a successful fit
-- In Overlays, checked non-primary files are drawn together. `Show all` fits the view to every checked file, `Primary only` hides overlays without unloading them, and double-clicking a row makes it primary
-- Clicking a point pins a temporary yellow marker without adding it to the legend. Click it again, press `Escape`, or use `Clear` to remove it; the data itself is never changed
-- Use `File > Save Analysis Session...` to resume a named analysis later, including overlays, masks, transforms, locks, plot/map state, and a still-valid fit result
-- For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, swap X/Y (on by default), or toggle equal physical axis scaling
+- The compact plot bar shows every applicable layer directly—Data, Fit, Smooth, Legend, annotations, residuals, confidence, raw channels, iterations, peaks, envelope, FFT, Edit plot, and Copy figure—without an overflow menu
+- The Project Explorer keeps all loaded files and compact multi-file actions visible. Single-click highlights, double-click makes primary, checkboxes overlay compatible 1D files, and the context menu exposes the same workflow
+- Use the Project Explorer filter to narrow long file lists by filename, experiment, dimensions, or detector; View > Reset Workspace Layout restores both docks and clears the filter
+- The Properties Inspector is organized into Model, Params, Process, Plot, Results, Map, and Export tabs. Tabs that do not apply to the active file are omitted automatically
+- Press Ctrl+K to focus the file filter; Alt+1 through Alt+7 open the corresponding inspector pages when available
+- The application shell uses a high-contrast dark workspace while exported and live scientific figures retain a white plotting surface
+- Clicking a point pins a temporary yellow marker without adding it to the legend. In a 1D plot, Ctrl/Shift-click additional samples to keep several highlighted (the readout follows the last one); click a selected point again, press `Escape`, or use `Clear` to remove the selection. The data itself is never changed
+- Use `File > Save Analysis Session...` to resume a named analysis later, including overlays, masks, transforms, locks, plot/map state, detector scope, and still-valid per-detector fit results
+- For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, swap X/Y, or toggle equal physical axis scaling; axis swapping and equal physical scaling are on by default
+- In a dual 2D comparison, the synchronized maps have separate colorbars and independent ranges by default. Select `Shared` only when one common color range is desired; manual limits are remembered per detector.
+- For an XY scan, open `Map > Fluorescent spots` and choose `Detect and fit`. The tool estimates a local background, detects bright and/or dark departures, and fits a rotated elliptical Gaussian to each object. The table reports physical X/Y center coordinates, half-maximum major/minor radii, angle, and R-squared; hover a row for contrast, SNR, and axis ratio. `Copy spot table` puts a compact, tab-separated and PowerPoint-friendly table on the clipboard while file exports retain the complete machine-readable table.
+- `Auto fluorescence` uses the raw Signal map when it contains structure, even if Contrast is flat. `Display analyzed source` shows the map actually used by the fit. `Show fitted shapes` toggles the ellipses and centers, while `Show numbers` controls labels. With `Apply to: Both detectors`, each detector is characterized independently and both overlays/results are retained.
+- Select one or more rows in the spot table to remove false positives or keep only the selected objects. `Restore removed` and Ctrl+Z restore the previous list. `Compare detector spots` reports the physical center offset, radius/orientation and amplitude ratios, plus local profile correlation, and highlights the compared pair on both detector maps.
+- Reference-only acquisitions automatically open in `reference` view instead of displaying a meaningless contrast trace; selecting a normal file restores the usual contrast default.
 
 The GUI has two workspaces:
 - `Analyze`: load one MAT file, prepare it, fit it, inspect the WYSIWYG plot, and export results
@@ -124,6 +140,9 @@ python -m nvfit.pro_batch --single-file "insert folder path here\data.mat" --out
 
 Useful options:
 - `--mode contrast`
+- `--detector all` (default; use `detector1` or `detector2` to restrict the run)
+- `--detector1-label "Detector 1"`
+- `--detector2-label "Detector 2"`
 - `--bin-size 1`
 - `--smooth-window 1`
 - `--model-override DynamicDecoupling`
@@ -133,7 +152,7 @@ Useful options:
 Batch output files:
 - `<name>_fit.png`: exported plot
 - `<name>_result.json`: fit results and metadata
-- `batch_summary.csv`: one-row summary for each file
+- `batch_summary.csv`: one row per processed detector; single-detector files still produce one row
 - `validation_report.csv`: pass/warn/fail summary
 - `aggregate_report.csv`: grouped statistics
 
@@ -146,6 +165,9 @@ GUI exports can include:
 - `<name>_gui_result.json`
 - `<name>_gui_result.csv`
 - `<name>_origin_bundle.csv`
+- `<name>__detectors_raw.csv` for a dual file when Origin export is selected
+
+Dual-file GUI and batch results use stable `__detector1` / `__detector2` suffixes so saving one detector cannot overwrite the other. The detector-raw CSV is tidy: each row identifies the detector and includes coordinates, signal, reference, contrast, difference, and validity.
 
 The JSON files contain:
 - experiment type
@@ -178,6 +200,8 @@ MATLAB file will not load
 - Confirm the file is a supported `.mat` export
 - Legacy files should contain `savedData`
 - New files should contain `data` and `scanInfo`
+- Snapshot files should contain `Data` and `scanInfo`; acquisition failures are reported with the saved run status and MATLAB error identifier/message
+- An unacquired failed 2D run is intentionally not displayed as a zero-valued map
 
 Fits look wrong
 - Check the selected profile

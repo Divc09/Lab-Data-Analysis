@@ -16,7 +16,7 @@ from .diagnostics import aic, bic, durbin_watson, r_squared, rmse
 from .analysis_tools import process_series
 from .fit_engine import FitResult, fit_model_multistart
 from .fit_workflows import FitWorkflowConfig, fit_non_ramsey
-from .io_mat import load_saved_data_mat
+from .io_mat import DETECTOR_LABELS, ExperimentTrace, load_experiment_dataset
 from .models import (
     MODEL_REGISTRY,
     build_custom_expression_model,
@@ -459,12 +459,22 @@ def _build_result_row(
     completion = ""
     if trace_metadata.get("completed_iterations") is not None or trace_metadata.get("target_iterations") is not None:
         completion = f"{trace_metadata.get('completed_iterations', '')}/{trace_metadata.get('target_iterations', '')}"
+    detector_id = str(trace_metadata.get("detector_id") or provenance.get("detector_id") or "detector1")
+    detector_label = str(
+        trace_metadata.get("detector_label")
+        or provenance.get("detector_label")
+        or DETECTOR_LABELS.get(detector_id, detector_id)
+    )
+    detector_count = int(trace_metadata.get("detector_count") or provenance.get("detector_count") or 1)
 
     if result is not None:
         nv = _extract_nv_metrics(exp_type, result, trace_metadata)
         result_json = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -493,6 +503,9 @@ def _build_result_row(
         summary_row = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -522,6 +535,9 @@ def _build_result_row(
         validation_row = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -537,6 +553,9 @@ def _build_result_row(
         result_json = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -558,6 +577,9 @@ def _build_result_row(
         summary_row = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -570,7 +592,7 @@ def _build_result_row(
             "bic": "",
             "durbin_watson": "",
             "bound_hits_count": 0,
-            "success": True,
+            "success": status not in {"FAIL"},
             "status": status,
             "status_reason": reason,
             "save_type": trace_metadata.get("save_type", ""),
@@ -587,6 +609,9 @@ def _build_result_row(
         validation_row = {
             "file": mat_file.name,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
             "experiment_type": exp_type,
             "scan_family": exp_type,
             "scan_dim": scan_dim,
@@ -663,6 +688,21 @@ def _output_stem(input_dir: Path, mat_file: Path, *, recursive: bool) -> str:
     return "__".join(rel.parts)
 
 
+def _canonical_batch_detector(value: str) -> str:
+    normalized = str(value or "all").strip().lower().replace(" ", "")
+    aliases = {
+        "all": "all",
+        "both": "all",
+        "detector1": "detector1",
+        "1": "detector1",
+        "detector2": "detector2",
+        "2": "detector2",
+    }
+    if normalized not in aliases:
+        raise ValueError("detector must be 'all', 'detector1', or 'detector2'")
+    return aliases[normalized]
+
+
 # ---------------------------------------------------------------------------
 # Main batch loop
 # ---------------------------------------------------------------------------
@@ -687,6 +727,8 @@ def run_batch(
     write_origin_bundles: bool = True,
     recursive: bool = False,
     skip_checkpoints: bool = False,
+    detector: str = "all",
+    detector_labels: dict[str, str] | None = None,
     progress_callback=None,
 ):
     """
@@ -710,6 +752,8 @@ def run_batch(
     progress_callback : callable or None
         Called with (file_index, total_files, filename, status_msg) tuples.
     """
+    detector = _canonical_batch_detector(detector)
+    labels = {**DETECTOR_LABELS, **(detector_labels or {})}
     output_dir.mkdir(parents=True, exist_ok=True)
     if single_file is not None:
         mat_files = [single_file]
@@ -726,13 +770,110 @@ def run_batch(
     if plugin_file is not None and plugin_file.exists():
         custom_spec = json.loads(plugin_file.read_text(encoding="utf-8"))
 
-    n_total = len(mat_files)
+    work_items: list[tuple[Path, ExperimentTrace | None, dict | None, int]] = []
+    for mat_file in mat_files:
+        try:
+            dataset = load_experiment_dataset(mat_file, mode=mode)  # type: ignore[arg-type]
+        except Exception as exc:
+            work_items.append(
+                (
+                    mat_file,
+                    None,
+                    {
+                        "detector_id": "detector1",
+                        "detector_label": labels["detector1"],
+                        "message": str(exc),
+                        "run_status": "load_error",
+                        "error_identifier": type(exc).__name__,
+                        "error_message": str(exc),
+                        "available_channels": [],
+                    },
+                    1,
+                )
+            )
+            continue
+        detector_count = len(dataset.available_detectors)
+        requested_ids = list(dataset.available_detectors) if detector == "all" else [detector]
+        for detector_id in requested_ids:
+            trace = dataset.detectors.get(detector_id)
+            if trace is not None:
+                trace.detector_label = labels.get(detector_id, DETECTOR_LABELS.get(detector_id, detector_id))
+                work_items.append((mat_file, trace, None, detector_count))
+                continue
+            failure = dataset.detector_errors.get(detector_id)
+            work_items.append(
+                (
+                    mat_file,
+                    None,
+                    {
+                        "detector_id": detector_id,
+                        "detector_label": labels.get(detector_id, DETECTOR_LABELS.get(detector_id, detector_id)),
+                        "message": failure.message if failure is not None else f"{detector_id} is unavailable",
+                        "run_status": failure.run_status if failure is not None else str(dataset.metadata.get("run_status", "unavailable")),
+                        "error_identifier": failure.error_identifier if failure is not None else "detector_unavailable",
+                        "error_message": failure.error_message if failure is not None else "",
+                        "available_channels": list(dataset.available_detectors),
+                    },
+                    detector_count,
+                )
+            )
 
-    for file_idx, mat_file in enumerate(mat_files):
-        trace = load_saved_data_mat(mat_file, mode=mode)  # type: ignore[arg-type]
-        exp_type = trace.experiment_type
+    n_total = len(work_items)
+
+    for file_idx, (mat_file, trace, load_failure, detector_count) in enumerate(work_items):
         relative_path = _relative_batch_path(input_dir, mat_file)
         file_meta = metadata_map.get(mat_file.name, {})
+        detector_id = trace.detector_id if trace is not None else str((load_failure or {}).get("detector_id", "detector1"))
+        detector_label = trace.detector_label if trace is not None else str((load_failure or {}).get("detector_label", labels.get(detector_id, detector_id)))
+        base_stem = _output_stem(input_dir, mat_file, recursive=recursive)
+        stem = f"{base_stem}__{detector_id}" if detector_count > 1 else base_stem
+
+        if load_failure is not None or trace is None:
+            trace_metadata = {
+                "detector_id": detector_id,
+                "detector_label": detector_label,
+                "detector_count": detector_count,
+                "run_status": str((load_failure or {}).get("run_status", "load_error")),
+                "error_identifier": str((load_failure or {}).get("error_identifier", "load_error")),
+                "error_message": str((load_failure or {}).get("error_message", "")),
+            }
+            reason = str((load_failure or {}).get("message", "Detector could not be loaded"))
+            provenance = {
+                "app_name": "SmartFitterPy",
+                "app_version": "2026.08",
+                "timestamp_utc": _now_utc_iso(),
+                "mode": mode,
+                "relative_path": relative_path,
+                "detector_id": detector_id,
+                "detector_label": detector_label,
+                "detector_count": detector_count,
+                "available_channels": list((load_failure or {}).get("available_channels", [])),
+            }
+            profile = PROFILES["LineScan"]
+            rj, sr, vr = _build_result_row(
+                mat_file,
+                "Unknown",
+                profile,
+                None,
+                "FAIL",
+                reason,
+                file_meta,
+                trace_metadata,
+                provenance,
+                "detector_load_error",
+                relative_path=relative_path,
+                scan_dim="unavailable",
+                fit_allowed=False,
+            )
+            with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
+                json.dump(rj, f, indent=2)
+            summary_rows.append(sr)
+            validation_rows.append(vr)
+            if progress_callback:
+                progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", f"FAIL | {reason}")
+            continue
+
+        exp_type = trace.experiment_type
         ex = exclude_map.get(mat_file.name, {})
         excluded = str(ex.get("exclude", "false")).lower() in ("1", "true", "yes", "y")
 
@@ -747,20 +888,25 @@ def run_batch(
 
         profile = PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
 
-        processed = process_series(trace.x_ns, trace.y, bin_size=bin_size, roi=(roi_min, roi_max))
-        x, y = processed.fit_x, processed.fit_y
-        if smooth_window > 1:
-            y = smooth_trace(y, smooth_window)
-
-        stem = _output_stem(input_dir, mat_file, recursive=recursive)
         fit_png = output_dir / f"{stem}_fit.png"
         trace_metadata = dict(trace.metadata or {})
+        trace_metadata.update(
+            {
+                "detector_id": detector_id,
+                "detector_label": detector_label,
+                "detector_count": detector_count,
+            }
+        )
         provenance = {
             "app_name": "SmartFitterPy",
-            "app_version": "2026.02",
+            "app_version": "2026.08",
             "timestamp_utc": _now_utc_iso(),
             "mode": mode,
             "relative_path": relative_path,
+            "detector_id": detector_id,
+            "detector_label": detector_label,
+            "detector_count": detector_count,
+            "available_channels": list(trace.available_detectors),
             "excluded": excluded,
             "model_override": model_override or "",
             "robust": robust,
@@ -770,14 +916,34 @@ def run_batch(
             "skip_checkpoints": skip_checkpoints,
         }
 
+        try:
+            processed = process_series(trace.x_ns, trace.y, bin_size=bin_size, roi=(roi_min, roi_max))
+            x, y = processed.fit_x, processed.fit_y
+            if smooth_window > 1:
+                y = smooth_trace(y, smooth_window)
+        except Exception as exc:
+            reason = f"Preprocessing failed: {type(exc).__name__}: {exc}"
+            rj, sr, vr = _build_result_row(
+                mat_file, exp_type, profile, None, "FAIL", reason,
+                file_meta, trace_metadata, provenance, "preprocess_error",
+                relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+            )
+            with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
+                json.dump(rj, f, indent=2)
+            summary_rows.append(sr)
+            validation_rows.append(vr)
+            if progress_callback:
+                progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", f"FAIL | {reason}")
+            continue
+
         if progress_callback:
-            progress_callback(file_idx, n_total, mat_file.name, "Processing...")
+            progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", "Processing...")
 
         # --- Spatial scans: plot only, no fit ---
         if trace.scan_dim == "scan2d" and trace.z2d is not None and trace.x2d is not None and trace.y2d is not None:
             _plot_scan2d(
                 fit_png, trace.x2d, trace.y2d, trace.z2d,
-                title=f"{mat_file.name} | 2D scan",
+                title=f"{mat_file.name} | {detector_label} | 2D scan",
                 x_label=(trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"),
                 y_label=(trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"),
                 dpi=dpi,
@@ -799,7 +965,7 @@ def run_batch(
         if trace.scan_dim == "scan1d" and not trace.fit_allowed:
             _plot_scan1d(
                 fit_png, x, y,
-                title=f"{mat_file.name} | 1D scan",
+                title=f"{mat_file.name} | {detector_label} | 1D scan",
                 x_label=(trace.scan_axes[0] if trace.scan_axes else trace.x_label),
                 y_label=trace.y_label, dpi=dpi,
             )
@@ -820,7 +986,7 @@ def run_batch(
         if excluded:
             _plot_scan1d(
                 fit_png, x, y,
-                title=f"{mat_file.name} | EXCLUDED",
+                title=f"{mat_file.name} | {detector_label} | EXCLUDED",
                 x_label=trace.x_label, y_label=trace.y_label, dpi=dpi,
             )
             rj, sr, vr = _build_result_row(
@@ -857,9 +1023,26 @@ def run_batch(
                 )
                 model_note = "single_model"
         except Exception as exc:
-            # Fallback
-            result = _fit_non_ramsey("SpinEcho", x, y, n_starts=multistart)
-            model_note = f"fallback_after_error:{type(exc).__name__}"
+            try:
+                result = _fit_non_ramsey("SpinEcho", x, y, n_starts=multistart)
+                model_note = f"fallback_after_error:{type(exc).__name__}"
+            except Exception as fallback_exc:
+                reason = (
+                    f"Fit failed: {type(exc).__name__}: {exc}; "
+                    f"fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
+                )
+                rj, sr, vr = _build_result_row(
+                    mat_file, exp_type, profile, None, "FAIL", reason,
+                    file_meta, trace_metadata, provenance, "fit_error",
+                    relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                )
+                with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
+                    json.dump(rj, f, indent=2)
+                summary_rows.append(sr)
+                validation_rows.append(vr)
+                if progress_callback:
+                    progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", f"FAIL | {reason}")
+                continue
 
         status, reason = classify_status(
             r2=result.r2, bound_hits=int(sum(result.bound_hits)), profile=profile,
@@ -867,7 +1050,7 @@ def run_batch(
 
         _plot_fit(
             fit_png, x, y, result,
-            title=f"{mat_file.name} | {result.model_name} | R²={result.r2:.4f}",
+            title=f"{mat_file.name} | {detector_label} | {result.model_name} | R²={result.r2:.4f}",
             y_label=trace.y_label, status=status, reason=reason, dpi=dpi,
         )
 
@@ -888,11 +1071,12 @@ def run_batch(
         validation_rows.append(vr)
 
         if progress_callback:
-            progress_callback(file_idx + 1, n_total, mat_file.name, f"{status} | R²={result.r2:.4f}")
+            progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", f"{status} | R²={result.r2:.4f}")
 
     # --- Summary CSVs ---
     _SUMMARY_FIELDS = [
-        "file", "relative_path", "experiment_type", "scan_family", "scan_dim", "fit_allowed",
+        "file", "relative_path", "detector_id", "detector_label", "detector_count",
+        "experiment_type", "scan_family", "scan_dim", "fit_allowed",
         "profile", "model", "r2", "rmse", "aic", "bic",
         "durbin_watson", "bound_hits_count", "success", "status", "status_reason",
         "save_type", "run_status", "iteration_completion", "completed_iterations",
@@ -905,7 +1089,8 @@ def run_batch(
         writer.writerows(summary_rows)
 
     _VALIDATION_FIELDS = [
-        "file", "relative_path", "experiment_type", "scan_family", "scan_dim", "status", "reason", "r2", "r2_min",
+        "file", "relative_path", "detector_id", "detector_label", "detector_count",
+        "experiment_type", "scan_family", "scan_dim", "status", "reason", "r2", "r2_min",
         "bound_hits", "bound_hits_max", "model",
     ]
     with (output_dir / "validation_report.csv").open("w", newline="", encoding="utf-8") as f:
@@ -941,6 +1126,14 @@ def main():
     parser.add_argument("--single-file", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("./batch_out"))
     parser.add_argument("--mode", choices=["contrast", "signal", "raw_signal", "reference", "difference"], default="contrast")
+    parser.add_argument(
+        "--detector",
+        choices=["all", "detector1", "detector2"],
+        default="all",
+        help="Detector stream(s) to process (default: all available streams).",
+    )
+    parser.add_argument("--detector1-label", default="Detector 1", help="Presentation label for detector1 outputs.")
+    parser.add_argument("--detector2-label", default="Detector 2", help="Presentation label for detector2 outputs.")
     parser.add_argument("--bin-size", type=int, default=1)
     parser.add_argument("--smooth-window", type=int, default=1)
     parser.add_argument("--roi-min", type=float, default=None)
@@ -977,6 +1170,8 @@ def main():
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         mode=args.mode,
+        detector=args.detector,
+        detector_labels={"detector1": args.detector1_label, "detector2": args.detector2_label},
         bin_size=args.bin_size,
         smooth_window=args.smooth_window,
         roi_min=args.roi_min,

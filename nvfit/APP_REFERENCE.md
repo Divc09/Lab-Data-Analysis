@@ -1,5 +1,7 @@
 # SmartFitter App Reference
 
+Current displayed application version: `2026.08`. Current analysis-session schema: `v3`.
+
 This document is the single source of truth for how the current `nvfit` app works, how to run it, and how to safely modify it later.
 
 ## 1) What this app is
@@ -12,7 +14,7 @@ This document is the single source of truth for how the current `nvfit` app work
 
 Primary goals:
 
-- Robust loading of MATLAB `savedData` and `data` + `scanInfo` structures.
+- Robust loading of MATLAB `savedData`, `data` + `scanInfo`, and single/dual-detector `Data` + `scanInfo` snapshot structures.
 - Correct experiment type detection from metadata first (axis labels / scan structure), filename second.
 - Physics-aware fitting workflows (especially Ramsey).
 - Useful outputs for lab review: plots, fit metrics, extracted NV-relevant parameters.
@@ -44,8 +46,8 @@ From repository root:
 Core files and responsibilities:
 
 - `nvfit/io_mat.py`
-  - Loads MATLAB files from both supported root schemas, extracts vectors, builds axes, infers experiment type.
-  - Provides `ExperimentTrace` with scan metadata (`scan_dim`, `scan_axes`, `fit_allowed`, optional 2D grids).
+  - Loads the supported MATLAB root schemas, extracts vectors, builds axes, and infers experiment type.
+  - Provides `ExperimentDataset` with stable detector IDs, per-detector traces/errors, channel metadata, and `ExperimentTrace` scan data.
 - `nvfit/preprocess.py`
   - ROI slicing, binning, smoothing.
 - `nvfit/models.py`
@@ -67,7 +69,8 @@ Core files and responsibilities:
 
 `io_mat.py` key concepts:
 
-- `DataMode`: `contrast`, `raw_signal`, `difference`
+- `DataMode`: `contrast`, `signal`/`raw_signal`, `reference`, `difference`
+- `ExperimentDataset` includes `detectors`, `detector_errors`, `available_detectors`, detector mode, and source/run metadata.
 - `ExperimentTrace` includes:
   - file/path
   - `experiment_type`
@@ -77,6 +80,9 @@ Core files and responsibilities:
   - optional raw acquisition axis (`raw_x`, `raw_x_label`)
   - trace metadata dictionary (`metadata`)
   - optional 2D grids (`x2d`, `y2d`, `z2d`)
+  - stable `detector_id`, editable presentation label, and available detector IDs
+
+`load_experiment_dataset(path, mode)` is the multi-detector API. `load_saved_data_mat(path, mode, detector_id="detector1")` remains the backward-compatible single-trace wrapper. Snapshot detector streams are read independently from `Data.values` / `analysis.*` and `Data.detector2Values` / `analysis.detector2.*`. Zero signal remains valid when acquisition progress marks the cell acquired. Unacquired 2D cells are never promoted into a zero map; failures retain run status and MATLAB error details.
 
 Type inference behavior:
 
@@ -180,14 +186,26 @@ Base plot toggles/settings include:
 - Figure width/height
 - Save DPI
 
-Factory presentation defaults are line-plus-scatter traces with smoothing,
+### 8.3 Dual-detector behavior
+
+- Detector 1 is active initially; comparison is off initially.
+- `Apply to` selects active-detector or both-detector analysis. Both mode applies shared preprocessing/display controls to both streams, runs the same requested fit independently for each channel, retains separate status/parameters/summaries, and restores the detector that initiated the run.
+- Detector labels default to `Detector 1` / `Detector 2`, are editable for the analysis session, and are presentation metadata only.
+- A 1D contrast comparison shares the primary axis. Counts and difference comparisons use a labeled secondary axis.
+- A 2D comparison uses synchronized equal-size maps with separate colorbars, point values, cursors, and linecuts. Maps are side by side when wide enough and stack vertically in a narrow plot area. Color ranges are independent by default; shared range is explicit and manual limits are stored per detector.
+- XY maps include background-aware fluorescent-spot characterization. Detection operates on the current observable or an explicitly selected Signal, Reference, or Difference map; Auto fluorescence prefers structured raw signal counts so flat derived contrast does not suppress detection. Each connected feature is fitted independently with a rotated elliptical Gaussian plus local planar background and reports center, Gaussian widths, half-maximum radii, equivalent radius, orientation, amplitude, local background, contrast, SNR, integrated signal, and R-squared. FWHM ellipses, center markers, and numbered labels are independently toggleable, preserved in v3 sessions, and included in JSON and `__spots.csv` exports. Table-row curation supports removing false positives or keeping selected objects, with Restore and undo support. Compare detector spots reports center/radius/orientation/amplitude differences and local profile correlation, and highlights the selected pair on both maps. Both-detector scope analyzes both maps independently.
+- File overlays and baselines follow the active detector. Missing overlay channels are skipped with a visible warning, and detector comparison applies only to the primary source.
+- Loaded 2D maps and 1D traces may coexist in the file registry, but only compatible 1D traces are checkable as overlays or baselines. `Plot selected` and row double-clicking switch the primary file through the full load/reset path.
+- A detector stream containing valid reference counts but only zero signal counts is treated as reference-only and automatically opens in Reference view. The automatic fallback is reevaluated when the primary file or detector changes.
+
+The plot-first workspace follows a compact desktop-scientific layout: a filterable Project Explorer, a dominant central figure, and a Properties Inspector with Model, Params, Process, Plot, Results, Map, and Export tabs. The application chrome uses a high-contrast dark palette while the scientific figure stays white. At narrower widths one dock becomes a direct-access drawer before the plot geometry is compromised; Reduce motion makes the 160 ms transitions immediate, and View > Reset Workspace Layout restores the default dock state. Factory presentation defaults are line-plus-scatter traces with smoothing,
 iteration mean, and the Rabi envelope disabled on an 8.5 × 5.5 inch white
 figure at 300 DPI. Existing preferences are migrated only when they still
 match previous factory values.
 
 Presentation settings affect the live plot, clipboard image, PNG/PDF/SVG outputs, and annotated report figures. Batch CLI plots remain independent.
 
-### 8.3 Parameter editor
+### 8.4 Parameter editor
 
 The parameter table is:
 
@@ -199,7 +217,7 @@ Behavior:
 - `Min` and `Max`: optional per-parameter bounds
 - `Lock`: hard-fixes parameter to `Value`
 
-### 8.4 Rabi mode
+### 8.5 Rabi mode
 
 In Fit Strategy:
 
@@ -211,7 +229,7 @@ In Fit Strategy:
 
 For adaptive fits, `delay` is fitted directly. Saved `RFRampTime` metadata is retained separately as `saved_rf_ramp_time_ns`; it is not confused with the exponential turn-on timescale `tau_ramp`.
 
-### 8.5 ODMR mode
+### 8.6 ODMR mode
 
 Supports:
 
@@ -223,12 +241,12 @@ Behavior:
 
 - Multi-peak + peak-pick mode reports peak locations (no forced single-peak Lorentzian fit).
 
-### 8.6 Equation rendering and custom expressions
+### 8.7 Equation rendering and custom expressions
 
 - Active model equations are rendered with Matplotlib mathtext in Fit Strategy.
 - `CustomModel` exposes editable expression source and live preview.
 
-### 8.7 Preferences/options
+### 8.8 Preferences/options
 
 Persistent controls live directly in the Plot, Annotation, Export, and Map sections. `Options > Save Current Preferences` stores them without a duplicate preferences dialog.
 
@@ -254,6 +272,10 @@ GUI save (`on_save_results`) writes:
 - `<stem>_gui_report.png` (non-2D scan mode)
 - `<stem>_gui_result.json`
 - `<stem>_gui_result.csv`
+- `<stem>_origin_bundle.csv` plus metadata when Origin export is selected
+- `<base>__detectors_raw.csv` for dual files, containing every detector's coordinates, signal, reference, contrast, difference, and validity
+
+Dual-file selected-detector outputs use stable `__detector1` / `__detector2` suffixes. JSON/CSV provenance records the active ID and editable label, available channels, label map, and comparison state. Single-detector filenames are unchanged.
 
 Report figure behavior:
 
@@ -278,6 +300,7 @@ Batch output (`pro_batch.py`):
   - `validation_report.csv`
 
 For spatial scans, batch writes plot-only results with explicit no-fit status.
+Batch defaults to all available detectors and accepts `--detector all|detector1|detector2`. Dual files produce separate rows and files per detector; single-detector row counts and filenames remain unchanged. Batch schemas include `detector_id`, `detector_label`, and `detector_count`. A bad file or detector produces a FAIL row with acquisition details and does not terminate later work items.
 
 ## 10) Profiles and quality gates
 
@@ -417,12 +440,12 @@ This release adds the following production features:
 
 ## 16) Analysis sessions, transforms, and clipboard
 
-- `File > Save Analysis Session...` writes an atomic v2 `.nvfit-session.json` document and can read v1 sessions. It records source fingerprints, overlays/baselines, profile/model choices, locks, preprocessing, masks, transforms, plot/map state, metadata, view limits, and valid fit state. Missing sources can be located interactively; changed sources invalidate stale fits.
+- `File > Save Analysis Session...` writes an atomic v3 `.nvfit-session.json` document and can read/migrate v1/v2 sessions. It records active detector, comparison state, labels, per-detector map limits, comparison scale, source fingerprints, overlays/baselines, profile/model choices, locks, preprocessing, masks, transforms, plot/map state, metadata, view limits, and valid fit state. v1/v2 migrate to Detector 1 with comparison disabled. Missing sources can be located interactively; changed sources invalidate stale fits.
 - Analysis transforms are display/measurement tools: baseline removal, detrend, normalization, derivative, integral, uniform resampling, and safe vector expressions. The fitting pipeline remains on the pre-transform processed data, so fit parameters retain their experiment-model meaning.
 - Plot clicks create a temporary yellow inspection marker that is excluded from the legend. Clicking the same point again, pressing `Escape`, or using `Clear` removes it without changing or excluding measured data.
-- Double-clicking presentation objects takes priority over point inspection and opens the Plot Editor at the matching series, annotation, title/label, or tick section.
-- `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard.
-- A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, default-on X/Y swapping, optional equal-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
+- Double-clicking presentation objects takes priority over point inspection and opens a compact property popover for text, visibility, typography, color, line/marker style, and location. `More...` opens the Plot Editor at the matching series, annotation, title/label, tick, or colorbar target. Direct edits participate in dirty-state tracking and undo/redo.
+- `Copy figure` and `Ctrl+Shift+C` render the current Matplotlib export figure at at least 300 DPI and place a PNG image on the system clipboard. Auto sizing uses 8.5 x 5.5 inches for 1D, 6.5 x 6.0 for one map, and 11 x 5.5 for dual maps; manual dimensions switch to Custom.
+- A labeled 2D Map Controls inspector appears beside scan maps. It controls colormap/reversal, editable robust percentiles or manual color limits, exact X/Y view bounds, full-view reset, pan, box zoom, pointer-centered wheel zoom, default-on X/Y swapping and equal physical-axis scaling, linecuts, and peak/dip navigation. Settings persist in `QSettings`.
 
 ## 17) Plugin spec for custom model
 

@@ -1,19 +1,22 @@
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.io import savemat
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QCheckBox, QFileDialog
 
 from nvfit.fit_engine import FitResult
 from nvfit.app_state import FitOutcome, FitRequest
 from nvfit.gui_app import IterationSelectionDialog, SmartFitterMainWindow
+from nvfit.scan_spots import SpotFit
 
 
 TDD_ROOT = Path(r"D:\BacklundLabResearch\Data\Experiments\429_TDD")
@@ -29,6 +32,90 @@ def _app() -> QApplication:
 
 def _fixture(*parts: str) -> Path:
     return Path(__file__).resolve().parents[1].joinpath(*parts)
+
+
+def _write_gui_dual_snapshot(path: Path, *, dimension: int, reference_only: bool = False) -> None:
+    if dimension == 1:
+        x = np.arange(4, dtype=float)
+        values1 = np.empty((4, 1), dtype=object)
+        values2 = np.empty((4, 1), dtype=object)
+        ref1 = 100.0 + x
+        ref2 = 60.0 + x
+        sig1 = np.zeros_like(x) if reference_only else 70.0 + x
+        sig2 = np.zeros_like(x) if reference_only else 20.0 + 2 * x
+        for i in range(4):
+            values1[i, 0] = np.array([ref1[i], sig1[i]])
+            values2[i, 0] = np.array([ref2[i], sig2[i]])
+
+        def metric(y_values: np.ndarray, label: str) -> dict:
+            return {"x": x, "y": y_values, "xLabel": "Stage Z", "yLabel": label}
+
+        scan_info = {
+            "bounds": np.array([0.0, 3.0]), "stepSize": 1.0, "nSteps": 4,
+            "parameter": "stage z", "identifier": "PI Stage",
+        }
+        analysis1 = {
+            "dimension": 1,
+            "averageContrast": metric((ref1 - sig1) / ref1, "Contrast"),
+            "averageSignal": metric(sig1, "Signal [counts]"),
+            "averageReference": metric(ref1, "Reference [counts]"),
+        }
+        analysis2 = {
+            "dimension": 1,
+            "averageContrast": metric((ref2 - sig2) / ref2, "Contrast"),
+            "averageSignal": metric(sig2, "Signal [counts]"),
+            "averageReference": metric(ref2, "Reference [counts]"),
+        }
+        iterations = np.ones(4)
+        failed = np.zeros((4, 1))
+    else:
+        x = np.array([0.0, 1.0, 2.0])
+        y = np.array([10.0, 11.0])
+        ref1 = np.array([[100.0, 101.0, 102.0], [103.0, 104.0, 105.0]])
+        sig1 = np.zeros_like(ref1) if reference_only else np.array([[80.0, 79.0, 78.0], [77.0, 76.0, 75.0]])
+        ref2 = np.array([[50.0, 51.0, 52.0], [53.0, 54.0, 55.0]])
+        sig2 = np.zeros_like(ref2) if reference_only else np.array([[10.0, 12.0, 14.0], [16.0, 18.0, 20.0]])
+        values1 = np.empty((2, 3), dtype=object)
+        values2 = np.empty((2, 3), dtype=object)
+        for index in np.ndindex(values1.shape):
+            values1[index] = np.array([ref1[index], sig1[index]])
+            values2[index] = np.array([ref2[index], sig2[index]])
+
+        def metric(z_values: np.ndarray, label: str) -> dict:
+            return {"x": x, "y": y, "z": z_values, "xLabel": "Stage X", "yLabel": "Stage Y", "zLabel": label}
+
+        scan_info = np.empty(2, dtype=object)
+        scan_info[0] = {"bounds": np.array([0.0, 2.0]), "stepSize": 1.0, "nSteps": 3, "parameter": "stage x", "identifier": "PI Stage"}
+        scan_info[1] = {"bounds": np.array([10.0, 11.0]), "stepSize": 1.0, "nSteps": 2, "parameter": "stage y", "identifier": "PI Stage"}
+        analysis1 = {
+            "dimension": 2,
+            "averageContrast": metric((ref1 - sig1) / ref1, "Contrast"),
+            "averageSignal": metric(sig1, "Signal [counts]"),
+            "averageReference": metric(ref1, "Reference [counts]"),
+        }
+        analysis2 = {
+            "dimension": 2,
+            "averageContrast": metric((ref2 - sig2) / ref2, "Contrast"),
+            "averageSignal": metric(sig2, "Signal [counts]"),
+            "averageReference": metric(ref2, "Reference [counts]"),
+        }
+        iterations = np.ones((2, 3))
+        failed = np.zeros((2, 3))
+
+    savemat(
+        path,
+        {
+            "Data": {
+                "values": values1, "detector2Values": values2,
+                "iteration": iterations, "failedPoints": failed, "detectorMode": "dual",
+            },
+            "scanInfo": scan_info,
+            "params": {"detectorMode": "dual"},
+            "progress": {"status": "completed", "completedIterations": 1, "targetIterations": 1},
+            "metadata": {"runStatus": "completed", "saveType": "final"},
+            "analysis": {**analysis1, "detector2": analysis2},
+        },
+    )
 
 
 def test_startup_empty_state_and_loaded_action_availability():
@@ -181,6 +268,108 @@ def test_gui_wysiwyg_plot_click_selection_pins_nearest_point_without_legend_entr
     assert not any(label in {"Point", "Selected point"} for label in win.ax_main.get_legend_handles_labels()[1])
 
 
+def test_gui_ctrl_click_keeps_multiple_1d_points_highlighted():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "NewCodebaseTests", "323RabiFullRun__checkpoint.mat")))
+
+    first = 4
+    second = 18
+    first_event = SimpleNamespace(
+        inaxes=win.ax_main,
+        xdata=float(win.ctx.x[first]),
+        ydata=float(win.ctx.y[first]),
+        key=None,
+    )
+    additive_event = SimpleNamespace(
+        inaxes=win.ax_main,
+        xdata=float(win.ctx.x[second]),
+        ydata=float(win.ctx.y[second]),
+        key="control",
+    )
+    win._on_plot_click(first_event)
+    win._on_plot_click(additive_event)
+
+    assert len(win._selected_plot_points) == 2
+    assert [point["x"] for point in win._selected_plot_points] == [
+        float(win.ctx.x[first]),
+        float(win.ctx.x[second]),
+    ]
+    assert "2 points selected" in win.point_readout_lbl.text()
+    assert sum(line.get_label() == "_nolegend_" for line in win.ax_main.lines) >= 2
+
+    # The same modifier toggles one point off without clearing the other.
+    win._on_plot_click(additive_event)
+    assert len(win._selected_plot_points) == 1
+    assert win._selected_plot_point["x"] == pytest.approx(float(win.ctx.x[first]))
+
+
+def test_gui_spot_table_clipboard_is_powerpoint_ready_and_orders_xy():
+    app = _app()
+    win = SmartFitterMainWindow()
+    spot = SpotFit(
+        spot_id=1,
+        polarity="bright",
+        center_x=227.0,
+        center_y=598.0,
+        sigma_major=0.8243 / np.sqrt(2.0 * np.log(2.0)),
+        sigma_minor=0.7259 / np.sqrt(2.0 * np.log(2.0)),
+        angle_deg=10.014,
+        amplitude=100.0,
+        background=2.0,
+        contrast_percent=50.0,
+        snr=10.0,
+        r_squared=0.9666733,
+        integrated_signal=1000.0,
+        component_pixels=12,
+        fit_success=True,
+        source="Reference",
+    )
+    win._scan_spot_results = {"detector1": [spot]}
+
+    rows = win._spot_presentation_rows()
+    assert rows[0] == ["#", "Detector", "Center X, Y", "R major × minor", "R²"]
+    assert rows[1][2] == "227, 598"
+    assert rows[1][3] == "0.8243 × 0.7259 @ 10°"
+    assert rows[1][4] == "0.9667"
+
+    win._copy_spot_table()
+    text = app.clipboard().text()
+    assert text.splitlines()[0] == "#\tDetector\tCenter X, Y\tR major × minor\tR²"
+    assert "227, 598" in text
+    assert "detector_id" not in text
+    assert "<table" in win._spot_presentation_html(rows)
+
+
+def test_gui_spot_table_converts_reversed_stored_scan_axes_to_physical_xy():
+    _app()
+    win = SmartFitterMainWindow()
+    win._primary_dataset = SimpleNamespace(
+        detectors={"detector1": SimpleNamespace(detector_id="detector1", scan_axes=("y", "x"))}
+    )
+    spot = SpotFit(
+        spot_id=1,
+        polarity="bright",
+        center_x=227.0,
+        center_y=598.0,
+        sigma_major=0.5,
+        sigma_minor=0.4,
+        angle_deg=0.0,
+        amplitude=1.0,
+        background=0.0,
+        contrast_percent=1.0,
+        snr=1.0,
+        r_squared=0.5,
+        integrated_signal=1.0,
+        component_pixels=4,
+        fit_success=True,
+    )
+    win._scan_spot_results = {"detector1": [spot]}
+
+    assert win._spot_presentation_rows()[1][2] == "598, 227"
+
+
 def test_gui_scan_visibility_and_summary_for_2d_scan():
     _app()
     win = SmartFitterMainWindow()
@@ -209,6 +398,8 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
     assert win.ctx.trace.experiment_type == "Scan2D"
     assert win.scan_swap_axes_chk.isChecked()
+    assert "Stage X" in win.scan_swap_axes_chk.text()
+    assert "Stage Z" in win.scan_swap_axes_chk.text()
     assert "Stage Z" in win.ax_main.get_xlabel()
     assert "Stage X" in win.ax_main.get_ylabel()
     swapped_extent = win._scan2d_extent(win.ctx.trace)[2]
@@ -218,7 +409,7 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     unswapped_extent = win._scan2d_extent(win.ctx.trace)[2]
     assert swapped_extent == pytest.approx((unswapped_extent[2], unswapped_extent[3], unswapped_extent[0], unswapped_extent[1]))
     win.scan_swap_axes_chk.setChecked(True)
-    win.scan_equal_aspect_chk.setChecked(True)
+    win.scan_pixel_geometry_combo.setCurrentText("Physical pixel size")
     win._refresh_plot_only()
 
     finite = np.asarray(win.ctx.trace.z2d, dtype=float)
@@ -241,7 +432,7 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     for edit, value in ((win.scan_xmin_edit, xlim[0]), (win.scan_xmax_edit, xlim[1]), (win.scan_ymin_edit, ylim[0]), (win.scan_ymax_edit, ylim[1])):
         edit.setText(f"{value:.12g}")
     win._apply_scan_view_limits()
-    assert not win.scan_equal_aspect_chk.isChecked()
+    assert win.scan_pixel_geometry_combo.currentText() == "Physical pixel size"
     assert win.ax_main.get_xlim() == pytest.approx(xlim)
     assert win.ax_main.get_ylim() == pytest.approx(ylim)
 
@@ -265,6 +456,38 @@ def test_gui_2d_quick_controls_update_color_limits_and_view():
     assert np.allclose(win.ax_main.get_ylim(), (extent[2], extent[3]))
 
 
+def test_gui_2d_pixel_geometry_survives_axis_swap_for_rectangular_map():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
+
+    trace = win.ctx.trace
+    assert trace is not None and trace.x2d is not None
+    # Make the 41-column first scan axis use 2-unit pixels while the
+    # 11-column second axis retains its 5-unit pixels.
+    first_axis = float(trace.x2d[0, 0]) + 2.0 * np.arange(trace.x2d.shape[1])
+    trace.x2d = np.tile(first_axis, (trace.x2d.shape[0], 1))
+
+    for geometry in ("Physical pixel size", "Square pixels"):
+        win.scan_pixel_geometry_combo.setCurrentText(geometry)
+        for swapped in (False, True):
+            win.scan_swap_axes_chk.setChecked(swapped)
+            win._refresh_plot_only()
+            win.canvas.draw()
+
+            x, y, z, _x_label, _y_label = win._scan2d_display_data(trace)
+            pos = win.ax_main.get_position()
+            fig_w, fig_h = win.fig.get_size_inches()
+            screen_cell_ratio = ((pos.width * fig_w) / z.shape[1]) / ((pos.height * fig_h) / z.shape[0])
+            expected = 1.0 if geometry == "Square pixels" else abs(float(np.median(np.diff(x))) / float(np.median(np.diff(y))))
+            assert screen_cell_ratio == pytest.approx(expected, rel=0.03)
+
+            _x_edges, _y_edges, extent = win._scan2d_extent(trace)
+            assert win.ax_main.get_xlim() == pytest.approx((extent[0], extent[1]))
+            assert win.ax_main.get_ylim() == pytest.approx((extent[2], extent[3]))
+
+
 def test_gui_2d_scan_draws_after_removing_twinned_observable_axis():
     _app()
     win = SmartFitterMainWindow()
@@ -279,7 +502,7 @@ def test_gui_2d_scan_draws_after_removing_twinned_observable_axis():
 
     win._load_file(str(_fixture("TestData", "1305_XZScan.mat")))
     assert win._ax_secondary is None
-    assert win.ax_main.get_adjustable() == "datalim"
+    assert win.ax_main.get_adjustable() == "box"
     win.canvas.draw()
 
     _x_edges, _y_edges, extent = win._scan2d_extent(win.ctx.trace)
@@ -293,7 +516,7 @@ def test_gui_june5_stage_scan_export_extent_and_colorbar_layout():
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
     win._load_file(str(JUNE5_2D_STAGE))
-    win.scan_equal_aspect_chk.setChecked(True)
+    win.scan_pixel_geometry_combo.setCurrentText("Physical pixel size")
     win._refresh_plot_only()
 
     assert win.ctx.trace is not None
@@ -653,14 +876,17 @@ def test_gui_options_drawers_defaults_and_tooltips():
     _app()
     win = SmartFitterMainWindow()
 
-    assert win.data_box.isChecked()
-    assert not win.overlay_box.isChecked()
-    assert not win.prep_box.isChecked()
-    assert win.strategy_box.isChecked()
-    assert not win.advanced_box.isChecked()
-    assert not win.plot_box.isChecked()
-    assert not win.annotation_box.isChecked()
-    assert win.export_box.isChecked()
+    assert win.data_box.isHidden()
+    assert not win.overlay_box.isCheckable()
+    assert not win.strategy_box.isCheckable()
+    assert not win.param_box.isCheckable()
+    assert win.prep_box.isHidden()
+    assert win.advanced_box.isHidden()
+    assert win.plot_box.isHidden()
+    assert win.annotation_box.isHidden()
+    assert win.export_box.isHidden()
+    assert win.analysis_tools_btn.isVisibleTo(win.left_panel)
+    assert win.file_details_btn.toolTip()
     assert not win.mask_mode_combo.isVisible()
 
     required = [
@@ -762,7 +988,85 @@ def test_gui_overlay_registry_starts_primary_only_and_explicit_selection_fits_co
     assert win.ax_main.get_xlim()[1] < 500.0
 
 
-def test_gui_responsive_scaling_reflows_toolbar_and_scales_plot_text():
+def test_gui_mixed_dimension_registry_keeps_2d_primary_visible_and_selectable():
+    _app()
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    first_1d = _fixture("TestData", "NewCodebaseTests", "Z_Scan4pm.mat")
+    second_1d = _fixture("TestData", "Rabi_2206GHz4ns.mat")
+    scan_2d = _fixture("TestData", "1305_XZScan.mat")
+
+    win._load_dropped_files([str(first_1d), str(second_1d)])
+    assert win._checked_overlay_names() == {second_1d.name}
+
+    win._load_dropped_files([str(scan_2d)])
+    win.canvas.draw()
+
+    assert win.ctx.trace is not None and win.ctx.trace.file_name == scan_2d.name
+    assert win.ctx.trace.scan_dim == "scan2d"
+    assert len(win.ax_main.collections) == 1
+    assert win._scan_colorbar is not None
+    assert win._checked_overlay_names() == set()
+    assert {first_1d.name, second_1d.name, scan_2d.name} <= set(win.ctx.loaded_traces)
+
+    first_item = next(
+        win.overlay_list.item(index)
+        for index in range(win.overlay_list.count())
+        if win._overlay_item_name(win.overlay_list.item(index)) == first_1d.name
+    )
+    assert not bool(first_item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    win.overlay_box.setChecked(True)
+    win.overlay_list.setCurrentItem(first_item)
+    win.btn_plot_selected_file.click()
+    win.canvas.draw()
+
+    assert win.ctx.trace is not None and win.ctx.trace.file_name == first_1d.name
+    assert win.ctx.trace.scan_dim == "scan1d"
+    assert len(win.ax_main.lines) >= 1
+    scan_item = next(
+        win.overlay_list.item(index)
+        for index in range(win.overlay_list.count())
+        if win._overlay_item_name(win.overlay_list.item(index)) == scan_2d.name
+    )
+    assert not bool(scan_item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+
+
+def test_gui_reference_only_primary_defaults_to_reference_and_normal_file_restores_contrast(tmp_path):
+    _app()
+    reference_only = tmp_path / "reference_only.mat"
+    normal = tmp_path / "normal_contrast.mat"
+    _write_gui_dual_snapshot(reference_only, dimension=2, reference_only=True)
+    _write_gui_dual_snapshot(normal, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(reference_only))
+    win.canvas.draw()
+    assert win.mode_combo.currentText() == "reference"
+    assert win.ctx.trace is not None and win.ctx.trace.mode == "reference"
+    assert np.allclose(win.ctx.trace.y, win.ctx.trace.reference)
+    assert len(win.ax_main.collections) == 1
+
+    assert win._load_file(str(normal))
+    assert win.mode_combo.currentText() == "contrast"
+    assert win.ctx.trace is not None and win.ctx.trace.mode == "contrast"
+
+    reference_item = next(
+        win.overlay_list.item(index)
+        for index in range(win.overlay_list.count())
+        if win._overlay_item_name(win.overlay_list.item(index)) == reference_only.name
+    )
+    win.overlay_box.setChecked(True)
+    win.overlay_list.setCurrentItem(reference_item)
+    win.btn_plot_selected_file.click()
+    win.canvas.draw()
+    assert win.ctx.trace is not None and win.ctx.trace.file_name == reference_only.name
+    assert win.mode_combo.currentText() == "reference"
+    assert win.ctx.trace.mode == "reference"
+    assert len(win.ax_main.collections) == 1
+
+
+def test_gui_responsive_layout_collapses_panels_before_scaling_text():
     _app()
     win = SmartFitterMainWindow()
     win._message = lambda *args, **kwargs: None
@@ -770,17 +1074,23 @@ def test_gui_responsive_scaling_reflows_toolbar_and_scales_plot_text():
     win.presentation_state.annotation_style.font_size = 14
     win._set_annotation_visible(True, refresh=True)
 
+    win.show()
+    _app().processEvents()
     win.resize(900, 560)
     win._apply_responsive_scaling(force=True)
+    _app().processEvents()
 
-    assert win._ui_scale < 1.0
-    assert win.left_panel.minimumWidth() < 240
-    assert win.right_panel.minimumWidth() < 360
-    rows = [win.plot_quick_grid.getItemPosition(i)[0] for i in range(win.plot_quick_grid.count())]
-    assert max(rows) >= 1
+    assert win._ui_scale == 1.0
+    assert win._plot_scale == 1.0
+    assert win._responsive_layout_mode == "files"
+    assert not win.left_panel.isHidden()
+    assert win.right_panel.isHidden()
+    assert win.files_drawer_btn.isVisible()
+    assert win.inspector_drawer_btn.isVisible()
     assert win._plot_annotation_artist is not None
-    assert win._plot_annotation_artist.get_fontsize() < 14
-    assert win.ax_main.get_position().height > win._ax_main_default_pos.height
+    assert win._plot_annotation_artist.get_fontsize() == pytest.approx(14)
+    assert win.plot_surface.width() >= win.plot_stack.width() - 4
+    assert win.plot_surface.height() >= win.plot_stack.height() - 4
 
 
 def test_gui_plot_toolbar_syncs_with_drawer_controls():
@@ -792,14 +1102,15 @@ def test_gui_plot_toolbar_syncs_with_drawer_controls():
     for button in (
         win.quick_data_btn,
         win.quick_fit_btn,
-        win.quick_smooth_btn,
         win.quick_legend_btn,
-        win.quick_annotation_btn,
-        win.quick_signal_btn,
-        win.quick_reference_btn,
-        win.quick_iterations_btn,
+        win.quick_edit_plot_btn,
+        win.copy_figure_btn,
     ):
         assert win.plot_quick_grid.indexOf(button) >= 0
+    for button in (win.quick_smooth_btn, win.quick_annotation_btn, win.quick_signal_btn, win.quick_reference_btn, win.quick_iterations_btn):
+        assert not button.isHidden()
+        assert win.plot_quick_grid.indexOf(button) >= 0
+    assert win.quick_more_btn.isHidden()
 
     win.quick_legend_btn.setChecked(False)
     assert not win.show_legend_chk.isChecked()
@@ -1098,9 +1409,8 @@ def test_gui_failed_quality_fit_keeps_values_and_reveals_results_summary():
     assert "maximum evaluations reached" in summary
     assert "f (" in summary
     assert "FAIL" in win.status_lbl.text()
-    viewport = win.right_scroll.viewport()
-    result_top = win.results_box.mapTo(viewport, win.results_box.rect().topLeft()).y()
-    assert result_top < viewport.height()
+    assert win.inspector_tabs.currentIndex() == win.inspector_tab_indices["results"]
+    assert not win.results_box.isHidden()
 
 
 def test_gui_fit_exception_preserves_previous_summary_values():
@@ -1136,7 +1446,7 @@ def test_gui_undo_history_is_chronological_across_parameters_and_masks():
     assert float(win.param_table.item(0, 1).text()) == 1.0
 
 
-def test_gui_session_v2_restores_plot_locks_and_fit_state(tmp_path, monkeypatch):
+def test_gui_session_v3_restores_plot_locks_and_fit_state(tmp_path, monkeypatch):
     _app()
     session_path = tmp_path / "complete.nvfit-session.json"
     win = SmartFitterMainWindow()
@@ -1174,3 +1484,392 @@ def test_gui_clearing_2d_cursor_does_not_recreate_best_point():
 
     assert win._scan_cursor is None
     assert win._selected_plot_point is None
+
+
+def test_gui_dual_detector_selection_invalidates_fit_and_compares_1d(tmp_path):
+    _app()
+    path = tmp_path / "dual_1d.mat"
+    _write_gui_dual_snapshot(path, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(path))
+    assert win._active_detector_id() == "detector1"
+    assert win.detector_combo.count() == 2
+    detector1_y = win.ctx.y.copy()
+    win.ctx.exclusion_ranges = [(0.5, 1.5)]
+    win.ctx.pending_locks = {"A": (0.1, True, 0.0, 1.0)}
+    win.ctx.fit_result = _fake_fit(win)
+
+    win.detector_combo.setCurrentIndex(win.detector_combo.findData("detector2"))
+
+    assert win.ctx.trace.detector_id == "detector2"
+    assert win.ctx.fit_result is None
+    assert win.ctx.exclusion_ranges == [(0.5, 1.5)]
+    assert win.ctx.pending_locks["A"][1]
+    assert len(win.ctx.y) != 0
+    assert not np.isclose(detector1_y[0], win.ctx.y[0])
+
+    win.compare_detectors_chk.setChecked(True)
+    assert any(line.get_label() == "Detector 1" for line in win.ax_main.lines)
+    win.mode_combo.setCurrentText("signal")
+    assert win._ax_secondary is not None
+    assert win._ax_secondary.get_ylabel().startswith("Detector 1")
+
+
+def test_gui_both_detector_scope_applies_smoothing_and_series_edits_to_both(tmp_path):
+    app = _app()
+    path = tmp_path / "dual_scope.mat"
+    _write_gui_dual_snapshot(path, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+
+    win.detector_scope_combo.setCurrentIndex(win.detector_scope_combo.findData("both"))
+    win.smooth_spin.setValue(3)
+    win.show_smoothed_chk.setChecked(True)
+    win._refresh_processed()
+
+    ids = {descriptor.series_id for descriptor in win._series_registry}
+    assert win.compare_detectors_chk.isChecked()
+    assert "smoothed" in ids
+    assert "detector:detector2:smoothed" in ids
+    assert "both detectors" in win.data_info_lbl.text()
+
+    data = next(descriptor for descriptor in win._series_registry if descriptor.series_id == "data")
+    win._open_plot_element_popover({"kind": "series", "descriptor": data, "route": ("series", "main", None)})
+    app.processEvents()
+    visible = next(
+        check for check in win._plot_element_popover.findChildren(QCheckBox)
+        if check.text() == "Show series"
+    )
+    visible.setChecked(False)
+    app.processEvents()
+
+    assert not win.presentation_state.series["data"].show_series
+    assert not win.presentation_state.series["detector:detector1"].show_series
+    assert not win.presentation_state.series["detector:detector2"].show_series
+    assert win.ctx.dirty
+    win._undo()
+    assert win.presentation_state.series.get("data") is None or win.presentation_state.series["data"].show_series
+
+
+def test_gui_dual_fit_queue_visits_each_detector_and_restores_origin(tmp_path, monkeypatch):
+    path = tmp_path / "dual_fit_queue.mat"
+    _write_gui_dual_snapshot(path, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+    win.detector_scope_combo.setCurrentIndex(win.detector_scope_combo.findData("both"))
+    win._dual_fit_origin = "detector1"
+    win._dual_fit_queue = ["detector2"]
+    win._dual_fit_robust = True
+    calls = []
+    monkeypatch.setattr(QTimer, "singleShot", staticmethod(lambda _delay, callback: callback()))
+    monkeypatch.setattr(win, "_start_fit", lambda robust=False, **kwargs: calls.append((win._active_detector_id(), robust, kwargs)))
+
+    win._continue_dual_fit()
+    assert calls == [("detector2", True, {"_detector_chain": True})]
+    assert win._active_detector_id() == "detector2"
+
+    win._dual_fit_summaries = {"detector1": "ok", "detector2": "ok"}
+    win._continue_dual_fit()
+    assert win._active_detector_id() == "detector1"
+    assert win._dual_fit_origin is None
+
+
+def test_gui_dual_2d_comparison_has_synchronized_maps_values_and_linecuts(tmp_path):
+    _app()
+    path = tmp_path / "dual_2d.mat"
+    _write_gui_dual_snapshot(path, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(path))
+    win.compare_detectors_chk.setChecked(True)
+
+    assert win._detector_compare_ax is not None and win._detector_compare_ax.get_visible()
+    assert win._scan_colorbar is not None
+    assert win._detector_compare_colorbar is not None
+    assert win.scan_compare_scale_combo.currentText() == "Independent"
+    assert np.allclose(win.ax_main.get_xlim(), win._detector_compare_ax.get_xlim())
+    assert np.allclose(win.ax_main.get_ylim(), win._detector_compare_ax.get_ylim())
+
+    x0 = float(win.ctx.trace.x2d[0, 0])
+    y0 = float(win.ctx.trace.y2d[0, 0])
+    win._select_point_from_plot(x0, y0, refresh=True)
+    assert "secondary_z" in win._selected_plot_point
+    assert "Detector 1=" in win.live_readout_lbl.text()
+    assert "Detector 2=" in win.live_readout_lbl.text()
+
+    # Clicking the comparison map while Detector 1 remains focused must use
+    # Detector 2 as the source and Detector 1 as the counterpart, not compare
+    # the selected cell with itself.
+    win._select_point_from_plot(x0, y0, refresh=True, detector_id="detector2")
+    assert win._selected_plot_point.get("detector_id") == "detector2"
+    assert win._selected_plot_point.get("secondary_z") != pytest.approx(win._selected_plot_point.get("z"))
+    assert "Detector 1=" in win.live_readout_lbl.text()
+    assert "Detector 2=" in win.live_readout_lbl.text()
+
+    win.scan_linecut_combo.setCurrentText("Cursor horizontal")
+    assert win.ax_res.get_visible()
+    assert len(win.ax_res.lines) >= 2
+
+
+def test_gui_dual_2d_plot_order_is_stable_when_focus_changes(tmp_path):
+    _app()
+    path = tmp_path / "dual_order.mat"
+    _write_gui_dual_snapshot(path, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+    win.compare_detectors_chk.setChecked(True)
+    assert win.ax_main.get_title() == "Detector 1"
+    compare_title = win._detector_compare_ax.get_title()
+    assert compare_title
+    assert "ACTIVE" not in win.ax_main.get_title()
+
+    win._activate_detector("detector2")
+    assert win.ax_main.get_title() == "Detector 1"
+    assert win._detector_compare_ax.get_title() == compare_title
+    assert "ACTIVE" not in win.ax_main.get_title()
+
+
+def test_gui_xy_spot_detection_uses_signal_and_targets_both_detectors(tmp_path):
+    _app()
+    path = tmp_path / "dual_spots.mat"
+    _write_gui_dual_snapshot(path, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+
+    x = np.linspace(-2.0, 2.0, 41)
+    y = np.linspace(-2.0, 2.0, 41)
+    xx, yy = np.meshgrid(x, y)
+    for detector_id, center in (("detector1", (-0.6, 0.4)), ("detector2", (0.7, -0.5))):
+        trace = win._primary_dataset.detectors[detector_id]
+        signal = 1000.0 + 300.0 * np.exp(
+            -0.5 * (((xx - center[0]) / 0.35) ** 2 + ((yy - center[1]) / 0.22) ** 2)
+        )
+        trace.x2d, trace.y2d = xx, yy
+        trace.z2d = np.zeros_like(signal)
+        trace.signal2d = signal
+        trace.reference2d = np.full_like(signal, 1000.0)
+
+    win.ctx.trace = win._primary_dataset.detectors["detector1"]
+    win.detector_scope_combo.setCurrentIndex(win.detector_scope_combo.findData("both"))
+    win.spot_threshold_spin.setValue(2.0)
+    win._detect_scan_spots()
+
+    assert set(win._scan_spot_results) == {"detector1", "detector2"}
+    assert all(win._scan_spot_results[detector_id] for detector_id in ("detector1", "detector2"))
+    assert all(
+        win._scan_spot_diagnostics[detector_id]["source_key"] == "signal"
+        for detector_id in ("detector1", "detector2")
+    )
+    assert win._detector_compare_ax is not None
+    assert win.ax_main.patches
+    assert win._detector_compare_ax.patches
+    win.spot_overlay_chk.setChecked(False)
+    assert not win.ax_main.patches
+    assert not win._detector_compare_ax.patches
+
+    win.spot_overlay_chk.setChecked(True)
+    win._compare_detector_spots()
+    assert win._spot_comparison_pair is not None
+    assert "Local profile correlation" in win.spot_compare_lbl.text()
+    original_count = sum(len(spots) for spots in win._scan_spot_results.values())
+    win.spot_results_table.selectRow(0)
+    win._remove_selected_spots()
+    assert sum(len(spots) for spots in win._scan_spot_results.values()) == original_count - 1
+    win._restore_removed_spots()
+    assert sum(len(spots) for spots in win._scan_spot_results.values()) == original_count
+
+
+def test_gui_dual_2d_comparison_supports_default_equal_physical_axes(tmp_path):
+    _app()
+    path = tmp_path / "dual_2d_equal_axes.mat"
+    _write_gui_dual_snapshot(path, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win.scan_pixel_geometry_combo.currentText() == "Physical pixel size"
+    assert win._load_file(str(path))
+    win.compare_detectors_chk.setChecked(True)
+    # Matplotlib validates the shared-axis aspect constraint during the
+    # deferred canvas draw, not when set_aspect() is called.
+    win.canvas.draw()
+
+    assert win._detector_compare_ax is not None
+    assert win.ax_main.get_aspect() == pytest.approx(1.0)
+    assert win._detector_compare_ax.get_aspect() == pytest.approx(1.0)
+    assert win.ax_main.get_adjustable() == "box"
+    assert win._detector_compare_ax.get_adjustable() == "box"
+    assert np.allclose(win.ax_main.get_xlim(), win._detector_compare_ax.get_xlim())
+    assert np.allclose(win.ax_main.get_ylim(), win._detector_compare_ax.get_ylim())
+
+
+def test_gui_dual_map_stacks_equal_axes_in_narrow_plot_shape(tmp_path):
+    path = tmp_path / "dual_2d_stacked.mat"
+    _write_gui_dual_snapshot(path, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+    win.compare_detectors_chk.setChecked(True)
+    win._dual_map_stacked = True
+    win._refresh_plot_only()
+    win.canvas.draw()
+
+    main = win.ax_main.get_position()
+    comparison = win._detector_compare_ax.get_position()
+    assert main.width == pytest.approx(comparison.width, rel=0.02)
+    assert main.height == pytest.approx(comparison.height, rel=0.02)
+    assert main.y0 > comparison.y0
+    assert win.ax_main.get_aspect() == pytest.approx(1.0)
+    assert win._detector_compare_ax.get_aspect() == pytest.approx(1.0)
+
+
+def test_gui_automatic_export_sizes_follow_plot_mode(tmp_path):
+    one_d = tmp_path / "dual_1d_export.mat"
+    two_d = tmp_path / "dual_2d_export.mat"
+    _write_gui_dual_snapshot(one_d, dimension=1)
+    _write_gui_dual_snapshot(two_d, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(one_d))
+    assert win._automatic_export_size() == (8.5, 5.5)
+    assert win._load_file(str(two_d))
+    win.compare_detectors_chk.setChecked(False)
+    assert win._automatic_export_size() == (6.5, 6.0)
+    win.compare_detectors_chk.setChecked(True)
+    assert win._automatic_export_size() == (11.0, 5.5)
+    win.fig_w_spin.setValue(9.25)
+    assert win.plot_opts.export_size_mode == "custom"
+    win._restore_automatic_export_size()
+    assert win.plot_opts.export_size_mode == "auto"
+
+
+def test_gui_reduced_motion_drawers_reach_immediate_end_state():
+    win = SmartFitterMainWindow()
+    win._reduce_motion = True
+    win._set_workspace_panel_visible("files", False)
+    assert win.left_panel.isHidden()
+    win._set_workspace_panel_visible("files", True)
+    assert not win.left_panel.isHidden()
+    assert win.left_panel.maximumWidth() > 10000
+
+
+def test_gui_reference_only_1d_comparison_can_transition_to_dual_2d_comparison(tmp_path):
+    _app()
+    reference_1d = tmp_path / "reference_only_1d.mat"
+    scan_2d = tmp_path / "dual_2d_after_twinned_axis.mat"
+    _write_gui_dual_snapshot(reference_1d, dimension=1, reference_only=True)
+    _write_gui_dual_snapshot(scan_2d, dimension=2)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+
+    assert win._load_file(str(reference_1d))
+    assert win.mode_combo.currentText() == "reference"
+    win.compare_detectors_chk.setChecked(True)
+    win.canvas.draw()
+    assert win._ax_secondary is not None
+    assert win.ax_main in win.ax_main._twinned_axes
+
+    assert win._load_file(str(scan_2d))
+    win.canvas.draw()
+
+    assert win.ctx.trace is not None and win.ctx.trace.scan_dim == "scan2d"
+    assert win.compare_detectors_chk.isChecked()
+    assert win._ax_secondary is None
+    assert win.ax_main not in win.ax_main._twinned_axes
+    assert len(win.ax_main.collections) == 1
+    assert win._detector_compare_ax is not None
+    assert len(win._detector_compare_ax.collections) == 1
+
+
+def test_gui_dual_session_labels_and_detector_safe_exports(tmp_path, monkeypatch):
+    _app()
+    path = tmp_path / "dual_session.mat"
+    session_path = tmp_path / "dual.nvfit-session.json"
+    export_dir = tmp_path / "exports"
+    export_dir.mkdir()
+    _write_gui_dual_snapshot(path, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+    win._detector_labels = {"detector1": "Green APD", "detector2": "Red APD"}
+    win._apply_detector_labels()
+    win._refresh_detector_controls("detector1")
+    win.compare_detectors_chk.setChecked(True)
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(export_dir))
+    win.exp_png_chk.setChecked(True)
+    win.exp_json_chk.setChecked(True)
+    win.exp_origin_chk.setChecked(True)
+    win.on_save_results()
+    win.detector_combo.setCurrentIndex(win.detector_combo.findData("detector2"))
+    win.on_save_results()
+
+    assert (export_dir / "dual_session__detector1_gui_result.json").exists()
+    assert (export_dir / "dual_session__detector2_gui_result.json").exists()
+    assert (export_dir / "dual_session__detector1__comparison_gui_fit.png").exists()
+    assert (export_dir / "dual_session__detector2__comparison_gui_fit.png").exists()
+    assert (export_dir / "dual_session__detectors_raw.csv").exists()
+    tidy = (export_dir / "dual_session__detectors_raw.csv").read_text(encoding="utf-8")
+    assert "Green APD" in tidy and "Red APD" in tidy
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(session_path), ""))
+    win.on_save_session()
+    payload = json.loads(session_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 3
+
+    restored = SmartFitterMainWindow()
+    restored._message = lambda *args, **kwargs: None
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(session_path), ""))
+    restored.on_load_session()
+    assert restored.ctx.trace.detector_id == "detector2"
+    assert restored.compare_detectors_chk.isChecked()
+    assert restored._detector_label("detector1") == "Green APD"
+    assert restored._detector_label("detector2") == "Red APD"
+
+
+def test_gui_session_v3_restores_independent_detector_fit_states(tmp_path, monkeypatch):
+    path = tmp_path / "dual_fit_session.mat"
+    session_path = tmp_path / "dual_fit_session.nvfit-session.json"
+    _write_gui_dual_snapshot(path, dimension=1)
+    win = SmartFitterMainWindow()
+    win._message = lambda *args, **kwargs: None
+    assert win._load_file(str(path))
+    win.detector_scope_combo.setCurrentIndex(win.detector_scope_combo.findData("both"))
+
+    detector1_result = _fake_fit(win)
+    detector1_result.params = detector1_result.params.copy()
+    detector1_result.params[0] = 1.25
+    win.ctx.fit_result = detector1_result
+    win.ctx.fit_target = win.ctx.y.copy()
+    win._set_status("PASS", "detector 1 fit")
+    win._store_active_detector_state()
+
+    win._activate_detector("detector2")
+    detector2_result = _fake_fit(win)
+    detector2_result.params = detector2_result.params.copy()
+    detector2_result.params[0] = 2.5
+    win.ctx.fit_result = detector2_result
+    win.ctx.fit_target = win.ctx.y.copy()
+    win._set_status("WARN", "detector 2 review")
+    win._store_active_detector_state()
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(session_path), ""))
+    win.on_save_session()
+    restored = SmartFitterMainWindow()
+    restored._message = lambda *args, **kwargs: None
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(session_path), ""))
+    restored.on_load_session()
+
+    assert restored.detector_scope_combo.currentData() == "both"
+    assert set(restored._detector_analysis_states) == {"detector1", "detector2"}
+    assert restored._detector_analysis_states["detector1"].fit_result.params[0] == pytest.approx(1.25)
+    assert restored._detector_analysis_states["detector2"].fit_result.params[0] == pytest.approx(2.5)
+    assert restored.ctx.trace.detector_id == "detector2"
+    assert restored.ctx.status == "WARN"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import numpy as np
@@ -10,6 +11,12 @@ from scipy.io import loadmat
 
 
 DataMode = Literal["contrast", "signal", "reference", "difference", "raw_signal"]
+DetectorId = Literal["detector1", "detector2"]
+
+DETECTOR_LABELS: dict[str, str] = {
+    "detector1": "Detector 1",
+    "detector2": "Detector 2",
+}
 
 
 @dataclass
@@ -38,6 +45,51 @@ class ExperimentTrace:
     iteration_signal: np.ndarray | None = None
     iteration_reference: np.ndarray | None = None
     iteration_valid: np.ndarray | None = None
+    signal2d: np.ndarray | None = None
+    reference2d: np.ndarray | None = None
+    detector_id: str = "detector1"
+    detector_label: str = "Detector 1"
+    available_detectors: tuple[str, ...] = ("detector1",)
+
+
+@dataclass(frozen=True)
+class DetectorLoadFailure:
+    detector_id: str
+    detector_label: str
+    message: str
+    run_status: str = ""
+    error_identifier: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class ExperimentDataset:
+    source_path: str
+    file_name: str
+    detector_mode: str
+    available_detectors: tuple[str, ...]
+    detectors: dict[str, ExperimentTrace]
+    detector_errors: dict[str, DetectorLoadFailure]
+    metadata: dict[str, object]
+
+
+class MatDataError(ValueError):
+    """Structured MAT loading failure with acquisition and detector context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        detector_id: str = "",
+        run_status: str = "",
+        error_identifier: str = "",
+        error_message: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.detector_id = detector_id
+        self.run_status = run_status
+        self.error_identifier = error_identifier
+        self.error_message = error_message
 
 
 def _clean_text(value: object) -> str:
@@ -299,6 +351,7 @@ def _finalize_trace(
     scan_dim: Literal["time", "scan1d", "scan2d"] = "time"
     fit_allowed = True
     x2d = y2d = z2d = None
+    signal2d = reference2d = None
     has_stage_axes = _stage_axis_count(scan_axes)
 
     if (has_stage_axes >= 2 or (_plot_only_scan_type(experiment_type) and len(scan_vectors) >= 2)) and len(scan_vectors) >= 2:
@@ -308,14 +361,17 @@ def _finalize_trace(
         L2 = nx * ny
         if len(y_full) >= L2:
             z = y_full[:L2].reshape(ny, nx)
+            signal_map = signal_full[:L2].reshape(ny, nx)
+            reference_map = reference_full[:L2].reshape(ny, nx)
             xv, yv = np.meshgrid(ax0, ax1)
             x2d, y2d, z2d = xv, yv, z
+            signal2d, reference2d = signal_map, reference_map
             scan_dim = "scan2d"
             fit_allowed = False
             x_ns = ax0.copy()
             y = np.nanmean(z2d, axis=0)
-            signal = signal_full[: len(y)]
-            reference = reference_full[: len(y)]
+            signal = np.nanmean(signal2d, axis=0)
+            reference = np.nanmean(reference2d, axis=0)
             raw_x_use = None
             y_sem_use = None
             contrast_iters_use = None
@@ -334,10 +390,6 @@ def _finalize_trace(
             reference = reference[:L1]
             raw_x_use = None if raw_x_use is None else raw_x_use[:L1]
             y_sem_use = None if y_sem_use is None else y_sem_use[:L1]
-            contrast_iters_use = None
-            signal_iters_use = None
-            reference_iters_use = None
-            valid_iters_use = None
 
     if scan_dim == "scan2d" and experiment_type == "LineScan":
         experiment_type = "Scan2D"
@@ -370,6 +422,8 @@ def _finalize_trace(
         iteration_signal=signal_iters_use,
         iteration_reference=reference_iters_use,
         iteration_valid=valid_iters_use,
+        signal2d=signal2d,
+        reference2d=reference2d,
     )
 
 
@@ -565,6 +619,8 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
     points_with_data = 0
 
     for i in range(nsteps):
+        if values.ndim == 1 and iterations.size > i and np.isfinite(iterations[i]) and iterations[i] <= 0:
+            continue
         max_iter = iter_capacity
         if values.ndim == 2 and iterations.size > i and np.isfinite(iterations[i]) and iterations[i] > 0:
             max_iter = min(max_iter, int(iterations[i]))
@@ -770,6 +826,7 @@ def _extract_snapshot_metadata(raw: dict[str, Any]) -> dict[str, object]:
         scan_notes = _safe_text_attr(meta, "scanNotes")
         base_save_path = _safe_text_attr(meta, "baseSavePath")
         avg_png = _safe_text_attr(meta, "averageContrastPNG")
+        detector2_avg_png = _safe_text_attr(meta, "detector2AverageContrastPNG")
         if save_type:
             metadata["save_type"] = save_type
         if run_status:
@@ -780,6 +837,15 @@ def _extract_snapshot_metadata(raw: dict[str, Any]) -> dict[str, object]:
             metadata["base_save_path"] = base_save_path
         if avg_png:
             metadata["average_contrast_png"] = avg_png
+        if detector2_avg_png:
+            metadata["detector2_average_contrast_png"] = detector2_avg_png
+        error_info = getattr(meta, "errorInfo", None)
+        error_identifier = _safe_text_attr(error_info, "identifier")
+        error_message = _safe_text_attr(error_info, "message")
+        if error_identifier:
+            metadata["acquisition_error_identifier"] = error_identifier
+        if error_message:
+            metadata["acquisition_error_message"] = error_message
 
     if progress is not None:
         progress_status = _safe_text_attr(progress, "status")
@@ -800,6 +866,9 @@ def _extract_snapshot_metadata(raw: dict[str, Any]) -> dict[str, object]:
             metadata["has_partial_iteration"] = bool(partial)
 
     if params is not None:
+        detector_mode = _safe_text_attr(params, "detectorMode")
+        if detector_mode:
+            metadata["detector_mode"] = detector_mode.lower()
         for attr_name, key in (
             ("xOffset", "x_offset_ns"),
             ("dataOnBuffer", "data_on_buffer_ns"),
@@ -823,16 +892,27 @@ def _extract_snapshot_metadata(raw: dict[str, Any]) -> dict[str, object]:
                 metadata["rabi_dead_time_source"] = f"params.{attr_name}"
                 break
 
+    data = raw.get("Data")
+    data_detector_mode = _safe_text_attr(data, "detectorMode")
+    if data_detector_mode:
+        metadata["detector_mode"] = data_detector_mode.lower()
+
     return metadata
 
 
-def _load_param_grid_stage_scan(mat_path: Path, raw: dict[str, Any], mode: DataMode) -> ExperimentTrace:
+def _load_param_grid_stage_scan(
+    mat_path: Path,
+    raw: dict[str, Any],
+    mode: DataMode,
+    detector_id: str = "detector1",
+) -> ExperimentTrace:
     mode = _canonical_mode(mode)
     data = raw["Data"]
     params = raw.get("params")
-    values = np.asarray(getattr(data, "values", None), dtype=object)
+    values_attr = "detector2Values" if detector_id == "detector2" else "values"
+    values = np.asarray(getattr(data, values_attr, None), dtype=object)
     if values.ndim != 2:
-        raise ValueError("Parameter-grid fallback expects Data.values to be a 2D object array.")
+        raise ValueError(f"Parameter-grid fallback expects Data.{values_attr} to be a 2D object array.")
     ny, nx = values.shape
 
     scan_axes_raw = np.asarray(getattr(params, "scanAxes", ["x", "y"]), dtype=object).ravel().tolist() if params is not None else ["x", "y"]
@@ -856,9 +936,13 @@ def _load_param_grid_stage_scan(mat_path: Path, raw: dict[str, Any], mode: DataM
     failed_points = np.asarray(getattr(data, "failedPoints", np.zeros((ny, nx), dtype=int)))
     if failed_points.shape != (ny, nx):
         failed_points = np.zeros((ny, nx), dtype=int)
+    iterations = np.asarray(getattr(data, "iteration", []), dtype=float)
+    has_grid_iterations = iterations.shape == (ny, nx)
     for iy in range(ny):
         for ix in range(nx):
             if int(failed_points[iy, ix]) != 0:
+                continue
+            if has_grid_iterations and (not np.isfinite(iterations[iy, ix]) or iterations[iy, ix] <= 0):
                 continue
             pair = np.asarray(values[iy, ix], dtype=float).ravel()
             if pair.size < 2 or not np.isfinite(pair[0]) or not np.isfinite(pair[1]):
@@ -870,10 +954,12 @@ def _load_param_grid_stage_scan(mat_path: Path, raw: dict[str, Any], mode: DataM
     reference_flat = reference.reshape(-1)
     y_flat, y_label = _compose_observable(signal_flat, reference_flat, mode)
     metadata = {
+        **_extract_snapshot_metadata(raw),
         "schema": "param_grid_stage_scan",
         "scan_notes": _safe_text_attr(params, "scanNotes"),
         "scan_axes": list(axis_names),
         "rf_frequency_ghz": _safe_float_attr(params, "RFFrequency"),
+        "detector_id": detector_id,
     }
     return _finalize_trace(
         mat_path=mat_path,
@@ -891,15 +977,74 @@ def _load_param_grid_stage_scan(mat_path: Path, raw: dict[str, Any], mode: DataM
     )
 
 
-def _load_snapshot_run(mat_path: Path, raw: dict[str, Any], mode: DataMode) -> ExperimentTrace:
+def _snapshot_detector_data(data: object, detector_id: str) -> SimpleNamespace:
+    values_attr = "detector2Values" if detector_id == "detector2" else "values"
+    if data is None or not hasattr(data, values_attr):
+        raise MatDataError(
+            f"Saved data does not contain {DETECTOR_LABELS.get(detector_id, detector_id)} values.",
+            detector_id=detector_id,
+        )
+    return SimpleNamespace(
+        values=getattr(data, values_attr),
+        iteration=getattr(data, "iteration", []),
+        failedPoints=getattr(data, "failedPoints", []),
+    )
+
+
+def _snapshot_acquired_cell_count(data: object) -> int:
+    """Count finite raw cells that acquisition progress marks as acquired."""
+    values = np.asarray(getattr(data, "values", None), dtype=object)
+    if values.ndim not in (1, 2):
+        return 0
+    iterations = np.asarray(getattr(data, "iteration", []), dtype=float)
+    failed = np.asarray(getattr(data, "failedPoints", np.zeros(values.shape, dtype=int)))
+    count = 0
+    for index in np.ndindex(values.shape):
+        if failed.shape == values.shape and int(failed[index]) != 0:
+            continue
+        acquired = True
+        if iterations.shape == values.shape:
+            acquired = bool(np.isfinite(iterations[index]) and iterations[index] > 0)
+        elif iterations.size == values.shape[0]:
+            row_iteration = float(iterations.ravel()[index[0]])
+            acquired = bool(np.isfinite(row_iteration) and row_iteration > 0)
+            if values.ndim == 2:
+                acquired = acquired and index[1] < int(row_iteration)
+        elif iterations.size == 1:
+            acquired = bool(np.isfinite(iterations.ravel()[0]) and iterations.ravel()[0] > 0)
+        if not acquired:
+            continue
+        try:
+            pair = np.asarray(values[index], dtype=float).ravel()
+        except (TypeError, ValueError):
+            continue
+        if pair.size >= 2 and np.isfinite(pair[0]) and np.isfinite(pair[1]):
+            count += 1
+    return count
+
+
+def _load_snapshot_run(
+    mat_path: Path,
+    raw: dict[str, Any],
+    mode: DataMode,
+    detector_id: str = "detector1",
+) -> ExperimentTrace:
     mode = _canonical_mode(mode)
-    data = raw["Data"]
+    stored_data = raw["Data"]
+    data = _snapshot_detector_data(stored_data, detector_id)
     scan_info = raw["scanInfo"]
-    analysis = raw.get("analysis")
+    root_analysis = raw.get("analysis")
+    analysis = (
+        getattr(root_analysis, "detector2", None)
+        if detector_id == "detector2" and root_analysis is not None
+        else root_analysis
+    )
     params = raw.get("params")
 
     scan_axes, scan_vectors, axis_meta, parameter, identifier, notes = _snapshot_axis_descriptors(scan_info)
     metadata = _extract_snapshot_metadata(raw)
+    metadata["detector_id"] = detector_id
+    metadata["detector_label"] = DETECTOR_LABELS.get(detector_id, detector_id)
     if parameter:
         metadata["scan_parameter"] = parameter
     if identifier:
@@ -928,6 +1073,19 @@ def _load_snapshot_run(mat_path: Path, raw: dict[str, Any], mode: DataMode) -> E
     analysis_dim = _safe_int_attr(analysis, "dimension") if analysis is not None else None
     if analysis_dim is not None:
         metadata["analysis_dimension"] = analysis_dim
+    acquired_raw_points = _snapshot_acquired_cell_count(data)
+    metadata["acquired_raw_points"] = acquired_raw_points
+    if analysis_dim == 2 and acquired_raw_points == 0:
+        run_status = str(metadata.get("run_status") or metadata.get("progress_status") or "")
+        error_identifier = str(metadata.get("acquisition_error_identifier") or "")
+        error_message = str(metadata.get("acquisition_error_message") or "")
+        raise MatDataError(
+            "No 2D cells were acquired; saved analysis arrays are not treated as measurements.",
+            detector_id=detector_id,
+            run_status=run_status,
+            error_identifier=error_identifier,
+            error_message=error_message,
+        )
     (
         contrast_mean,
         contrast_sem,
@@ -1036,6 +1194,9 @@ def _load_snapshot_run(mat_path: Path, raw: dict[str, Any], mode: DataMode) -> E
         raise ValueError("Snapshot MAT file did not contain usable analysis exports or scan axes.")
 
     nsteps = int(np.prod([len(v) for v in scan_vectors], dtype=int)) if len(scan_vectors) > 1 else len(scan_vectors[0])
+    values = np.asarray(getattr(data, "values", None), dtype=object)
+    if len(scan_vectors) >= 2 and values.ndim == 2:
+        return _load_param_grid_stage_scan(mat_path, raw, mode, detector_id=detector_id)
     signal, reference, reduction_meta = _reduce_new_format_values(data, nsteps)
     metadata.update(reduction_meta)
     y, y_label = _compose_observable(signal, reference, mode)
@@ -1231,19 +1392,166 @@ def _load_new_data_scaninfo(mat_path: Path, raw: dict[str, Any], mode: DataMode)
     )
 
 
-def load_saved_data_mat(path: str | Path, mode: DataMode = "contrast") -> ExperimentTrace:
+def _canonical_detector_id(detector_id: str | int) -> str:
+    text = str(detector_id).strip().lower().replace("_", "").replace(" ", "")
+    aliases = {
+        "1": "detector1",
+        "detector1": "detector1",
+        "primary": "detector1",
+        "2": "detector2",
+        "detector2": "detector2",
+        "secondary": "detector2",
+    }
+    if text not in aliases:
+        raise ValueError(f"Unsupported detector id: {detector_id}")
+    return aliases[text]
+
+
+def _snapshot_detector_ids(raw: dict[str, Any]) -> tuple[str, ...]:
+    data = raw.get("Data")
+    params = raw.get("params")
+    analysis = raw.get("analysis")
+    detector_mode = _safe_text_attr(data, "detectorMode") or _safe_text_attr(params, "detectorMode")
+    has_detector2 = bool(
+        (data is not None and hasattr(data, "detector2Values"))
+        or (analysis is not None and hasattr(analysis, "detector2"))
+        or detector_mode.lower() == "dual"
+    )
+    return ("detector1", "detector2") if has_detector2 else ("detector1",)
+
+
+def _attach_detector_context(
+    trace: ExperimentTrace,
+    detector_id: str,
+    available_detectors: tuple[str, ...],
+) -> ExperimentTrace:
+    trace.detector_id = detector_id
+    trace.detector_label = DETECTOR_LABELS.get(detector_id, detector_id)
+    trace.available_detectors = available_detectors
+    metadata = dict(trace.metadata or {})
+    metadata.update(
+        {
+            "detector_id": detector_id,
+            "detector_label": trace.detector_label,
+            "available_detectors": list(available_detectors),
+            "detector_count": len(available_detectors),
+            "detector_mode": "dual" if len(available_detectors) > 1 else "single",
+        }
+    )
+    trace.metadata = metadata
+    return trace
+
+
+def _detector_failure(
+    detector_id: str,
+    exc: Exception,
+    metadata: dict[str, object],
+) -> DetectorLoadFailure:
+    run_status = str(getattr(exc, "run_status", "") or metadata.get("run_status") or metadata.get("progress_status") or "")
+    error_identifier = str(getattr(exc, "error_identifier", "") or metadata.get("acquisition_error_identifier") or "")
+    error_message = str(getattr(exc, "error_message", "") or metadata.get("acquisition_error_message") or "")
+    label = DETECTOR_LABELS.get(detector_id, detector_id)
+    detail = str(exc).strip() or type(exc).__name__
+    context: list[str] = []
+    if run_status:
+        context.append(f"run_status={run_status}")
+    if error_identifier:
+        context.append(error_identifier)
+    if error_message:
+        context.append(error_message)
+    message = f"{label}: {detail}"
+    if context:
+        message += " Acquisition details: " + " | ".join(context)
+    return DetectorLoadFailure(
+        detector_id=detector_id,
+        detector_label=label,
+        message=message,
+        run_status=run_status,
+        error_identifier=error_identifier,
+        error_message=error_message,
+    )
+
+
+def load_experiment_dataset(path: str | Path, mode: DataMode = "contrast") -> ExperimentDataset:
     mat_path = Path(path)
     mode = _canonical_mode(mode)
     raw = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
+    metadata: dict[str, object] = {}
+    available_detectors: tuple[str, ...] = ("detector1",)
+    detector_mode = "single"
+    loaders: dict[str, Any] = {}
+
     if "savedData" in raw:
-        return _load_legacy_saved_data(mat_path, raw, mode)
-    if "data" in raw and "scanInfo" in raw:
-        return _load_new_data_scaninfo(mat_path, raw, mode)
-    if "Data" in raw and "scanInfo" in raw:
+        loaders["detector1"] = lambda: _load_legacy_saved_data(mat_path, raw, mode)
+    elif "data" in raw and "scanInfo" in raw:
+        loaders["detector1"] = lambda: _load_new_data_scaninfo(mat_path, raw, mode)
+    elif "Data" in raw and "scanInfo" in raw:
+        metadata = _extract_snapshot_metadata(raw)
+        available_detectors = _snapshot_detector_ids(raw)
+        detector_mode = "dual" if len(available_detectors) > 1 else "single"
+        for detector_id in available_detectors:
+            loaders[detector_id] = lambda detector_id=detector_id: _load_snapshot_run(
+                mat_path,
+                raw,
+                mode,
+                detector_id=detector_id,
+            )
+    else:
+        raise ValueError("No supported MATLAB root structure found. Expected 'savedData', 'data'+'scanInfo', or snapshot 'Data'+'scanInfo'.")
+
+    detectors: dict[str, ExperimentTrace] = {}
+    detector_errors: dict[str, DetectorLoadFailure] = {}
+    for detector_id in available_detectors:
         try:
-            return _load_snapshot_run(mat_path, raw, mode)
-        except Exception:
-            if "params" in raw:
-                return _load_param_grid_stage_scan(mat_path, raw, mode)
-            raise
-    raise ValueError("No supported MATLAB root structure found. Expected 'savedData', 'data'+'scanInfo', or snapshot 'Data'+'scanInfo'.")
+            detectors[detector_id] = _attach_detector_context(
+                loaders[detector_id](),
+                detector_id,
+                available_detectors,
+            )
+        except Exception as exc:
+            detector_errors[detector_id] = _detector_failure(detector_id, exc, metadata)
+
+    metadata = {
+        **metadata,
+        "detector_mode": detector_mode,
+        "available_detectors": list(available_detectors),
+        "detector_count": len(available_detectors),
+    }
+    return ExperimentDataset(
+        source_path=str(mat_path.resolve()),
+        file_name=mat_path.name,
+        detector_mode=detector_mode,
+        available_detectors=available_detectors,
+        detectors=detectors,
+        detector_errors=detector_errors,
+        metadata=metadata,
+    )
+
+
+def load_saved_data_mat(
+    path: str | Path,
+    mode: DataMode = "contrast",
+    detector_id: str | int = "detector1",
+) -> ExperimentTrace:
+    requested = _canonical_detector_id(detector_id)
+    dataset = load_experiment_dataset(path, mode=mode)
+    if requested not in dataset.available_detectors:
+        raise MatDataError(
+            f"{DETECTOR_LABELS.get(requested, requested)} is not available in {dataset.file_name}.",
+            detector_id=requested,
+        )
+    if requested in dataset.detectors:
+        return dataset.detectors[requested]
+    failure = dataset.detector_errors.get(requested)
+    if failure is None:
+        raise MatDataError(
+            f"{DETECTOR_LABELS.get(requested, requested)} could not be loaded from {dataset.file_name}.",
+            detector_id=requested,
+        )
+    raise MatDataError(
+        failure.message,
+        detector_id=failure.detector_id,
+        run_status=failure.run_status,
+        error_identifier=failure.error_identifier,
+        error_message=failure.error_message,
+    )

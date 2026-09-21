@@ -244,9 +244,9 @@ def test_double_click_targets_open_the_relevant_editor_section():
     assert win._editable_plot_target(event) == ("series", None, None)
 
     captured = []
-    win._open_plot_editor = lambda *args, **kwargs: captured.append((args, kwargs))
+    win._open_plot_element_popover = lambda element: captured.append(element)
     win._on_plot_click(event)
-    assert captured and captured[0][1]["section"] == "series"
+    assert captured and captured[0]["kind"] == "legend"
 
     win.canvas.draw()
     xlabel_bbox = win.ax_main.xaxis.label.get_window_extent(win.canvas.get_renderer())

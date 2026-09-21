@@ -4,7 +4,7 @@ SmartFitter is a Python application for loading, visualizing, fitting, and expor
 
 ## Highlights
 
-- Loads legacy MATLAB `savedData` files and newer `data` + `scanInfo` snapshots.
+- Loads legacy MATLAB `savedData` files and newer single- or dual-detector snapshot exports.
 - Supports Rabi, Ramsey, spin echo, dynamic decoupling, T1, ODMR, DEER, line scans, and 2D stage scans.
 - Provides experiment-aware fitting, diagnostics, exclusions, transformations, overlays, iteration views, and derived NV metrics.
 - Includes a unified Plot Editor for legends, annotations, titles, axes, ticks, secondary axes, and report presentation.
@@ -60,13 +60,14 @@ On Windows, after creating `.venv`, you can also double-click `Launch SmartFitte
 
 1. Open or drag in a supported `.mat` file.
 2. Leave the analysis profile on **Auto**, or choose an experiment-specific profile.
-3. Select the observable: contrast, signal, reference, or difference.
-4. Adjust the region of interest, binning, smoothing, exclusions, or transforms as needed.
-5. Run the fit for supported 1D experiments.
-6. Double-click a legend, annotation, title, axis label, or tick label to customize the figure.
-7. Export the figure, fit data, metadata, or report.
+3. For a dual-detector file, choose Detector 1 or Detector 2, then use **Apply to** to target the active detector or both detector streams. Labels are editable for the current session.
+4. Select the observable: contrast, signal, reference, or difference.
+5. Adjust the fit range in the **Model** inspector tab; binning, smoothing, exclusions, and transforms stay in the adjacent **Process** tab.
+6. Run the fit for supported 1D experiments. In **Both detectors** mode, SmartFitter fits each stream independently with the same model/settings and retains both results.
+7. Double-click plot text, legends, annotations, measured/fit series, markers, or colorbar labels for a compact live editor; use **Edit plot** or the **Plot** inspector tab for complete control.
+8. Export the figure, fit data, metadata, or report.
 
-Spatial scans are plot-only. Their map controls provide color scaling, view bounds, pan and zoom, peak/dip navigation, and cursor or best-point linecuts.
+Spatial scans are plot-only for the 1D fit engine. Their map controls provide color scaling, view bounds, pan and zoom, peak/dip navigation, and cursor or best-point linecuts. In a 1D plot, Ctrl/Shift-click keeps multiple samples highlighted while a plain click retains the simple single-point pin. For XY scans, **Fluorescent spots > Detect and fit** removes the slowly varying background, detects bright or dark features, and fits rotated elliptical Gaussians. It reports each center, half-maximum radii, angle, contrast, SNR, and fit quality, and draws a toggleable fitted-shape overlay. Select rows in the spot table to **Remove selected** or **Keep selected only**; **Restore removed** and Ctrl+Z both undo curation. **Compare detector spots** pairs one spot from each detector, reports center/radius/orientation/amplitude differences and local profile correlation, and highlights the pair on both maps. **Copy spot table** places a compact X,Y-ordered table on the clipboard for PowerPoint, while saved CSV output remains complete. **Auto fluorescence** analyzes raw signal counts even when the displayed contrast is flat; **Display analyzed source** makes that fitted map visible. Detector scope can apply the operation independently to both channels.
 
 ## Batch analysis
 
@@ -83,6 +84,8 @@ python -m nvfit.pro_batch --single-file "path/to/data.mat" --output-dir "path/to
 ```
 
 Run `python -m nvfit.pro_batch --help` for all options. Batch results include fit figures, JSON records, CSV summaries, validation reports, and aggregate reports.
+
+Batch processes both available detector streams by default. Use `--detector detector1` or `--detector detector2` to restrict it. Dual-file outputs use `__detector1` and `__detector2` suffixes; single-detector output names remain unchanged.
 
 ## Tests
 

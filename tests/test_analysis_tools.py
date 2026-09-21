@@ -76,5 +76,17 @@ def test_session_v1_document_migrates_on_load(tmp_path):
     path = tmp_path / "legacy.nvfit-session.json"
     path.write_text(json.dumps({"format": "nvfit-session", "version": 1, "analysis_steps": []}), encoding="utf-8")
     loaded = load_session(path)
-    assert loaded["version"] == 2
+    assert loaded["version"] == 3
     assert loaded["migrated_from"] == 1
+    assert loaded["active_detector_id"] == "detector1"
+    assert loaded["compare_detectors"] is False
+
+
+def test_session_v2_document_migrates_to_detector1(tmp_path):
+    path = tmp_path / "legacy-v2.nvfit-session.json"
+    path.write_text(json.dumps({"format": "nvfit-session", "version": 2, "analysis_steps": []}), encoding="utf-8")
+    loaded = load_session(path)
+    assert loaded["version"] == 3
+    assert loaded["migrated_from"] == 2
+    assert loaded["active_detector_id"] == "detector1"
+    assert loaded["detector_labels"] == {"detector1": "Detector 1", "detector2": "Detector 2"}

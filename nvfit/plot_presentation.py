@@ -170,7 +170,7 @@ class AxisStyle:
 def axis_style_for_role(role: str) -> AxisStyle:
     """Return factory defaults that respect the physical side of an axis role."""
     style = AxisStyle()
-    if role in {"secondary", "colorbar"}:
+    if role in {"secondary", "colorbar", "detector_compare_colorbar"}:
         style.x_ticks.bottom = False
         style.x_ticks.top = False
         style.x_ticks.label_bottom = False
@@ -765,12 +765,25 @@ class PlotEditorDialog(QDialog):
         layout.addWidget(reset)
         self.tabs.addTab(tab, "Titles && Axes")
 
-    def open_for(self, section: str = "series", axis_role: str | None = None, dimension: str | None = None) -> None:
+    def open_for(
+        self,
+        section: str = "series",
+        axis_role: str | None = None,
+        dimension: str | None = None,
+        series_id: str | None = None,
+    ) -> None:
         self.refresh()
         index = {"series": 0, "annotation": 1, "axes": 2}.get(section, 0)
         self.tabs.setCurrentIndex(index)
         if axis_role and self.axis_role_combo.findText(axis_role) >= 0:
             self.axis_role_combo.setCurrentText(axis_role)
+        if series_id:
+            for row in range(self.series_table.rowCount()):
+                item = self.series_table.item(row, 0)
+                if item is not None and str(item.data(Qt.UserRole)) == series_id:
+                    self.series_table.selectRow(row)
+                    self.series_table.scrollToItem(item)
+                    break
         if dimension in {"x", "y"}:
             self.tick_tabs.setCurrentIndex(0 if dimension == "x" else 1)
         elif dimension in {"title", "xlabel", "ylabel"}:
