@@ -7,6 +7,11 @@ from typing import Callable
 import numpy as np
 
 
+def time_trace_decay(t, background, amplitude, tau_s):
+    """Descriptive exponential drift against measured elapsed seconds."""
+    return background + amplitude * np.exp(-np.asarray(t, dtype=float) / tau_s)
+
+
 def ramsey_simple(t, y0, A, f, phi, tau, n):
     x = np.abs(t / tau)
     return y0 + A * np.exp(-(x**n)) * np.cos(2 * np.pi * f * t + phi)
@@ -182,7 +187,18 @@ def build_custom_expression_model(expression: str, param_names: list[str]) -> Ca
     return _model
 
 
+def gaussian_peaks(x, background, *peak_params):
+    """Constant background plus (amplitude, center, sigma) Gaussian peaks."""
+    x = np.asarray(x, dtype=float)
+    result = np.full_like(x, background)
+    for amplitude, center, sigma in np.asarray(peak_params).reshape(-1, 3):
+        result += amplitude * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+    return result
+
+
 MODEL_REGISTRY = {
+    "TimeTraceDecay": time_trace_decay,
+    "GaussianPeaks": gaussian_peaks,
     "RamseySimple": ramsey_simple,
     "RamseyHyperfine": ramsey_hyperfine_n14,
     "RamseyExtended": ramsey_extended,

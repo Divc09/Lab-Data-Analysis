@@ -21,6 +21,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Ellipse
 from PySide6.QtCore import (
     QEvent,
+    QItemSelectionModel,
     QEasingCurve,
     QObject,
     QPropertyAnimation,
@@ -122,6 +123,7 @@ from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelo
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
 from .sessions import load_session, resolve_source, save_session, source_descriptor
 from .scan_spots import SpotFit, detect_fluorescent_spots
+from .map_comparison import PALETTES, axis_key, compatible_axes, build_map_overlay
 from .plot_presentation import (
     AnnotationDescriptor,
     AnnotationOverride,
@@ -227,48 +229,10 @@ class DetectorAnalysisState:
     summary: str = ""
 
 
-class AspectRatioContainer(QWidget):
-    """Center one child at a preferred aspect without stretching the figure."""
-
-    def __init__(self, child: QWidget, ratio: float = 1.5, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._child = child
-        self._ratio = max(0.25, float(ratio))
-        child.setParent(self)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-    def set_ratio(self, ratio: float) -> None:
-        ratio = max(0.25, float(ratio))
-        if abs(ratio - self._ratio) < 1e-6:
-            return
-        self._ratio = ratio
-        self._layout_child()
-
-    def ratio(self) -> float:
-        return self._ratio
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._layout_child()
-
-    def _layout_child(self) -> None:
-        width = max(1, self.width())
-        height = max(1, self.height())
-        chrome = 0
-        for widget in self._child.findChildren(NavigationToolbar):
-            if widget.parent() is self._child and widget.isVisibleTo(self._child):
-                chrome += max(0, widget.sizeHint().height())
-        child_width = width
-        child_height = round(child_width / self._ratio) + chrome
-        if child_height > height:
-            child_height = height
-            child_width = round(max(1, child_height - chrome) * self._ratio)
-        left = (width - child_width) // 2
-        top = (height - child_height) // 2
-        self._child.setGeometry(left, top, max(1, child_width), max(1, child_height))
-
-
 PARAM_METADATA: dict[str, ParamMeta] = {
+    "tau_s": ParamMeta("Decay time", "s", "Descriptive exponential drift/bleaching timescale in seconds."),
+    "background": ParamMeta("Background", "arb.", "Fitted baseline in the selected observable's recorded units."),
+    "amplitude": ParamMeta("Amplitude", "arb.", "Exponential component in the selected observable's recorded units."),
     "y0": ParamMeta("y_0", "arb.", "Vertical offset / baseline level."),
     "m": ParamMeta("m", "arb./ns", "Linear drift slope across scan window."),
     "A": ParamMeta("A", "arb.", "Oscillation/contrast amplitude."),
@@ -296,6 +260,10 @@ PARAM_METADATA: dict[str, ParamMeta] = {
 
 
 def _param_meta(name: str) -> ParamMeta:
+    if name.startswith("center_"):
+        return ParamMeta(name, "axis units", "Gaussian peak center.")
+    if name.startswith("sigma_"):
+        return ParamMeta(name, "axis units", "Gaussian standard deviation; FWHM = 2.35482 sigma.")
     return PARAM_METADATA.get(name, ParamMeta(name, "", "Model parameter."))
 
 
@@ -393,6 +361,15 @@ def _nv_metrics(experiment_type: str, result: FitResult, trace_metadata: dict[st
             if trace_metadata.get(key) is not None:
                 out[key] = float(trace_metadata[key])  # type: ignore[arg-type]
     return out
+
+
+class PlotNavigationToolbar(NavigationToolbar):
+    def __init__(self, canvas, parent, reset_view):
+        self._reset_view = reset_view
+        super().__init__(canvas, parent)
+
+    def home(self, *args):
+        self._reset_view()
 
 
 class NoScrollSpinBox(QSpinBox):
@@ -627,6 +604,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._syncing_detector_controls = False
         self._activating_detector = False
         self._auto_reference_fallback = False
+        self._map_overlay_ax = None
+        self._map_overlay_data = None
+        self._map_comparison_export: dict[str, Any] = {}
+        self._map_overlay_return_state: dict[str, Any] | None = None
         self.settings = QSettings("BacklundLab", "SmartFitterPy")
         self.plot_opts = PlotOptions()
         self.presentation_factory = PlotPresentationState()
@@ -742,6 +723,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.mpl_connect("axes_leave_event", self._on_plot_leave)
         self.canvas.mpl_connect("scroll_event", self._on_scan_scroll)
         self.canvas.mpl_connect("button_release_event", self._on_scan_navigation_finished)
+        self.canvas.mpl_connect("resize_event", self._on_plot_resize)
         self.canvas.setContextMenuPolicy(Qt.CustomContextMenu)
         self.canvas.customContextMenuRequested.connect(self._show_plot_context_menu)
 
@@ -749,7 +731,8 @@ class SmartFitterMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+O"), self, self.on_load)
         QShortcut(QKeySequence("Ctrl+F"), self, self.on_fit)
         QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.on_robust_fit)
-        QShortcut(QKeySequence("Escape"), self, self.clear_selected_marker)
+        QShortcut(QKeySequence("Escape"), self, lambda: self.file_filter_edit.clear()
+                  if self.file_filter_edit.hasFocus() else self.clear_selected_marker())
         QShortcut(QKeySequence("Ctrl+K"), self, self._focus_file_filter)
         self._inspector_shortcuts: list[QShortcut] = []
         for sequence, page in (
@@ -1218,7 +1201,8 @@ class SmartFitterMainWindow(QMainWindow):
         compact_header = mode != "expanded"
         band = (0 if mode == "plot" else (1 if mode == "files" else 2), compact_header)
         if not force and band == self._responsive_band:
-            self._update_plot_surface_ratio()
+            self._relayout_plot_quick_toolbar()
+            self._update_plot_surface_layout()
             return
 
         self._responsive_band = band
@@ -1261,9 +1245,9 @@ class SmartFitterMainWindow(QMainWindow):
             combo.setMinimumWidth(0)
             combo.setMinimumContentsLength(8 if compact_header else 12)
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self._relayout_plot_quick_toolbar()
         self._apply_theme()
-        self._update_plot_surface_ratio()
+        self._relayout_plot_quick_toolbar()
+        self._update_plot_surface_layout()
 
     def _panel_for_name(self, name: str) -> QWidget:
         return self.left_panel if name == "files" else self.right_panel
@@ -1292,7 +1276,7 @@ class SmartFitterMainWindow(QMainWindow):
             panel.setMinimumWidth(target if visible else 0)
             panel.setMaximumWidth(16777215)
             panel.setVisible(visible)
-            self._update_plot_surface_ratio()
+            self._update_plot_surface_layout()
             return
         if visible:
             panel.setVisible(True)
@@ -1315,7 +1299,7 @@ class SmartFitterMainWindow(QMainWindow):
             else:
                 panel.setVisible(False)
                 panel.setMaximumWidth(16777215)
-            self._update_plot_surface_ratio()
+            self._update_plot_surface_layout()
 
         animation.finished.connect(finish)
         self._panel_animations[name] = animation
@@ -1353,25 +1337,20 @@ class SmartFitterMainWindow(QMainWindow):
         self.file_filter_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.file_filter_edit.selectAll()
 
-    def _update_plot_surface_ratio(self) -> None:
+    def _update_plot_surface_layout(self) -> None:
         if not hasattr(self, "plot_surface"):
             return
         trace = self.ctx.trace
         available_ratio = self.plot_stack.width() / max(1, self.plot_stack.height())
-        comparison = bool(trace is not None and trace.scan_dim == "scan2d" and self._comparison_trace() is not None)
+        comparison = bool(trace is not None and trace.scan_dim == "scan2d" and self._canonical_scan_traces()[1] is not None)
         # Side-by-side maps use substantially more area whenever the plot is
         # at least as wide as it is tall. Stack only in genuinely narrow panes.
         self._dual_map_stacked = bool(comparison and available_ratio < 1.0)
-        # The Matplotlib layout owns scientific aspect ratios. The Qt shell
-        # should fill the workspace instead of letterboxing the entire figure
-        # and creating large unusable gutters.
-        toolbar_height = self.toolbar.sizeHint().height() if hasattr(self, "toolbar") else 0
-        canvas_height = max(1, self.plot_stack.height() - toolbar_height)
-        self.plot_surface.set_ratio(self.plot_stack.width() / canvas_height)
 
     def _workspace_splitter_settled(self) -> None:
+        self._relayout_plot_quick_toolbar()
         previous = bool(getattr(self, "_dual_map_stacked", False))
-        self._update_plot_surface_ratio()
+        self._update_plot_surface_layout()
         if (
             previous != bool(getattr(self, "_dual_map_stacked", False))
             and self.ctx.trace is not None
@@ -1477,7 +1456,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.ax_res = self.fig.add_subplot(plot_grid[1])
         self._ax_main_default_pos = self.ax_main.get_position().frozen()
         self._ax_res_default_pos = self.ax_res.get_position().frozen()
-        self.toolbar = NavigationToolbar(self.canvas, root)
+        self.toolbar = PlotNavigationToolbar(self.canvas, root, self._reset_plot_view)
         self._style_navigation_toolbar_icons()
         splitter = QSplitter(Qt.Horizontal)
         self.main_splitter = splitter
@@ -1504,6 +1483,7 @@ class SmartFitterMainWindow(QMainWindow):
         center = QWidget()
         center.setObjectName("PlotColumn")
         self.plot_column = center
+        center.installEventFilter(self)
         center_layout = QVBoxLayout(center)
         self.center_layout = center_layout
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -1543,7 +1523,8 @@ class SmartFitterMainWindow(QMainWindow):
         plot_layout.setSpacing(0)
         plot_layout.addWidget(self.toolbar)
         plot_layout.addWidget(self.canvas, 1)
-        self.plot_surface = AspectRatioContainer(plot_shell, ratio=1.5)
+        # Fill the workspace; Matplotlib preserves each map's pixel geometry.
+        self.plot_surface = plot_shell
         self.plot_stack.addWidget(self.plot_surface)
         self.plot_stack.setCurrentIndex(0)
         center_layout.addWidget(self.plot_stack, 1)
@@ -1604,7 +1585,7 @@ class SmartFitterMainWindow(QMainWindow):
         data_gl.addWidget(self.load_help_lbl, 1, 0, 1, 2)
 
         self.profile_combo = NoScrollComboBox()
-        self.profile_combo.addItems(["Auto", "Ramsey", "Rabi", "SpinEcho", "DynamicDecoupling", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "LineScan", "Scan2D"])
+        self.profile_combo.addItems(["Auto", "Ramsey", "Rabi", "SpinEcho", "DynamicDecoupling", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "LineScan", "Scan2D", "TimeTrace"])
         self.profile_combo.setToolTip("Choose the experiment family. Auto follows the detected type from the file.")
         self.profile_combo.currentTextChanged.connect(self.apply_profile_defaults)
         data_gl.addWidget(QLabel("Experiment type"), 2, 0)
@@ -1730,9 +1711,11 @@ class SmartFitterMainWindow(QMainWindow):
         self.roi_max.setToolTip("Maximum ROI bound in ns.")
         self.roi_min.editingFinished.connect(self._refresh_processed)
         self.roi_max.editingFinished.connect(self._refresh_processed)
-        prep_gl.addWidget(QLabel("ROI min (ns)"), 2, 0)
+        self.roi_min_label = QLabel("ROI min (ns)")
+        prep_gl.addWidget(self.roi_min_label, 2, 0)
         prep_gl.addWidget(self.roi_min, 2, 1)
-        prep_gl.addWidget(QLabel("ROI max (ns)"), 3, 0)
+        self.roi_max_label = QLabel("ROI max (ns)")
+        prep_gl.addWidget(self.roi_max_label, 3, 0)
         prep_gl.addWidget(self.roi_max, 3, 1)
         left_inner_layout.addWidget(prep_box)
 
@@ -1751,7 +1734,7 @@ class SmartFitterMainWindow(QMainWindow):
         common_form = QFormLayout()
         
         self.model_combo = NoScrollComboBox()
-        self.model_combo.addItems(["RamseyAuto", "RamseySimple", "RamseyHyperfine", "Rabi", "SpinEcho", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "LineScan", "CustomModel"])
+        self.model_combo.addItems(["RamseyAuto", "RamseySimple", "RamseyHyperfine", "Rabi", "SpinEcho", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "GaussianPeaks", "LineScan", "TimeTraceDecay", "CustomModel"])
         self.model_combo.setCurrentText("LineScan")
         self.model_combo.setToolTip("Analysis mode used for fitting.")
         self.model_combo.currentTextChanged.connect(self._update_contextual_visibility)
@@ -1770,6 +1753,15 @@ class SmartFitterMainWindow(QMainWindow):
 
         st_layout.addLayout(common_form)
         st_layout.addWidget(self.multistart_help_lbl)
+
+        self.gaussian_container = QGroupBox("1D Gaussian peaks")
+        gaussian_layout = QFormLayout(self.gaussian_container)
+        self.gaussian_peak_count_spin = NoScrollSpinBox()
+        self.gaussian_peak_count_spin.setRange(1, 8)
+        self.gaussian_peak_count_spin.setValue(1)
+        self.gaussian_peak_count_spin.setToolTip("Fit this many positive Gaussian peaks plus a constant background in the selected ROI.")
+        gaussian_layout.addRow("Number of peaks", self.gaussian_peak_count_spin)
+        st_layout.addWidget(self.gaussian_container)
 
         # Rabi specific
         self.rabi_container = QGroupBox("Rabi Settings")
@@ -2615,7 +2607,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.file_filter_edit = QLineEdit()
         self.file_filter_edit.setPlaceholderText("Filter files…")
         self.file_filter_edit.setClearButtonEnabled(True)
-        self.file_filter_edit.setToolTip("Filter by filename, experiment, dimensions, or detector availability.")
+        self.file_filter_edit.setToolTip("Filter by filename, folder, experiment, dimensions, or detector. All search words must match. Enter opens the first match; Escape clears the search.")
         self.file_filter_edit.textChanged.connect(self._filter_project_files)
         self.file_filter_edit.returnPressed.connect(self._activate_filtered_file)
         self.btn_plot_selected_file.setText("Make primary")
@@ -2658,6 +2650,13 @@ class SmartFitterMainWindow(QMainWindow):
         roi_row.addWidget(self.roi_max)
         roi_form.addRow("Fit range", roi_row)
         self.strategy_layout.insertLayout(1, roi_form)
+        # These controls were hidden inside the old collapsed Process group.
+        self.roi_min.show()
+        self.roi_max.show()
+        for row in (2, 3):
+            label = self.prep_box.layout().itemAtPosition(row, 0).widget()
+            label.setProperty("drawerHidden", True)
+            label.hide()
 
         self.inspector_title = QLabel("Inspector")
         self.inspector_title.setObjectName("PaneTitle")
@@ -2896,7 +2895,7 @@ class SmartFitterMainWindow(QMainWindow):
             "confidence": fit_allowed,
             "peaks": is_odmr,
             "rabi_envelope": is_rabi,
-            "fft": fit_allowed,
+            "fft": fit_allowed and trace.experiment_type != "TimeTrace",
         }
         for key, visible in visibility.items():
             action = self._plot_more_actions.get(key)
@@ -2971,6 +2970,7 @@ class SmartFitterMainWindow(QMainWindow):
     def _build_plot_quick_toolbar(self, layout: QVBoxLayout):
         bar = QWidget()
         bar.setObjectName("PlotQuickBar")
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.plot_quick_bar = bar
         row = QGridLayout(bar)
         row.setContentsMargins(4, 3, 4, 3)
@@ -2997,6 +2997,14 @@ class SmartFitterMainWindow(QMainWindow):
         self.quick_peaks_btn = self._make_quick_toggle("Peaks", "Show detected ODMR peaks.", lambda checked: self.show_peaks_chk.setChecked(checked) if not self._syncing_plot_controls else None)
         self.quick_envelope_btn = self._make_quick_toggle("Envelope", "Show the fitted Rabi envelope.", lambda checked: self.show_rabi_envelope_chk.setChecked(checked) if not self._syncing_plot_controls else None)
         self.quick_fft_btn = self._make_quick_toggle("FFT", "Show the FFT detail panel.", lambda checked: self.show_fft_panel_chk.setChecked(checked) if not self._syncing_plot_controls else None)
+        self.quick_time_events_btn = self._make_quick_toggle("Events", "Show saved optimization and pause intervals on the elapsed-time axis.", lambda _checked: self._refresh_plot_only())
+        self.quick_time_events_btn.blockSignals(True)
+        self.quick_time_events_btn.setChecked(True)
+        self.quick_time_events_btn.blockSignals(False)
+        self.quick_map_overlay_btn = QPushButton("2D overlay")
+        self.quick_map_overlay_btn.setCheckable(True)
+        self.quick_map_overlay_btn.setToolTip("Toggle an RGB comparison of two maps. Click again to restore the previous map view and zoom. Choose the sources and layout in Map controls.")
+        self.quick_map_overlay_btn.clicked.connect(self._toggle_map_overlay)
 
         self.quick_iteration_select_btn = QPushButton("Choose iterations…")
         self.quick_iteration_select_btn.setToolTip("Choose multiple complete iterations to plot.")
@@ -3039,6 +3047,8 @@ class SmartFitterMainWindow(QMainWindow):
             self.quick_peaks_btn,
             self.quick_envelope_btn,
             self.quick_fft_btn,
+            self.quick_time_events_btn,
+            self.quick_map_overlay_btn,
             self.quick_edit_plot_btn,
             self.copy_figure_btn,
         ]
@@ -3060,7 +3070,12 @@ class SmartFitterMainWindow(QMainWindow):
         while row.count():
             row.takeAt(0)
         visible = [widget for widget in self._plot_quick_widgets if not widget.isHidden()]
-        columns = 10 if self.plot_column.width() >= 900 else (7 if self.plot_column.width() >= 620 else 5)
+        for column in range(row.columnCount()):
+            row.setColumnStretch(column, 0)
+        # Size for the actual button labels, including longer iteration controls.
+        cell_width = max((widget.sizeHint().width() for widget in visible), default=80)
+        available = max(1, self.plot_column.width() - 12)
+        columns = max(1, available // (cell_width + row.horizontalSpacing()))
         for index, widget in enumerate(visible):
             row.addWidget(widget, index // columns, index % columns)
         row.setColumnStretch(columns, 1)
@@ -3159,6 +3174,39 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_compare_scale_combo.currentTextChanged.connect(self._on_scan_style_changed)
         outer.addWidget(QLabel("Detector ranges"), 15, 0)
         outer.addWidget(self.scan_compare_scale_combo, 15, 1, 1, 2)
+
+        # Put comparison controls first so the everyday overlay workflow does
+        # not require scrolling past the existing color and navigation tools.
+        map_items = [(outer.itemAt(i).widget(), *outer.getItemPosition(i)) for i in range(outer.count())]
+        for widget, row, column, row_span, column_span in map_items:
+            if widget is not None:
+                outer.removeWidget(widget)
+                outer.addWidget(widget, row + 4, column, row_span, column_span)
+        self.map_compare_source_combo = NoScrollComboBox()
+        self.map_compare_source_combo.addItem("Other detector", None)
+        self.map_compare_source_combo.setToolTip("Compare with the other detector or any loaded map with the same physical axes.")
+        self.map_compare_source_combo.currentIndexChanged.connect(self._on_map_comparison_changed)
+        outer.addWidget(QLabel("Compare with"), 0, 0)
+        outer.addWidget(self.map_compare_source_combo, 0, 1, 1, 2)
+        self.map_compare_view_combo = NoScrollComboBox()
+        self.map_compare_view_combo.addItems(["Separate maps", "RGB overlay", "Maps + overlay", "Single map"])
+        self.map_compare_view_combo.setToolTip("Single map shows the active detector. Separate maps shows the selected sources. RGB overlay blends them; Maps + overlay shows all three.")
+        self.map_compare_view_combo.currentTextChanged.connect(self._on_map_view_changed)
+        outer.addWidget(QLabel("View"), 1, 0)
+        outer.addWidget(self.map_compare_view_combo, 1, 1, 1, 2)
+        self.map_overlay_palette_combo = NoScrollComboBox()
+        self.map_overlay_palette_combo.addItems(list(PALETTES))
+        self.map_overlay_palette_combo.currentTextChanged.connect(self._on_map_comparison_changed)
+        outer.addWidget(QLabel("Colors"), 2, 0)
+        outer.addWidget(self.map_overlay_palette_combo, 2, 1, 1, 2)
+        self.map_overlay_background_spin = QDoubleSpinBox()
+        self.map_overlay_background_spin.setRange(0, 99)
+        self.map_overlay_background_spin.setValue(10)
+        self.map_overlay_background_spin.setSuffix(" %")
+        self.map_overlay_background_spin.setToolTip("Subtract this intensity percentile before RGB normalization. Independent ranges emphasize shape; Shared retains relative recorded intensity.")
+        self.map_overlay_background_spin.valueChanged.connect(self._on_map_comparison_changed)
+        outer.addWidget(QLabel("Background"), 3, 0)
+        outer.addWidget(self.map_overlay_background_spin, 3, 1, 1, 2)
 
         self.scan_quick_bar.setVisible(False)
         layout.addWidget(self.scan_quick_bar)
@@ -3362,7 +3410,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.batch_detector1_label_edit = QLineEdit("Detector 1")
         self.batch_detector2_label_edit = QLineEdit("Detector 2")
         self.batch_model_combo = NoScrollComboBox()
-        self.batch_model_combo.addItems(["Auto-detect", "Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition"])
+        self.batch_model_combo.addItems(["Auto-detect", "Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "TimeTraceDecay"])
         self.batch_bin_spin = NoScrollSpinBox()
         self.batch_bin_spin.setRange(1, 500)
         self.batch_bin_spin.setValue(1)
@@ -3817,6 +3865,12 @@ class SmartFitterMainWindow(QMainWindow):
         if scan_extent is None:
             return
         xmin, xmax, ymin, ymax = scan_extent[2]
+        other = self._canonical_scan_traces()[1]
+        other_extent = self._scan2d_extent(other) if other is not None else None
+        if other_extent is not None:
+            oxmin, oxmax, oymin, oymax = other_extent[2]
+            xmin, xmax = min(xmin, oxmin), max(xmax, oxmax)
+            ymin, ymax = min(ymin, oymin), max(ymax, oymax)
         self._scan_view_limits = None
         self.ax_main.set_xlim(xmin, xmax)
         self.ax_main.set_ylim(ymin, ymax)
@@ -3868,7 +3922,7 @@ class SmartFitterMainWindow(QMainWindow):
             self.toolbar.zoom()
 
     def _on_scan_navigation_finished(self, event):
-        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax}:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax, self._map_overlay_ax}:
             return
         source_ax = event.inaxes
         self._scan_view_limits = (tuple(float(value) for value in source_ax.get_xlim()), tuple(float(value) for value in source_ax.get_ylim()))
@@ -3880,7 +3934,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._update_scan_view_fields(*self._scan_view_limits)
 
     def _on_scan_scroll(self, event):
-        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax}:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d" or event.inaxes not in {self.ax_main, self._detector_compare_ax, self._map_overlay_ax}:
             return
         source_ax = event.inaxes
         xlim, ylim = source_ax.get_xlim(), source_ax.get_ylim()
@@ -4131,12 +4185,23 @@ class SmartFitterMainWindow(QMainWindow):
         *,
         refresh: bool = True,
         detector_id: str | None = None,
+        trace_override: ExperimentTrace | None = None,
         multi_select: bool = False,
     ):
-        trace = self.ctx.trace
-        if detector_id and self._primary_dataset is not None:
+        trace = trace_override or self.ctx.trace
+        if trace_override is None and detector_id and self._primary_dataset is not None:
             trace = self._primary_dataset.detectors.get(detector_id, trace)
         if trace is not None and trace.scan_dim == "scan2d" and trace.z2d is not None and ydata is not None:
+            # Existing direct callers may provide recorded-axis coordinates;
+            # mouse events explicitly pass the displayed source trace.
+            if trace_override is None and self.scan_swap_axes_chk.isChecked() and not self._map_contains_point(trace, xdata, ydata) and self._map_contains_point(trace, ydata, xdata):
+                xdata, ydata = ydata, xdata
+            if not self._map_contains_point(trace, xdata, ydata):
+                other = self._counterpart_scan_trace(trace)
+                if other is None or not self._map_contains_point(other, xdata, ydata):
+                    self._update_point_readout("Point readout: outside measured map coverage")
+                    return
+                trace = other
             display = self._scan2d_display_data(trace)
             if display is None:
                 return
@@ -4150,13 +4215,14 @@ class SmartFitterMainWindow(QMainWindow):
             if (
                 self._selected_plot_point is not None
                 and self._selected_plot_point.get("detector_id") == trace.detector_id
+                and self._selected_plot_point.get("source_path", trace.source_path) == trace.source_path
                 and np.isclose(float(self._selected_plot_point.get("x", np.nan)), px)
                 and np.isclose(float(self._selected_plot_point.get("y", np.nan)), py)
             ):
                 self.clear_selected_marker(refresh=refresh)
                 return
             self._scan_cursor = (px, py)
-            self._selected_plot_point = {"x": px, "y": py, "z": z, "detector_id": trace.detector_id}
+            self._selected_plot_point = {"x": px, "y": py, "z": z, "detector_id": trace.detector_id, "source_path": trace.source_path}
             self._selected_plot_points = [self._selected_plot_point]
             self.clear_marker_btn.setVisible(True)
             self.scan_cursor_lbl.setText(f"Cursor: x={px:.6g}, y={py:.6g}, z={z:.6g}")
@@ -4165,7 +4231,7 @@ class SmartFitterMainWindow(QMainWindow):
                 f"{self._detector_label(trace.detector_id)}={self._format_inspect_value(z)}",
             ]
             other = self._counterpart_scan_trace(trace)
-            if other is not None:
+            if other is not None and self._map_contains_point(other, px, py):
                 other_display = self._scan2d_display_data(other)
                 if other_display is not None:
                     ox, oy, oz, _ox_label, _oy_label = other_display
@@ -4330,7 +4396,7 @@ class SmartFitterMainWindow(QMainWindow):
         menu.addSeparator()
         reset_action = menu.addAction("Reset view")
         reset_action.setEnabled(self.ctx.trace is not None)
-        reset_action.triggered.connect(self._reset_scan_view if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" else self.toolbar.home)
+        reset_action.triggered.connect(self._reset_plot_view)
         clear_action = menu.addAction("Clear marker")
         clear_action.setEnabled(bool(self._selected_points_for_plot()))
         clear_action.triggered.connect(self.clear_selected_marker)
@@ -4390,9 +4456,7 @@ class SmartFitterMainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         reset_plot_action = view_menu.addAction("Reset Plot View")
         reset_plot_action.setShortcut(QKeySequence("Ctrl+Home"))
-        reset_plot_action.triggered.connect(
-            lambda: self._reset_scan_view() if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d" else self.toolbar.home()
-        )
+        reset_plot_action.triggered.connect(self._reset_plot_view)
         view_menu.addSeparator()
         self.view_files_action = QAction("Project Explorer", self)
         self.view_files_action.setCheckable(True)
@@ -4650,6 +4714,7 @@ class SmartFitterMainWindow(QMainWindow):
                 (self.quick_signal_btn, self.show_signal_layer_chk.isChecked()),
                 (self.quick_reference_btn, self.show_reference_layer_chk.isChecked()),
                 (self.quick_compare_detectors_btn, self.compare_detectors_chk.isChecked()),
+                (self.quick_map_overlay_btn, self.map_compare_view_combo.currentText() == "RGB overlay"),
                 (self.quick_difference_btn, self.show_difference_layer_chk.isChecked()),
                 (self.quick_iterations_btn, self.show_iteration_layer_chk.isChecked()),
                 (self.quick_mean_btn, self.show_iteration_mean_chk.isChecked()),
@@ -4691,6 +4756,8 @@ class SmartFitterMainWindow(QMainWindow):
         is_odmr = bool(loaded and trace.experiment_type in {"ODMR", "DEERFrequency"})
         has_iterations = bool(loaded and self._iteration_count() > 0 and not is_scan2d)
         has_dual = bool(self._primary_dataset is not None and len(self._primary_dataset.detectors) > 1)
+        is_time_trace = bool(loaded and trace.experiment_type == "TimeTrace")
+        reference_only = bool(loaded and (trace.metadata or {}).get("reference_only"))
         visibility = {
             self.quick_data_btn: loaded,
             self.quick_fit_btn: fit_allowed,
@@ -4699,9 +4766,9 @@ class SmartFitterMainWindow(QMainWindow):
             self.quick_annotation_btn: fit_allowed,
             self.quick_residual_btn: fit_allowed,
             self.quick_confidence_btn: fit_allowed,
-            self.quick_signal_btn: loaded and not is_scan2d,
+            self.quick_signal_btn: loaded and not is_scan2d and not reference_only,
             self.quick_reference_btn: loaded and not is_scan2d,
-            self.quick_difference_btn: loaded and not is_scan2d,
+            self.quick_difference_btn: loaded and not is_scan2d and not reference_only,
             self.quick_compare_detectors_btn: loaded and has_dual,
             self.quick_iterations_btn: has_iterations,
             self.quick_mean_btn: has_iterations,
@@ -4709,7 +4776,9 @@ class SmartFitterMainWindow(QMainWindow):
             self.quick_iteration_select_btn: has_iterations,
             self.quick_peaks_btn: is_odmr,
             self.quick_envelope_btn: is_rabi,
-            self.quick_fft_btn: fit_allowed,
+            self.quick_fft_btn: fit_allowed and not is_time_trace,
+            self.quick_time_events_btn: is_time_trace,
+            self.quick_map_overlay_btn: is_scan2d,
             self.quick_edit_plot_btn: loaded,
             self.copy_figure_btn: loaded,
         }
@@ -4965,6 +5034,16 @@ class SmartFitterMainWindow(QMainWindow):
             f"Source: {trace.source_path}",
         ]
         lines.extend(self._scan_axis_detail_lines(trace))
+        if metadata.get("is_time_trace"):
+            timing = dict(metadata.get("time_trace") or {})
+            lines.extend([
+                f"Source sequence: {metadata.get('source_experiment', 'unknown')}",
+                "Time origin: first measurement midpoint; timestamps in seconds",
+                f"Timing: {timing.get('timing', 'unknown')}; requested duration {timing.get('durationSeconds', '?')} s",
+                f"Fixed value: {timing.get('fixedValue', 'none')}; cadence {timing.get('cadenceSeconds', 'back to back')} s",
+                f"Recorded units: {metadata.get('value_unit')}; values are not rescaled by the sample cadence",
+                f"Saved events: {len(timing.get('events') or [])}; sampling {'irregular' if metadata.get('time_sampling_irregular') else 'regular'}",
+            ])
         if metadata.get("save_type") or metadata.get("run_status"):
             lines.append(f"Run state: {metadata.get('run_status', 'unknown')} ({metadata.get('save_type', 'unknown')})")
         if completed is not None or target is not None:
@@ -5181,6 +5260,10 @@ class SmartFitterMainWindow(QMainWindow):
     def _canonical_scan_traces(self) -> tuple[ExperimentTrace, ExperimentTrace | None]:
         """Return plot traces in stable detector order, independent of focus."""
         active = self.ctx.trace
+        if active is not None and active.scan_dim == "scan2d" and self.map_compare_view_combo.currentText() == "Single map":
+            return active, None
+        if active is not None and active.scan_dim == "scan2d" and self.map_compare_source_combo.currentData() is not None:
+            return active, self._selected_comparison_map()
         if active is None or self._primary_dataset is None:
             return active, None
         if not self.compare_detectors_chk.isChecked():
@@ -5195,6 +5278,148 @@ class SmartFitterMainWindow(QMainWindow):
             return ordered[0], ordered[1]
         return active, self._comparison_trace()
 
+    def _refresh_map_comparison_sources(self) -> None:
+        if not hasattr(self, "map_compare_source_combo"):
+            return
+        combo = self.map_compare_source_combo
+        selected = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Other detector", None)
+        primary = self.ctx.trace
+        if primary is not None and primary.scan_dim == "scan2d":
+            for name, dataset in sorted(self._loaded_datasets.items()):
+                for detector_id, trace in dataset.detectors.items():
+                    if name == primary.file_name:
+                        continue
+                    if trace.scan_dim == "scan2d" and compatible_axes(primary.scan_axes, trace.scan_axes):
+                        combo.addItem(f"{name} · {self._detector_label(detector_id)}", (name, detector_id))
+            index = self._map_comparison_source_index(selected)
+            combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _map_comparison_source_index(self, source: Any) -> int:
+        source = tuple(source) if isinstance(source, (list, tuple)) else source
+        combo = self.map_compare_source_combo
+        return next((i for i in range(combo.count()) if combo.itemData(i) == source), -1)
+
+    def _selected_comparison_map(self) -> ExperimentTrace | None:
+        source = self.map_compare_source_combo.currentData()
+        if source is None:
+            return self._comparison_trace()
+        dataset = self._loaded_datasets.get(source[0])
+        trace = dataset.detectors.get(source[1]) if dataset is not None else None
+        primary = self.ctx.trace
+        if trace is None or primary is None or trace.scan_dim != "scan2d" or not compatible_axes(primary.scan_axes, trace.scan_axes):
+            return None
+        return trace
+
+    def _on_map_view_changed(self, view: str) -> None:
+        if self._syncing_scan_controls or self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        if view == "Separate maps" and self.map_compare_source_combo.currentData() is None:
+            self._syncing_detector_controls = True
+            try:
+                self.compare_detectors_chk.setChecked(self.compare_detectors_chk.isEnabled())
+            finally:
+                self._syncing_detector_controls = False
+        self._on_map_comparison_changed()
+
+    def _on_map_comparison_changed(self, *_args) -> None:
+        if self._syncing_scan_controls or self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        view = self.map_compare_view_combo.currentText()
+        self._syncing_detector_controls = True
+        try:
+            if view == "Single map":
+                self.compare_detectors_chk.setChecked(False)
+            elif view in {"RGB overlay", "Maps + overlay"} and self.map_compare_source_combo.currentData() is None:
+                self.compare_detectors_chk.setChecked(self.compare_detectors_chk.isEnabled())
+        finally:
+            self._syncing_detector_controls = False
+        if view in {"RGB overlay", "Maps + overlay"} and self._canonical_scan_traces()[1] is None:
+            self.map_compare_view_combo.blockSignals(True)
+            self.map_compare_view_combo.setCurrentText("Separate maps")
+            self.map_compare_view_combo.blockSignals(False)
+            self.statusBar().showMessage("Add another 2D map with the same axes, or load a dual-detector scan.", 7000)
+        if self.map_compare_view_combo.currentText() != "RGB overlay":
+            self._map_overlay_return_state = None
+        self.ctx.dirty = True
+        self._scan_view_limits = None
+        self._refresh_plot_only(preserve_view=False)
+
+    def _toggle_map_overlay(self, checked: bool) -> None:
+        if self._syncing_plot_controls:
+            return
+        if checked:
+            self._show_map_overlay()
+        else:
+            self._restore_map_overlay_view()
+
+    def _show_map_overlay(self) -> None:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        self._refresh_map_comparison_sources()
+        source_index = self.map_compare_source_combo.currentIndex()
+        has_detector_pair = bool(self._primary_dataset is not None and any(
+            trace.detector_id != self.ctx.trace.detector_id and trace.scan_dim == "scan2d"
+            and compatible_axes(self.ctx.trace.scan_axes, trace.scan_axes)
+            for trace in self._primary_dataset.detectors.values()
+        ))
+        if source_index == 0 and not has_detector_pair:
+            source_index = 1 if self.map_compare_source_combo.count() > 1 else -1
+        if source_index < 0:
+            self.statusBar().showMessage("Add another 2D map with the same axes, or load a dual-detector scan.", 7000)
+            self._sync_quick_toolbar_from_state()
+            self._show_inspector_page("map")
+            return
+        if self.map_compare_view_combo.currentText() != "RGB overlay":
+            self._map_overlay_return_state = {
+                "source_path": self.ctx.trace.source_path,
+                "source": self.map_compare_source_combo.currentData(),
+                "view": self.map_compare_view_combo.currentText(),
+                "compare_detectors": self.compare_detectors_chk.isChecked(),
+                "limits": (tuple(self.ax_main.get_xlim()), tuple(self.ax_main.get_ylim())),
+                "swap_axes": self.scan_swap_axes_chk.isChecked(),
+                "pixel_geometry": self.scan_pixel_geometry_combo.currentText(),
+            }
+            self._syncing_scan_controls = True
+            try:
+                self.map_compare_source_combo.setCurrentIndex(source_index)
+                self.map_compare_view_combo.setCurrentText("RGB overlay")
+            finally:
+                self._syncing_scan_controls = False
+            self._on_map_comparison_changed()
+        self._show_inspector_page("map")
+
+    def _restore_map_overlay_view(self) -> None:
+        if self.ctx.trace is None or self.ctx.trace.scan_dim != "scan2d":
+            return
+        state = self._map_overlay_return_state
+        self._map_overlay_return_state = None
+        if state is not None and state["source_path"] != self.ctx.trace.source_path:
+            state = None
+        self._syncing_scan_controls = True
+        self._syncing_detector_controls = True
+        try:
+            self.map_compare_view_combo.setCurrentText(state["view"] if state else "Separate maps")
+            if state is not None:
+                source_index = self._map_comparison_source_index(state["source"])
+                self.map_compare_source_combo.setCurrentIndex(max(0, source_index))
+                self.compare_detectors_chk.setChecked(state["compare_detectors"] and self.compare_detectors_chk.isEnabled())
+                self.scan_pixel_geometry_combo.setCurrentText(state["pixel_geometry"])
+                limits = state["limits"]
+                if state["swap_axes"] != self.scan_swap_axes_chk.isChecked():
+                    limits = (limits[1], limits[0])
+                self._scan_view_limits = limits
+            else:
+                self._scan_view_limits = None
+        finally:
+            self._syncing_scan_controls = False
+            self._syncing_detector_controls = False
+        self.ctx.dirty = True
+        self._refresh_plot_only(preserve_view=False)
+
     def _scan_trace_for_axis(self, axis) -> ExperimentTrace | None:
         if self.ctx.trace is None:
             return None
@@ -5208,12 +5433,15 @@ class SmartFitterMainWindow(QMainWindow):
     def _counterpart_scan_trace(self, trace: ExperimentTrace | None) -> ExperimentTrace | None:
         """Return the other plotted detector for a source map/readout."""
         if trace is None or not self.compare_detectors_chk.isChecked():
+            if trace is not None and self.map_compare_source_combo.currentData() is not None:
+                primary, secondary = self._canonical_scan_traces()
+                return primary if trace is secondary else secondary
             return self._comparison_trace()
         primary, secondary = self._canonical_scan_traces()
         if primary is not None and secondary is not None:
-            if trace.detector_id == primary.detector_id:
+            if trace is primary:
                 return secondary
-            if trace.detector_id == secondary.detector_id:
+            if trace is secondary:
                 return primary
         other = self._comparison_trace()
         return None if other is not None and other.detector_id == trace.detector_id else other
@@ -5377,13 +5605,24 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_compare_detectors_toggled(self, _checked: bool) -> None:
         if self._syncing_detector_controls:
             return
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            # A direct detector toggle selects the source-map layout. Leaving
+            # RGB mode active used to let later palette edits re-enable it.
+            self._map_overlay_return_state = None
+            self._syncing_scan_controls = True
+            try:
+                self.map_compare_source_combo.setCurrentIndex(0)
+                self.map_compare_view_combo.setCurrentText("Separate maps" if _checked else "Single map")
+            finally:
+                self._syncing_scan_controls = False
+            self._scan_view_limits = None
         self._sync_quick_toolbar_from_state()
         if self.ctx.trace is not None:
             self.ctx.dirty = True
             self._refresh_plot_only()
 
     def _experiment_display_name(self, experiment_type: str) -> str:
-        return {"Scan2D": "2D Scan", "LineScan": "1D Scan"}.get(experiment_type, experiment_type)
+        return {"Scan2D": "2D Scan", "LineScan": "1D Scan", "TimeTrace": "Time trace"}.get(experiment_type, experiment_type)
 
     def _update_profile_hint(self):
         if self.ctx.trace is None:
@@ -5487,6 +5726,20 @@ class SmartFitterMainWindow(QMainWindow):
         is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
         is_fit_trace = bool(self.ctx.trace is not None and self.ctx.trace.fit_allowed)
+        is_time_trace = bool(self.ctx.trace is not None and self.ctx.trace.experiment_type == "TimeTrace")
+        reference_only = bool(self.ctx.trace is not None and (self.ctx.trace.metadata or {}).get("reference_only"))
+        unit = "s" if is_time_trace else ("scan units" if is_scan else "ns")
+        self.roi_min_label.setText(f"ROI min ({unit})")
+        self.roi_max_label.setText(f"ROI max ({unit})")
+        self.roi_min.setToolTip(f"Minimum fit/analysis bound in {unit}.")
+        self.roi_max.setToolTip(f"Maximum fit/analysis bound in {unit}.")
+        for index in range(self.model_combo.count()):
+            item = self.model_combo.model().item(index)
+            item.setEnabled(not is_time_trace or self.model_combo.itemText(index) in {"TimeTraceDecay", "CustomModel"})
+        if is_time_trace and self.model_combo.currentText() not in {"TimeTraceDecay", "CustomModel"}:
+            self.model_combo.setCurrentText("TimeTraceDecay")
+        for index in range(self.mode_combo.count()):
+            self.mode_combo.model().item(index).setEnabled(not reference_only or self.mode_combo.itemText(index) == "reference")
         fit_enabled = bool(is_fit_trace and self.ctx.trace is not None and self._active_fit_request is None)
         if hasattr(self, "file_details_btn"):
             self.file_details_btn.setVisible(self.ctx.trace is not None and self._responsive_layout_mode == "expanded")
@@ -5533,11 +5786,11 @@ class SmartFitterMainWindow(QMainWindow):
                 (self.show_rabi_envelope_chk, is_fit_trace and is_rabi),
                 (self.show_peaks_chk, is_odmr),
                 (self.show_residual_chk, is_fit_trace),
-                (self.show_fft_panel_chk, is_fit_trace),
+                (self.show_fft_panel_chk, is_fit_trace and not is_time_trace),
                 (self.show_confidence_chk, is_fit_trace),
-                (self.show_signal_layer_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_signal_layer_chk, self.ctx.trace is not None and not is_scan2d and not reference_only),
                 (self.show_reference_layer_chk, self.ctx.trace is not None and not is_scan2d),
-                (self.show_difference_layer_chk, self.ctx.trace is not None and not is_scan2d),
+                (self.show_difference_layer_chk, self.ctx.trace is not None and not is_scan2d and not reference_only),
                 (self.show_iteration_layer_chk, has_iterations),
                 (self.show_iteration_mean_chk, has_iterations),
                 (self.show_iteration_std_chk, has_iterations),
@@ -5578,7 +5831,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._update_report_controls_visibility()
         self._update_plot_more_menu()
         self._update_plot_quick_visibility()
-        self._update_plot_surface_ratio()
+        self._update_plot_surface_layout()
         self._update_data_info_strip()
 
     def _effective_trace_metadata(self) -> dict[str, object]:
@@ -5586,6 +5839,8 @@ class SmartFitterMainWindow(QMainWindow):
             return {}
         metadata = dict(self.ctx.trace.metadata or {})
         metadata["rabi_dead_time_ns"] = float(self.rabi_dead_time_ns.value())
+        if self.ctx.trace.scan_dim == "scan2d" and self._map_comparison_export:
+            metadata["map_comparison"] = self._map_comparison_export
         return metadata
 
     def _on_mode_changed(self, *_args):
@@ -5789,6 +6044,8 @@ class SmartFitterMainWindow(QMainWindow):
             roles.append("detector_compare")
         if self._detector_compare_colorbar_ax is not None and self._detector_compare_colorbar_ax.get_visible():
             roles.append("detector_compare_colorbar")
+        if self._map_overlay_ax is not None and self._map_overlay_ax.get_visible():
+            roles.append("map_overlay")
         return list(dict.fromkeys(roles))
 
     def _save_preferences(self):
@@ -6019,7 +6276,7 @@ class SmartFitterMainWindow(QMainWindow):
         is_t1 = model == "T1"
         is_custom = model == "CustomModel"
         is_fit_trace = bool(self.ctx.trace is None or self.ctx.trace.fit_allowed)
-        
+        self.gaussian_container.setVisible(is_fit_trace and model == "GaussianPeaks")
         self.rabi_container.setVisible(is_fit_trace and is_rabi)
         self.t1_container.setVisible(is_fit_trace and is_t1)
         self.odmr_container.setVisible(is_fit_trace and is_odmr)
@@ -6058,7 +6315,10 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _update_equation_display(self):
         m = self.model_combo.currentText()
-        if m == "T1":
+        if m == "GaussianPeaks":
+            latex_eq = r"$b + \sum_i A_i \exp[-(x-c_i)^2/(2\sigma_i^2)]$"
+            code_eq = "background + sum(A_i * exp(-0.5 * ((x-center_i)/sigma_i)**2))"
+        elif m == "T1":
             stretch = self.t1_model_combo.currentText().startswith("Stretched")
             normalized = self.t1_prep_combo.currentText().startswith("Normalize")
             if stretch and normalized:
@@ -6387,7 +6647,11 @@ class SmartFitterMainWindow(QMainWindow):
         # File overlays are line plots. Keep 2D maps independently selectable
         # in the registry, but never feed them into the line-overlay or
         # baseline pipelines.
-        return primary.scan_dim != "scan2d" and trace.scan_dim != "scan2d"
+        if primary.scan_dim == "scan2d" or trace.scan_dim == "scan2d":
+            return False
+        if primary.experiment_type == "TimeTrace" or trace.experiment_type == "TimeTrace":
+            return primary.experiment_type == trace.experiment_type == "TimeTrace"
+        return True
 
     def _checked_overlay_names(self) -> set[str]:
         if not hasattr(self, "overlay_list"):
@@ -6408,6 +6672,12 @@ class SmartFitterMainWindow(QMainWindow):
     def _update_overlay_widgets(self, checked_names: set[str] | None = None):
         checked_names = set(self._overlay_visible_names if checked_names is None else checked_names)
         current = self.ctx.trace.file_name if self.ctx.trace is not None else None
+        highlighted = self.overlay_list.currentItem()
+        highlighted_name = self._overlay_item_name(highlighted) if highlighted is not None else current
+        selected_names = {self._overlay_item_name(item) for item in self.overlay_list.selectedItems()}
+        if self._is_loading or highlighted_name not in (self.ctx.loaded_traces or {}):
+            highlighted_name = current
+            selected_names = {current} if current is not None else set()
         checked_names.discard(current)
         baseline_name = self.baseline_combo.currentText() if hasattr(self, "baseline_combo") else "None"
         self._updating_overlay_list = True
@@ -6440,7 +6710,7 @@ class SmartFitterMainWindow(QMainWindow):
                 font.setBold(True)
                 item.setFont(font)
                 item.setToolTip("Current primary plot")
-            elif not compatible:
+            elif not compatible and self.ctx.trace is not None:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                 item.setToolTip(
                     f"This {dimension} file cannot overlay the active {self._trace_dimension_label(self.ctx.trace)} view. "
@@ -6450,8 +6720,9 @@ class SmartFitterMainWindow(QMainWindow):
                 item.setToolTip("Check to overlay this compatible trace. Single-click highlights; double-click makes it primary.")
             item.setToolTip(f"{trace.source_path}\n\n{item.toolTip()}\nEnter makes this file primary.")
             self.overlay_list.addItem(item)
-            if is_primary:
-                self.overlay_list.setCurrentItem(item)
+            if name == highlighted_name:
+                self.overlay_list.setCurrentItem(item, QItemSelectionModel.SelectionFlag.NoUpdate)
+            item.setSelected(name in selected_names if selected_names else is_primary)
             if compatible and not is_primary:
                 self.baseline_combo.addItem(name)
         if self.baseline_combo.findText(baseline_name) >= 0:
@@ -6465,6 +6736,7 @@ class SmartFitterMainWindow(QMainWindow):
             if name in self.ctx.loaded_traces and self._overlay_is_compatible(self.ctx.loaded_traces[name])
         }
         self._filter_project_files()
+        self._refresh_map_comparison_sources()
 
     def _activate_filtered_file(self) -> None:
         item = next((self.overlay_list.item(i) for i in range(self.overlay_list.count())
@@ -6477,10 +6749,17 @@ class SmartFitterMainWindow(QMainWindow):
     def _filter_project_files(self, *_args) -> None:
         if not hasattr(self, "file_filter_edit"):
             return
-        query = self.file_filter_edit.text().strip().casefold()
+        words = self.file_filter_edit.text().strip().casefold().split()
+        visible = 0
         for index in range(self.overlay_list.count()):
             item = self.overlay_list.item(index)
-            item.setHidden(bool(query and query not in item.text().casefold()))
+            trace = self.ctx.loaded_traces.get(self._overlay_item_name(item))
+            searchable = f"{item.text()} {trace.source_path if trace is not None else ''}".casefold()
+            item.setHidden(not all(word in searchable for word in words))
+            visible += not item.isHidden()
+        total = self.overlay_list.count()
+        count = f"{visible} / {total}" if words else str(total)
+        self.overlay_box.setTitle(f"Project Explorer — {count} file{'s' if total != 1 else ''}")
 
     def _show_file_context_menu(self, position) -> None:
         item = self.overlay_list.itemAt(position)
@@ -6489,7 +6768,7 @@ class SmartFitterMainWindow(QMainWindow):
         menu = QMenu(self.overlay_list)
         make_primary = menu.addAction("Make Primary")
         make_primary.setEnabled(item is not None and self.ctx.trace is not None and self._overlay_item_name(item) != self.ctx.trace.file_name)
-        make_primary.triggered.connect(self.on_plot_selected_file)
+        make_primary.triggered.connect(lambda: self.on_overlay_set_primary(item) if item is not None else None)
         if item is not None and item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
             show_trace = menu.addAction("Show on Plot" if item.checkState() != Qt.Checked else "Hide from Plot")
             show_trace.triggered.connect(lambda: item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked))
@@ -6530,9 +6809,14 @@ class SmartFitterMainWindow(QMainWindow):
         self._overlay_visible_names.clear()
         self._overlay_view_dirty = True
         self._update_overlay_widgets(set())
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d":
+            self.map_compare_view_combo.setCurrentText("Single map")
         self._refresh_plot_only()
 
     def on_add_overlays(self):
+        if self._active_fit_request is not None:
+            self._message("Fit in progress", "Cancel or wait for the current fit before loading another file.")
+            return
         paths, _ = QFileDialog.getOpenFileNames(self, "Add Data Files", str(self.settings.value("session/last_open_dir", "")), "MAT files (*.mat)")
         if not paths:
             return
@@ -6544,6 +6828,11 @@ class SmartFitterMainWindow(QMainWindow):
         detector_id = self._active_detector_id()
         skipped: list[str] = []
         for p in paths:
+            if self.ctx.trace is None:
+                if self._load_file(p):
+                    mode = self._current_data_mode()
+                    detector_id = self._active_detector_id()
+                continue
             try:
                 dataset = load_experiment_dataset(p, mode=mode)
                 tr = dataset.detectors.get(detector_id)
@@ -6568,10 +6857,11 @@ class SmartFitterMainWindow(QMainWindow):
     def on_remove_overlays(self):
         if not self.ctx.loaded_traces:
             return
-        selected = [self._overlay_item_name(it) for it in self.overlay_list.selectedItems()]
+        selected = [self._overlay_item_name(it) for it in self.overlay_list.selectedItems() if not it.isHidden()]
         if not selected:
             return
         current_name = self.ctx.trace.file_name if self.ctx.trace is not None else ""
+        baseline = self.baseline_combo.currentText()
         for nm in selected:
             if nm == current_name:
                 continue
@@ -6580,9 +6870,12 @@ class SmartFitterMainWindow(QMainWindow):
             self._overlay_visible_names.discard(nm)
         self._overlay_view_dirty = True
         self._update_overlay_widgets(self._overlay_visible_names)
+        if self.baseline_combo.currentText() != baseline:
+            self._refresh_processed()
         self._refresh_plot_only()
 
     def on_clear_overlays(self):
+        baseline = self.baseline_combo.currentText()
         if self.ctx.loaded_traces is None:
             self.ctx.loaded_traces = {}
         current = self.ctx.trace.file_name if self.ctx.trace is not None else None
@@ -6598,6 +6891,8 @@ class SmartFitterMainWindow(QMainWindow):
         self._overlay_visible_names.clear()
         self._overlay_view_dirty = True
         self._update_overlay_widgets(set())
+        if self.baseline_combo.currentText() != baseline:
+            self._refresh_processed()
         self._refresh_plot_only()
 
     def on_compare_traces(self):
@@ -6709,7 +7004,7 @@ class SmartFitterMainWindow(QMainWindow):
         if item is None:
             selected = self.overlay_list.selectedItems()
             item = selected[0] if selected else None
-        if item is None:
+        if item is None or item.isHidden():
             self.statusBar().showMessage("Select a loaded file to plot", 4000)
             return
         self.on_overlay_set_primary(item)
@@ -6833,6 +7128,7 @@ class SmartFitterMainWindow(QMainWindow):
                 float(event.xdata),
                 float(event.ydata) if event.ydata is not None else None,
                 detector_id=None if source_trace is None else source_trace.detector_id,
+                trace_override=source_trace,
                 multi_select=self._multi_point_modifier(event),
             )
 
@@ -7103,6 +7399,7 @@ class SmartFitterMainWindow(QMainWindow):
             "profile": self.profile_combo.currentText(),
             "mode": self.mode_combo.currentText(),
             "model": self.model_combo.currentText(),
+            "gaussian_peak_count": self.gaussian_peak_count_spin.value(),
             "rabi_mode": self.rabi_mode_combo.currentText(),
             "t1_prep_mode": self.t1_prep_combo.currentText(),
             "t1_model_family": self.t1_model_combo.currentText(),
@@ -7187,6 +7484,7 @@ class SmartFitterMainWindow(QMainWindow):
         return {
             "primary_source": source_descriptor(trace.source_path, session_path), "profile": self.profile_combo.currentText(),
             "mode": self.mode_combo.currentText(), "model": self.model_combo.currentText(),
+            "gaussian_peak_count": self.gaussian_peak_count_spin.value(),
             "active_detector_id": trace.detector_id,
             "compare_detectors": self.compare_detectors_chk.isChecked(),
             "detector_scope": "both" if self._detector_scope_is_both() else "active",
@@ -7197,6 +7495,7 @@ class SmartFitterMainWindow(QMainWindow):
             "sample_metadata": self._collect_sample_metadata(), "locks": self._collect_locks(),
             "overlay_sources": overlays,
             "baseline_trace": self.baseline_combo.currentText(),
+            "time_trace_options": {"show_events": self.quick_time_events_btn.isChecked()},
             "map_options": {
                 "colormap": self.scan_colormap_combo.currentText(),
                 "reverse": self.scan_reverse_chk.isChecked(),
@@ -7210,6 +7509,10 @@ class SmartFitterMainWindow(QMainWindow):
                 "linecut": self.scan_linecut_combo.currentText(),
                 "secondary": self.scan_secondary_combo.currentText(),
                 "detector_compare_scale": self.scan_compare_scale_combo.currentText(),
+                "comparison_source": self.map_compare_source_combo.currentData(),
+                "comparison_view": self.map_compare_view_combo.currentText(),
+                "overlay_palette": self.map_overlay_palette_combo.currentText(),
+                "overlay_background_percentile": self.map_overlay_background_spin.value(),
                 "detector_color_limits": json_safe(self._detector_map_limits),
                 "spot_source": self.spot_source_combo.currentText(),
                 "spot_polarity": self.spot_polarity_combo.currentText(),
@@ -7377,6 +7680,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._update_overlay_widgets({name for name, checked in overlay_states.items() if checked})
         self.profile_combo.setCurrentText(str(document.get("profile", "Auto")))
         self.model_combo.setCurrentText(str(document.get("model", self.model_combo.currentText())))
+        self.gaussian_peak_count_spin.setValue(int(document.get("gaussian_peak_count", 1)))
         roi = document.get("roi") or ["", ""]
         self.roi_min.setText(str(roi[0] if len(roi) else "")); self.roi_max.setText(str(roi[1] if len(roi) > 1 else ""))
         self.bin_spin.setValue(int(document.get("bin_size", 1))); self.smooth_spin.setValue(int(document.get("smooth_window", 1)))
@@ -7385,6 +7689,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.ctx.analysis_steps = [AnalysisStep.from_dict(value) for value in document.get("analysis_steps") or []]
         self._apply_plot_options_payload(dict(document.get("plot_options") or {}))
         map_options = dict(document.get("map_options") or {})
+        self.quick_time_events_btn.setChecked(bool(dict(document.get("time_trace_options") or {}).get("show_events", True)))
         self._syncing_scan_controls = True
         try:
             self.scan_colormap_combo.setCurrentText(str(map_options.get("colormap", self.scan_colormap_combo.currentText())))
@@ -7405,6 +7710,14 @@ class SmartFitterMainWindow(QMainWindow):
             self.scan_linecut_combo.setCurrentText(str(map_options.get("linecut", "None")))
             self.scan_secondary_combo.setCurrentText(str(map_options.get("secondary", "None")))
             self.scan_compare_scale_combo.setCurrentText(str(map_options.get("detector_compare_scale", "Independent")))
+            self._refresh_map_comparison_sources()
+            comparison_source = map_options.get("comparison_source")
+            if isinstance(comparison_source, list):
+                comparison_source = tuple(comparison_source)
+            self.map_compare_source_combo.setCurrentIndex(max(0, self._map_comparison_source_index(comparison_source)))
+            self.map_compare_view_combo.setCurrentText(str(map_options.get("comparison_view", "Separate maps")))
+            self.map_overlay_palette_combo.setCurrentText(str(map_options.get("overlay_palette", "Pink / teal")))
+            self.map_overlay_background_spin.setValue(float(map_options.get("overlay_background_percentile", 10)))
             self.spot_source_combo.setCurrentText(str(map_options.get("spot_source", "Auto fluorescence")))
             self.spot_polarity_combo.setCurrentText(str(map_options.get("spot_polarity", "Auto")))
             self.spot_threshold_spin.setValue(float(map_options.get("spot_threshold_sigma", 3.0)))
@@ -7440,7 +7753,11 @@ class SmartFitterMainWindow(QMainWindow):
         }
         self._restore_spot_comparison_payload(document.get("scan_spot_comparison"))
         self._populate_spot_table()
-        self.compare_detectors_chk.setChecked(bool(document.get("compare_detectors", False)))
+        self._syncing_detector_controls = True
+        try:
+            self.compare_detectors_chk.setChecked(bool(document.get("compare_detectors", False)))
+        finally:
+            self._syncing_detector_controls = False
         if hasattr(self, "detector_scope_combo"):
             scope_index = self.detector_scope_combo.findData(str(document.get("detector_scope", "active")))
             self.detector_scope_combo.setCurrentIndex(max(0, scope_index))
@@ -7506,6 +7823,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.profile_combo.setCurrentText(str(payload.get("profile", self.profile_combo.currentText())))
         self.mode_combo.setCurrentText(str(payload.get("mode", self.mode_combo.currentText())))
         self.model_combo.setCurrentText(str(payload.get("model", self.model_combo.currentText())))
+        self.gaussian_peak_count_spin.setValue(int(payload.get("gaussian_peak_count", 1)))
         self.rabi_mode_combo.setCurrentText(str(payload.get("rabi_mode", self.rabi_mode_combo.currentText())))
         self.t1_prep_combo.setCurrentText(str(payload.get("t1_prep_mode", self.t1_prep_combo.currentText())))
         self.t1_model_combo.setCurrentText(str(payload.get("t1_model_family", self.t1_model_combo.currentText())))
@@ -7575,6 +7893,8 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Custom model", f"Failed to load:\n{exc}")
 
     def _active_profile(self) -> FitProfile:
+        if self.ctx.trace is not None and self.ctx.trace.experiment_type == "TimeTrace":
+            return PROFILES["TimeTrace"]
         p = self.profile_combo.currentText()
         if p == "Auto":
             if self.ctx.trace is None:
@@ -7612,6 +7932,8 @@ class SmartFitterMainWindow(QMainWindow):
 
     @staticmethod
     def _trace_is_reference_only(trace: ExperimentTrace) -> bool:
+        if (trace.metadata or {}).get("reference_only"):
+            return True
         signal = np.asarray(trace.signal, dtype=float).ravel()
         reference = np.asarray(trace.reference, dtype=float).ravel()
         count = min(signal.size, reference.size)
@@ -7661,6 +7983,8 @@ class SmartFitterMainWindow(QMainWindow):
                 "detector1" if "detector1" in dataset.detectors else next(iter(dataset.detectors))
             )
             trace = dataset.detectors[detector_id]
+            resolved_mode = trace.mode
+            auto_reference_fallback = requested_mode == "contrast" and trace.mode == "reference"
             if requested_mode == "contrast" and self._trace_is_reference_only(trace):
                 resolved_mode = "reference"
                 auto_reference_fallback = True
@@ -7674,6 +7998,8 @@ class SmartFitterMainWindow(QMainWindow):
             self._is_loading = False
             self._message("Load error", f"Loaded trace is empty after applying observable mode '{self._friendly_mode_name(resolved_mode)}'.")
             return False
+        if not preserve_analysis or self.ctx.trace is None or self.ctx.trace.source_path != trace.source_path:
+            self._map_overlay_return_state = None
         if not preserve_analysis:
             self._scan_spot_results.clear()
             self._scan_spot_diagnostics.clear()
@@ -7818,34 +8144,40 @@ class SmartFitterMainWindow(QMainWindow):
         return float(self.odmr_cal_offset.value()) + float(self.odmr_cal_scale.value()) * float(xval)
 
     def _display_y(self, y: np.ndarray) -> tuple[np.ndarray, str]:
+        if self.ctx.trace is not None and self.ctx.trace.experiment_type == "TimeTrace":
+            return y, self.ctx.trace.y_label
         if self.ctx.trace is not None and self.ctx.trace.experiment_type in {"ODMR", "DEERFrequency"}:
             if self.odmr_display_combo.currentText().startswith("Dips"):
                 return -y, "ODMR signal [a.u.] (dips)"
             return y, "ODMR signal [a.u.] (peaks)"
         if self.ctx.trace is None:
             return y, "Signal"
+        units = str((self.ctx.trace.metadata or {}).get("value_unit", "counts"))
         mode = self._friendly_mode_name(self._current_data_mode()) if hasattr(self, "mode_combo") else self.ctx.trace.mode
         if mode == "contrast":
             return y, "Contrast [a.u.]"
         if mode == "signal":
-            return y, "Signal [counts]"
+            return y, f"Signal [{units}]"
         if mode == "reference":
-            return y, "Reference [counts]"
+            return y, f"Reference [{units}]"
         if mode == "difference":
-            return y, "Difference [counts]"
+            return y, f"Difference [{units}]"
         return y, (self.ctx.trace.y_label or "Signal")
 
     def _series_for_mode(self, trace: ExperimentTrace, mode: str) -> tuple[np.ndarray, str]:
         mode_key = mode.strip().lower()
+        if (trace.metadata or {}).get("reference_only") and mode_key != "reference":
+            return np.full_like(trace.reference, np.nan), "Unavailable"
+        units = str((trace.metadata or {}).get("value_unit", "counts"))
         if mode_key == "contrast":
             ref = trace.reference.astype(float, copy=True)
             ref[ref == 0] = np.nan
             return (trace.reference - trace.signal) / ref, "Contrast [a.u.]"
         if mode_key == "signal":
-            return trace.signal.astype(float, copy=True), "Signal [counts]"
+            return trace.signal.astype(float, copy=True), f"Signal [{units}]"
         if mode_key == "reference":
-            return trace.reference.astype(float, copy=True), "Reference [counts]"
-        return (trace.reference - trace.signal).astype(float, copy=True), "Difference [counts]"
+            return trace.reference.astype(float, copy=True), f"Reference [{units}]"
+        return (trace.reference - trace.signal).astype(float, copy=True), f"Difference [{units}]"
 
     def _iteration_source_for_mode(self, trace: ExperimentTrace, mode: str) -> tuple[np.ndarray | None, str]:
         mode_key = mode.strip().lower()
@@ -8272,6 +8604,8 @@ class SmartFitterMainWindow(QMainWindow):
             return "detector_compare"
         if ax is self._detector_compare_colorbar_ax:
             return "detector_compare_colorbar"
+        if ax is self._map_overlay_ax:
+            return "map_overlay"
         return "main"
 
     def _register_series(
@@ -8589,11 +8923,21 @@ class SmartFitterMainWindow(QMainWindow):
     def _reset_export_navigation_history(self):
         """Discard toolbar views whose limits predate the rebuilt axes."""
         try:
-            self.toolbar._nav_stack.clear()
-            self.toolbar.push_current()
             self.toolbar.update()
+            self.toolbar.push_current()
         except Exception:
             pass
+
+    def _reset_plot_view(self, *_args) -> None:
+        if self.ctx.trace is None:
+            return
+        if self.ctx.trace.scan_dim == "scan2d":
+            self._reset_scan_view()
+        else:
+            # Rebuilt axes can retain a zoomed view as their oldest history.
+            self._overlay_view_dirty = True
+            self._refresh_plot_only(preserve_view=False)
+        self._reset_export_navigation_history()
 
     def _style_navigation_toolbar_icons(self) -> None:
         """Use explicit high-contrast icons instead of OS-theme-dependent SVGs."""
@@ -8636,10 +8980,16 @@ class SmartFitterMainWindow(QMainWindow):
             return ""
         trace = self.ctx.trace
         parts: list[str] = []
-        if raw_idx < len(trace.signal):
+        if raw_idx < len(trace.signal) and not (trace.metadata or {}).get("reference_only"):
             parts.append(f"signal={self._format_inspect_value(float(trace.signal[raw_idx]))}")
         if raw_idx < len(trace.reference):
             parts.append(f"reference={self._format_inspect_value(float(trace.reference[raw_idx]))}")
+        if trace.experiment_type == "TimeTrace":
+            timing = dict((trace.metadata or {}).get("time_trace") or {})
+            for field, label in (("scheduledSeconds", "scheduled_s"), ("latenessSeconds", "lateness_s"), ("failedPoints", "retries")):
+                values = timing.get(field) or []
+                if raw_idx < len(values) and np.isfinite(values[raw_idx]):
+                    parts.append(f"{label}={self._format_inspect_value(values[raw_idx])}")
         if trace.y_sem is not None and raw_idx < len(trace.y_sem):
             parts.append(f"SEM={self._format_inspect_value(float(trace.y_sem[raw_idx]))}")
         if trace.iteration_valid is not None and raw_idx < trace.iteration_valid.shape[0]:
@@ -8688,6 +9038,8 @@ class SmartFitterMainWindow(QMainWindow):
             axes.add(self._ax_secondary)
         if self._detector_compare_ax is not None:
             axes.add(self._detector_compare_ax)
+        if self._map_overlay_ax is not None:
+            axes.add(self._map_overlay_ax)
         return axes
 
     def _ensure_crosshairs(self, x: float, y: float):
@@ -9467,11 +9819,8 @@ class SmartFitterMainWindow(QMainWindow):
         for spot in self._scan_spot_results.get(detector_id, []):
             center_x, center_y = (spot.center_y, spot.center_x) if swapped else (spot.center_x, spot.center_y)
             angle = 90.0 - spot.angle_deg if swapped else spot.angle_deg
-            ellipse_width, ellipse_height = (
-                (spot.fwhm_minor, spot.fwhm_major)
-                if swapped
-                else (spot.fwhm_major, spot.fwhm_minor)
-            )
+            # Reflection across x=y changes the angle, not the principal radii.
+            ellipse_width, ellipse_height = spot.fwhm_major, spot.fwhm_minor
             is_highlighted = (
                 self.spot_compare_highlight_chk.isChecked()
                 and (detector_id, int(spot.spot_id)) in highlighted
@@ -9595,6 +9944,12 @@ class SmartFitterMainWindow(QMainWindow):
             source_trace = self._scan_trace_for_axis(event.inaxes)
             if source_trace is None:
                 return
+            if not self._map_contains_point(source_trace, event.xdata, event.ydata):
+                other = self._counterpart_scan_trace(source_trace)
+                if other is None or not self._map_contains_point(other, event.xdata, event.ydata):
+                    self._update_point_readout("Point readout: outside measured map coverage")
+                    return
+                source_trace = other
             self._ensure_crosshairs(float(event.xdata), float(event.ydata))
             self._crosshair_v.set_xdata([event.xdata, event.xdata])
             self._crosshair_h.set_ydata([event.ydata, event.ydata])
@@ -9618,7 +9973,7 @@ class SmartFitterMainWindow(QMainWindow):
                 f"{self._detector_label(source_trace.detector_id)} {source_label}={self._format_inspect_value(z)}"
             ]
             other = self._counterpart_scan_trace(source_trace)
-            if other is not None:
+            if other is not None and self._map_contains_point(other, event.xdata, event.ydata):
                 other_display = self._scan2d_display_data(other)
                 if other_display is not None:
                     ox, oy, oz, _ox_label, _oy_label = other_display
@@ -9727,6 +10082,11 @@ class SmartFitterMainWindow(QMainWindow):
                     pass
 
     def _clear_scan_colorbar(self):
+        self._map_comparison_export = {}
+        self._map_overlay_data = None
+        if self._map_overlay_ax is not None:
+            self._map_overlay_ax.remove()
+            self._map_overlay_ax = None
         if self._detector_compare_colorbar is not None:
             try:
                 self._detector_compare_colorbar.remove()
@@ -9769,12 +10129,17 @@ class SmartFitterMainWindow(QMainWindow):
             pass
         self.ax_res.set_position(self._ax_res_default_pos)
 
+    def _on_plot_resize(self, _event) -> None:
+        if self.ctx.trace is not None and self.ctx.trace.scan_dim != "scan2d":
+            self._configure_1d_layout(self.ax_res.get_visible())
+
     def _configure_1d_layout(self, show_detail: bool) -> None:
         if show_detail:
             self.ax_main.set_position(self._ax_main_default_pos)
             self.ax_res.set_position(self._ax_res_default_pos)
             return
-        rect = [0.11, 0.14, 0.82, 0.76]
+        bottom = max(0.14, min(0.32, 50 * self.fig.dpi / 100 / max(1, self.fig.bbox.height)))
+        rect = [0.11, bottom, 0.82, 0.90 - bottom]
         self.ax_main.set_position(rect)
         if self._ax_secondary is not None:
             self._ax_secondary.set_position(rect)
@@ -9804,6 +10169,10 @@ class SmartFitterMainWindow(QMainWindow):
         y_centers = np.asarray(y2d[:, 0], dtype=float)
         x_label = trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"
         y_label = trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"
+        primary = self.ctx.trace
+        if primary is not None and primary.scan_dim == "scan2d" and len(primary.scan_axes) == 2 and trace.source_path != primary.source_path:
+            if axis_key(x_label) == axis_key(primary.scan_axes[1]) and axis_key(y_label) == axis_key(primary.scan_axes[0]):
+                x_centers, y_centers, z2d, x_label, y_label = y_centers, x_centers, z2d.T, y_label, x_label
         self.scan_swap_axes_chk.setText(f"Swap {x_label} / {y_label} axes")
         self.scan_swap_axes_chk.setToolTip(
             f"Exchange {x_label} and {y_label} between the horizontal and vertical display axes."
@@ -9811,6 +10180,13 @@ class SmartFitterMainWindow(QMainWindow):
         if self.scan_swap_axes_chk.isChecked():
             return y_centers, x_centers, z2d.T, y_label, x_label
         return x_centers, y_centers, z2d, x_label, y_label
+
+    def _map_contains_point(self, trace: ExperimentTrace, x: float, y: float) -> bool:
+        extent = self._scan2d_extent(trace)
+        if extent is None:
+            return False
+        xmin, xmax, ymin, ymax = extent[2]
+        return xmin <= x <= xmax and ymin <= y <= ymax
 
     def _scan2d_extent(self, trace: ExperimentTrace) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]] | None:
         display = self._scan2d_display_data(trace)
@@ -9864,7 +10240,8 @@ class SmartFitterMainWindow(QMainWindow):
             self.ax_res.set_position([0.09, 0.10, 0.79, 0.21])
             self.ax_res.set_visible(True)
         else:
-            base_rect = [0.08, 0.10, 0.80, 0.82]
+            top_height = 0.77 if self._map_overlay_data is not None else 0.82
+            base_rect = [0.08, 0.10, 0.80, top_height]
             main_rect = self._fit_axes_box_to_aspect(base_rect, box_aspect)
             self.ax_res.set_visible(False)
         self.ax_main.set_position(main_rect)
@@ -9877,6 +10254,7 @@ class SmartFitterMainWindow(QMainWindow):
         self,
         show_linecut: bool,
         box_aspect: float,
+        show_overlay: bool = False,
     ) -> None:
         stacked = bool(getattr(self, "_dual_map_stacked", False))
         if stacked:
@@ -9893,6 +10271,19 @@ class SmartFitterMainWindow(QMainWindow):
             compare_base_rect = [0.54, bottom, 0.39, height]
         main_rect = self._fit_axes_box_to_aspect(main_base_rect, box_aspect)
         compare_rect = self._fit_axes_box_to_aspect(compare_base_rect, box_aspect)
+        if show_overlay:
+            fig_width, fig_height = self.fig.get_size_inches()
+            if fig_width / max(fig_height, 0.1) < 2.35:
+                source_bottom = 0.68 if show_linecut else 0.65
+                source_height = 0.22 if show_linecut else 0.26
+                overlay_bottom, overlay_height = (0.39, 0.20) if show_linecut else (0.23, 0.20)
+                slots = [[0.12, source_bottom, 0.30, source_height], [0.56, source_bottom, 0.28, source_height],
+                         [0.28, overlay_bottom, 0.44, overlay_height]]
+            else:
+                bottom = 0.43 if show_linecut else 0.22
+                slots = [[0.07 + i * 0.32, bottom, 0.22, 0.46 if show_linecut else 0.67] for i in range(3)]
+            main_rect, compare_rect, overlay_rect = [self._fit_axes_box_to_aspect(rect, box_aspect) for rect in slots]
+            self._map_overlay_ax = self.fig.add_axes(overlay_rect, sharex=self.ax_main, sharey=self.ax_main)
         self.ax_main.set_position(main_rect)
         self._detector_compare_ax = self.fig.add_axes(compare_rect, sharex=self.ax_main, sharey=self.ax_main)
         cbar_pad = 0.010
@@ -9904,14 +10295,37 @@ class SmartFitterMainWindow(QMainWindow):
             [compare_rect[0] + compare_rect[2] + cbar_pad, compare_rect[1], cbar_width, compare_rect[3]]
         )
         if show_linecut:
-            self.ax_res.set_position([0.09, 0.07, 0.80, 0.18] if stacked else [0.08, 0.09, 0.84, 0.21])
+            if show_overlay:
+                self.ax_res.set_position([0.12, 0.15, 0.76, 0.12])
+            else:
+                self.ax_res.set_position([0.09, 0.07, 0.80, 0.18] if stacked else [0.08, 0.09, 0.84, 0.21])
             self.ax_res.set_visible(True)
         else:
             self.ax_res.set_visible(False)
 
+    def _map_source_label(self, trace: ExperimentTrace, other: ExperimentTrace | None) -> str:
+        detector = self._detector_label(trace.detector_id)
+        if other is not None and other.source_path != trace.source_path:
+            name = Path(trace.file_name).stem
+            limit = 18 if self.map_compare_view_combo.currentText() == "Maps + overlay" else 28
+            return f"{name[:limit]}{'…' if len(name) > limit else ''}\n{detector}"
+        return detector
+
+    def _label_map_overlay(self, axis, primary: ExperimentTrace, secondary: ExperimentTrace) -> None:
+        palette = self.map_overlay_palette_combo.currentText()
+        colors = palette.split(" / ")
+        scope = "Shared scale" if self.scan_compare_scale_combo.currentText() == "Shared" else "Independent scales"
+        axis.set_facecolor("#dadada")
+        axis.set_title(f"{scope}\n{self.map_overlay_background_spin.value():g}% background")
+        for index, (trace, color) in enumerate(zip((primary, secondary), PALETTES[palette])):
+            label = f"{colors[index].title()}: {self._map_source_label(trace, secondary if index == 0 else primary).replace(chr(10), ' · ')}"
+            self._plot_series(axis, np.array([]), np.array([]), label, role="overlay", series_id=f"map_overlay:{index}", color=color, lw=3)
+
     def _current_observable_label(self) -> str:
         if self.ctx.trace is None:
             return "Signal"
+        if self.ctx.trace.experiment_type == "TimeTrace":
+            return self.ctx.trace.y_label
         mode = self._friendly_mode_name(self._current_data_mode()) if hasattr(self, "mode_combo") else self.ctx.trace.mode
         if mode == "contrast":
             return "Contrast [a.u.]"
@@ -9925,7 +10339,7 @@ class SmartFitterMainWindow(QMainWindow):
 
     def _scan_colorbar_label(self, detector_id: str, observable: str) -> str:
         """Return a colorbar label that remains legible in stacked maps."""
-        if getattr(self, "_dual_map_stacked", False):
+        if getattr(self, "_dual_map_stacked", False) or self.map_compare_view_combo.currentText() == "Maps + overlay":
             # The detector is already identified by the map title.  Omitting
             # it from the vertical colorbar label prevents the two long
             # labels from colliding in the narrow stacked export layout.
@@ -10008,6 +10422,15 @@ class SmartFitterMainWindow(QMainWindow):
                 legend_kwargs["title"] = style.title
             if style.custom_anchor:
                 legend_kwargs["bbox_to_anchor"] = (style.anchor_x, style.anchor_y)
+            elif self._map_overlay_ax is not None and style.location in {"best", "upper right"}:
+                legend_kwargs.update(loc="lower center", bbox_to_anchor=(0.5, 0.015),
+                                     bbox_transform=self.fig.transFigure, ncol=2,
+                                     fontsize=max(6.0, min(style.font_size, 8.0)))
+            elif self._map_overlay_data is not None and not style.custom_anchor:
+                width_px = self.ax_main.get_position().width * self.fig.get_figwidth() * self.fig.dpi
+                label_chars = max(len(label) for label in labels)
+                fit_font = (width_px - 25) * 72 / (self.fig.dpi * max(label_chars, 1) * 0.6)
+                legend_kwargs["fontsize"] = max(6.0, min(legend_kwargs["fontsize"], fit_font))
             legend = self.ax_main.legend(
                 handles,
                 labels,
@@ -10038,6 +10461,7 @@ class SmartFitterMainWindow(QMainWindow):
             self._scan_colorbar_ax,
             self._detector_compare_ax,
             self._detector_compare_colorbar_ax,
+            self._map_overlay_ax,
         ]
         for ax in axes:
             if ax is None or not ax.get_visible():
@@ -10074,6 +10498,8 @@ class SmartFitterMainWindow(QMainWindow):
             axes["detector_compare"] = self._detector_compare_ax
         if self._detector_compare_colorbar_ax is not None and self._detector_compare_colorbar_ax.get_visible():
             axes["detector_compare_colorbar"] = self._detector_compare_colorbar_ax
+        if self._map_overlay_ax is not None and self._map_overlay_ax.get_visible():
+            axes["map_overlay"] = self._map_overlay_ax
         return axes
 
     def _presentation_axis_text(self, role: str, key: str) -> str:
@@ -10091,6 +10517,9 @@ class SmartFitterMainWindow(QMainWindow):
     def _apply_axis_presentation(self, ax, role: str) -> None:
         style = self.presentation_state.axis(role)
         scale = float(getattr(self, "_plot_scale", 1.0))
+        if self._map_overlay_ax is not None:
+            width_px = self.fig.get_figwidth() * self.fig.dpi
+            scale *= 0.65 if width_px < 520 else (0.75 if width_px < 1000 else 0.9)
         generated_title = ax.get_title()
         generated_xlabel = ax.get_xlabel()
         generated_ylabel = ax.get_ylabel()
@@ -10287,6 +10716,16 @@ class SmartFitterMainWindow(QMainWindow):
         self._plot_annotation_artist = None
         self._detail_axis_role = "residual"
         is_scan2d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan2d")
+        if is_scan2d and self.map_compare_view_combo.currentText() in {"RGB overlay", "Maps + overlay"}:
+            secondary = self._canonical_scan_traces()[1]
+            if secondary is None or secondary.scan_dim != "scan2d":
+                # Loading/removing files rebuilds the source picker with its
+                # signals blocked. Do not leave a selected overlay mode when
+                # its second map has disappeared.
+                self.map_compare_view_combo.blockSignals(True)
+                self.map_compare_view_combo.setCurrentText("Separate maps")
+                self.map_compare_view_combo.blockSignals(False)
+                self._map_overlay_return_state = None
         view_state = self._capture_view_state() if (not self._is_loading and not is_scan2d and not self._overlay_view_dirty) else None
         self._apply_plot_controls_to_state()
         self._clear_secondary_axis()
@@ -10306,6 +10745,8 @@ class SmartFitterMainWindow(QMainWindow):
                 return
             _x_centers, _y_centers, display_z, display_x_label, display_y_label = display
             display_z, display_observable_label = self._spot_map_for_display(plot_trace, display_z)
+            if display_observable_label in {"Signal", "Reference", "Difference"}:
+                display_observable_label += f" [{(plot_trace.metadata or {}).get('value_unit', 'counts')}]"
             x_edges, y_edges, extent = scan_extent
             xmin, xmax, ymin, ymax = extent
             data_aspect, box_aspect = self._scan2d_geometry(x_edges, y_edges)
@@ -10316,13 +10757,62 @@ class SmartFitterMainWindow(QMainWindow):
             compare_observable_label = self._current_observable_label()
             if compare_display is not None and compare_trace is not None:
                 compare_z, compare_observable_label = self._spot_map_for_display(compare_trace, compare_display[2])
+                if compare_observable_label in {"Signal", "Reference", "Difference"}:
+                    compare_observable_label += f" [{(compare_trace.metadata or {}).get('value_unit', 'counts')}]"
                 compare_display = (
                     compare_display[0], compare_display[1], compare_z, compare_display[3], compare_display[4]
                 )
+                if axis_key(compare_display[3]) == axis_key(display_y_label) and axis_key(compare_display[4]) == axis_key(display_x_label):
+                    compare_display = (compare_display[1], compare_display[0], compare_display[2].T, compare_display[4], compare_display[3])
+                compare_edges_x, compare_edges_y = self._scan2d_axis_edges(compare_display[0]), self._scan2d_axis_edges(compare_display[1])
+                xmin, xmax = min(xmin, float(np.min(compare_edges_x))), max(xmax, float(np.max(compare_edges_x)))
+                ymin, ymax = min(ymin, float(np.min(compare_edges_y))), max(ymax, float(np.max(compare_edges_y)))
+                if not (np.array_equal(np.sort(display[0]), np.sort(compare_display[0])) and np.array_equal(np.sort(display[1]), np.sort(compare_display[1]))):
+                    self.scan_pixel_geometry_combo.blockSignals(True)
+                    self.scan_pixel_geometry_combo.setCurrentText("Physical pixel size")
+                    self.scan_pixel_geometry_combo.blockSignals(False)
+                    data_aspect, box_aspect = 1.0, (xmax - xmin) / (ymax - ymin)
+            overlay = None
+            overlay_view = self.map_compare_view_combo.currentText()
+            if compare_display is not None and self.scan_compare_scale_combo.currentText() == "Shared":
+                if display_observable_label != compare_observable_label or (plot_trace.metadata or {}).get("value_unit") != (compare_trace.metadata or {}).get("value_unit"):
+                    self.scan_compare_scale_combo.blockSignals(True)
+                    self.scan_compare_scale_combo.setCurrentText("Independent")
+                    self.scan_compare_scale_combo.blockSignals(False)
+                    self.statusBar().showMessage("Shared normalization requires matching observables and recorded units; using Independent.", 7000)
+            if compare_display is not None and overlay_view in {"RGB overlay", "Maps + overlay"}:
+                try:
+                    overlay = build_map_overlay(
+                        (display[0], display[1], display_z), compare_display[:3],
+                        shared=self.scan_compare_scale_combo.currentText() == "Shared",
+                        background_percentile=self.map_overlay_background_spin.value(),
+                        palette=self.map_overlay_palette_combo.currentText(),
+                    )
+                except ValueError as exc:
+                    self.statusBar().showMessage(str(exc), 7000)
+                if overlay is not None:
+                    self._map_overlay_data = overlay
+                    self._map_comparison_export = {
+                        "view": overlay_view, "palette": self.map_overlay_palette_combo.currentText(),
+                        "normalization": self.scan_compare_scale_combo.currentText(),
+                        "background_percentile": self.map_overlay_background_spin.value(),
+                        "ranges": [list(values) for values in overlay.ranges],
+                        "sources": [{"path": trace.source_path, "detector_id": trace.detector_id, "observable": trace.mode} for trace in (plot_trace, compare_trace)],
+                        "display_observables": [display_observable_label, compare_observable_label],
+                        "display_axes": [display_x_label, display_y_label],
+                        "grid_method": "native pixel rectangles split at common boundaries; no interpolation or extrapolation",
+                    }
+            only_overlay = overlay is not None and overlay_view == "RGB overlay"
+            if overlay is not None:
+                xmin, xmax, ymin, ymax = float(overlay.x_edges[0]), float(overlay.x_edges[-1]), float(overlay.y_edges[0]), float(overlay.y_edges[-1])
+            if only_overlay:
+                x_edges, y_edges = overlay.x_edges, overlay.y_edges
+                xmin, xmax, ymin, ymax = float(x_edges[0]), float(x_edges[-1]), float(y_edges[0]), float(y_edges[-1])
+                data_aspect, box_aspect = self._scan2d_geometry(x_edges, y_edges)
             if linecut is not None:
                 self._detail_axis_role = "linecut"
-            if compare_display is not None:
-                self._configure_scan2d_comparison_layout(show_linecut=linecut is not None, box_aspect=box_aspect)
+            if compare_display is not None and not only_overlay:
+                self._configure_scan2d_comparison_layout(show_linecut=linecut is not None, box_aspect=box_aspect, show_overlay=overlay is not None)
             else:
                 self._configure_scan2d_layout(show_linecut=linecut is not None, box_aspect=box_aspect)
             if compare_display is not None and self.scan_compare_scale_combo.currentText() == "Shared":
@@ -10347,21 +10837,29 @@ class SmartFitterMainWindow(QMainWindow):
                     )
                 else:
                     compare_low, compare_high = low, high
-            mesh = self.ax_main.pcolormesh(
-                x_edges, y_edges, display_z, shading="flat",
-                cmap=self._scan_colormap_name(), vmin=low, vmax=high,
-            )
+            if only_overlay:
+                mesh = self.ax_main.pcolormesh(x_edges, y_edges, overlay.rgba, shading="flat")
+            else:
+                mesh = self.ax_main.pcolormesh(
+                    x_edges, y_edges, display_z, shading="flat",
+                    cmap=self._scan_colormap_name(), vmin=low, vmax=high,
+                )
             # Both geometry modes preserve pixels. Physical mode uses the
             # scan-axis spacing; square mode scales the two data dimensions so
             # one sampled cell has equal screen width and height.
             self.ax_main.set_aspect(data_aspect, adjustable="box")
             self.ax_main.set_xlabel(self._friendly_axis_label(display_x_label))
             self.ax_main.set_ylabel(self._friendly_axis_label(display_y_label))
-            self.ax_main.set_title(self._detector_label(plot_trace.detector_id))
-            self._scan_colorbar = self.fig.colorbar(mesh, cax=self._scan_colorbar_ax)
-            self._scan_colorbar.set_label(
-                self._scan_colorbar_label(plot_trace.detector_id, display_observable_label)
-            )
+            self.ax_main.set_title(self._map_source_label(plot_trace, compare_trace))
+            if only_overlay:
+                self._scan_colorbar_ax.remove()
+                self._scan_colorbar_ax = None
+                self._label_map_overlay(self.ax_main, plot_trace, compare_trace)
+            else:
+                self._scan_colorbar = self.fig.colorbar(mesh, cax=self._scan_colorbar_ax)
+                self._scan_colorbar.set_label(
+                    self._scan_colorbar_label(plot_trace.detector_id, display_observable_label)
+                )
             self._draw_scan_spot_overlays(self.ax_main, plot_trace.detector_id)
             if compare_display is not None and compare_trace is not None and self._detector_compare_ax is not None:
                 compare_x, compare_y, compare_z, compare_x_label, compare_y_label = compare_display
@@ -10378,13 +10876,20 @@ class SmartFitterMainWindow(QMainWindow):
                 )
                 self._detector_compare_ax.set_xlabel(self._friendly_axis_label(compare_x_label))
                 self._detector_compare_ax.set_ylabel(self._friendly_axis_label(compare_y_label))
-                self._detector_compare_ax.set_title(self._detector_label(compare_trace.detector_id))
+                self._detector_compare_ax.set_title(self._map_source_label(compare_trace, plot_trace))
                 self._detector_compare_ax.set_aspect(data_aspect, adjustable="box")
                 self._detector_compare_colorbar = self.fig.colorbar(compare_mesh, cax=self._detector_compare_colorbar_ax)
                 self._detector_compare_colorbar.set_label(
                     self._scan_colorbar_label(compare_trace.detector_id, compare_observable_label)
                 )
-                self._draw_scan_spot_overlays(self._detector_compare_ax, compare_trace.detector_id)
+                if compare_trace.source_path == self.ctx.trace.source_path:
+                    self._draw_scan_spot_overlays(self._detector_compare_ax, compare_trace.detector_id)
+            if overlay is not None and self._map_overlay_ax is not None:
+                self._map_overlay_ax.pcolormesh(overlay.x_edges, overlay.y_edges, overlay.rgba, shading="flat")
+                self._map_overlay_ax.set_aspect(data_aspect, adjustable="box")
+                self._map_overlay_ax.set_xlabel(self._friendly_axis_label(display_x_label))
+                self._map_overlay_ax.set_ylabel(self._friendly_axis_label(display_y_label))
+                self._label_map_overlay(self._map_overlay_ax, plot_trace, compare_trace)
             self._update_scan_summary()
             if self._scan_cursor is not None:
                 cx, cy = self._scan_cursor
@@ -10403,6 +10908,9 @@ class SmartFitterMainWindow(QMainWindow):
             if self._detector_compare_ax is not None:
                 self._detector_compare_ax.set_xlim(*view_xlim)
                 self._detector_compare_ax.set_ylim(*view_ylim)
+            if self._map_overlay_ax is not None:
+                self._map_overlay_ax.set_xlim(*view_xlim)
+                self._map_overlay_ax.set_ylim(*view_ylim)
             self._update_scan_view_fields(view_xlim, view_ylim)
             self.ax_res.set_visible(linecut is not None)
             if linecut is not None:
@@ -10490,6 +10998,7 @@ class SmartFitterMainWindow(QMainWindow):
                 primary_series.append(np.asarray(ysm_disp, dtype=float))
                 self._plot_series(self.ax_main, self.ctx.x, ysm_disp, self._legend_label("Smoothed", "Smooth"), role="smoothed", series_id="smoothed")
             self._draw_selected_1d_markers(primary_series)
+            self._draw_time_trace_events()
             self.ax_main.set_xlabel(self._friendly_axis_label(self.ctx.trace.x_label if self.ctx.trace else "X"))
             self.ax_main.set_ylabel(y_lab)
             if self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d":
@@ -10500,7 +11009,7 @@ class SmartFitterMainWindow(QMainWindow):
             self._apply_combined_legend()
             self._update_scan_summary()
             is_scan1d = bool(self.ctx.trace is not None and self.ctx.trace.scan_dim == "scan1d")
-            show_detail = bool(self.plot_opts.show_fft_panel and not is_scan1d)
+            show_detail = bool(self.plot_opts.show_fft_panel and not is_scan1d and self.ctx.trace.experiment_type != "TimeTrace")
             self.ax_res.set_visible(show_detail)
             self._configure_1d_layout(show_detail)
             if show_detail:
@@ -10531,7 +11040,27 @@ class SmartFitterMainWindow(QMainWindow):
         self._overlay_view_dirty = False
         self._refresh_open_plot_editor()
 
+    def _draw_time_trace_events(self) -> None:
+        trace = self.ctx.trace
+        if trace is None or trace.experiment_type != "TimeTrace" or not self.quick_time_events_btn.isChecked():
+            return
+        events = dict((trace.metadata or {}).get("time_trace") or {}).get("events") or []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            times = event.get("elapsedSeconds") or []
+            if len(times) < 2 or not np.all(np.isfinite(times[:2])):
+                continue
+            start, end = max(float(times[0]), float(np.min(trace.x_ns))), min(float(times[1]), float(np.max(trace.x_ns)))
+            if end < start:
+                continue
+            self.ax_main.axvspan(start, end, color="#e0a458", alpha=0.18, label="_time_event")
+            self.ax_main.text((start + end) / 2, 0.98, str(event.get("type", "Event")), transform=self.ax_main.get_xaxis_transform(), ha="center", va="top", fontsize=8, rotation=90)
+
     def on_fft(self):
+        if self.ctx.trace is not None and self.ctx.trace.experiment_type == "TimeTrace":
+            self._message("FFT unavailable", "Time traces use measured midpoint timestamps. A regular FFT would assume uniform sampling and report incorrect frequencies.")
+            return
         if self.ctx.x is None or self.ctx.y is None:
             return
         y_use = (
@@ -10765,6 +11294,7 @@ class SmartFitterMainWindow(QMainWindow):
         is_ramsey_auto = (model_name == "RamseyAuto")
         
         fit_config = {
+            "gaussian_peak_count": self.gaussian_peak_count_spin.value(),
             "multistart": int(self.multistart_spin.value()),
             "rabi_use_sem": self.rabi_sem_weight_chk.isChecked(),
             "rabi_pi_lock": self.rabi_pi_lock_chk.isChecked(),
@@ -10859,6 +11389,8 @@ class SmartFitterMainWindow(QMainWindow):
             "baseline": self.baseline_combo.currentText(),
             "data_digest": digest.hexdigest(),
         }
+        if model_name == "GaussianPeaks":
+            payload["gaussian_peak_count"] = self.gaussian_peak_count_spin.value()
         return state_signature(payload)
 
     def _current_fit_signature(self) -> str | None:
@@ -10988,6 +11520,8 @@ class SmartFitterMainWindow(QMainWindow):
             self._message("Overlay files added", f"Loaded {Path(primary).name} and added {added} extra dropped file(s) as overlays.")
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is getattr(self, "plot_column", None) and event.type() == QEvent.Resize:
+            self._relayout_plot_quick_toolbar()
         if watched not in {self, self.centralWidget()}:
             return super().eventFilter(watched, event)
         if event.type() == QEvent.DragEnter:
@@ -11144,6 +11678,8 @@ class SmartFitterMainWindow(QMainWindow):
             lines.append(f"Optimizer: {result.message}")
         if result.selection_note:
             lines.append(f"Selection: {result.selection_note}")
+        for peak, width in result.extras.get("peak_fwhm", {}).items():
+            lines.append(f"{peak} FWHM: {width:.6g} axis units")
         if self.ctx.trace is not None:
             snapshot_lines = self._snapshot_summary_lines(self.ctx.trace.metadata if self.ctx.trace.metadata is not None else {})
             if snapshot_lines:
@@ -11252,6 +11788,7 @@ class SmartFitterMainWindow(QMainWindow):
             x,
             y,
             config=FitWorkflowConfig(
+                gaussian_peak_count=int(config.get("gaussian_peak_count", 1)),
                 multistart=n_starts,
                 rabi_use_sem=bool(config.get("rabi_use_sem", True)),
                 rabi_pi_lock=bool(config["rabi_pi_lock"]),
@@ -11413,7 +11950,11 @@ class SmartFitterMainWindow(QMainWindow):
                 self._plot_series(self.ax_main, tx, ty_disp, self._legend_label(f"Overlay:{nm}", f"Ov:{nm}"), role="overlay", series_id=overlay_id, alpha=0.5)
         if self.plot_opts.show_fit:
             primary_series.append(np.asarray(yfit_disp, dtype=float))
-            self._plot_series(self.ax_main, x, yfit_disp, self._legend_label(f"Fit: {fit_result.model_name}", fit_result.model_name), role="fit", series_id="fit")
+            curve_x, curve_y = x, yfit_disp
+            if fit_result.model_name == "GaussianPeaks" and not self.ctx.analysis_steps:
+                curve_x = np.linspace(float(np.min(x)), float(np.max(x)), max(400, len(x)))
+                curve_y, _ = self._display_y(MODEL_REGISTRY["GaussianPeaks"](curve_x, *fit_result.params))
+            self._plot_series(self.ax_main, curve_x, curve_y, self._legend_label(f"Fit: {fit_result.model_name}", fit_result.model_name), role="fit", series_id="fit")
             self._plot_rabi_envelope(self.ax_main, x, fit_result, primary_series)
             # Confidence band (±1σ from parameter errors)
             if self.plot_opts.show_confidence and fit_result.errors is not None:
@@ -11464,6 +12005,7 @@ class SmartFitterMainWindow(QMainWindow):
             self._draw_selected_secondary_markers()
         self._set_axis_ylim_from_series(self.ax_main, primary_series)
         self.ax_main.grid(True, alpha=0.3)
+        self._draw_time_trace_events()
         self._draw_plot_annotation(fit_result)
         self._apply_combined_legend()
         detector_title = (
@@ -11475,10 +12017,11 @@ class SmartFitterMainWindow(QMainWindow):
 
         fit_target = self.ctx.fit_target if self.ctx.fit_target is not None else raw_y
         residual = fit_target - fit_result.y_fit
-        show_detail = bool((self.plot_opts.show_residual or self.plot_opts.show_fft_panel) and not self.ctx.analysis_steps)
+        fft_allowed = self.ctx.trace.experiment_type != "TimeTrace"
+        show_detail = bool((self.plot_opts.show_residual or (self.plot_opts.show_fft_panel and fft_allowed)) and not self.ctx.analysis_steps)
         self.ax_res.set_visible(show_detail)
         self._configure_1d_layout(show_detail)
-        if show_detail and self.plot_opts.show_fft_panel:
+        if show_detail and self.plot_opts.show_fft_panel and fft_allowed:
             y_fft = y_raw
             if len(x) > 3:
                 dt = float(np.median(np.diff(x)))
@@ -11504,6 +12047,43 @@ class SmartFitterMainWindow(QMainWindow):
         self.canvas.draw_idle()
         self._overlay_view_dirty = False
         self._refresh_open_plot_editor()
+
+    def _write_time_trace_export(self, out: Path, stem: str) -> Path:
+        path = out / f"{stem}__time_trace.csv"
+        traces = self._primary_dataset.detectors.values() if self._primary_dataset is not None else [self.ctx.trace]
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["source_file", "detector_id", "source_point_index", "elapsed_s", "reference", "signal", "contrast", "difference", "scheduled_start_s", "lateness_s", "retries", "n_points", "recorded_units"])
+            for trace in traces:
+                timing = dict((trace.metadata or {}).get("time_trace") or {})
+                reference_only = bool((trace.metadata or {}).get("reference_only"))
+                indices = (trace.metadata or {}).get("source_point_indices") or list(range(len(trace.x_ns)))
+                def value(values, index):
+                    return values[index] if index < len(values) and np.isfinite(values[index]) else ""
+                for index, time in enumerate(trace.x_ns):
+                    ref, sig = trace.reference[index], trace.signal[index]
+                    contrast = (ref - sig) / ref if np.isfinite(sig) and ref != 0 else np.nan
+                    writer.writerow([
+                        trace.source_path, trace.detector_id, indices[index], time, value(trace.reference, index),
+                        "" if reference_only else value(trace.signal, index), "" if reference_only or not np.isfinite(contrast) else contrast,
+                        "" if reference_only else ref - sig,
+                        value(timing.get("scheduledSeconds") or [], index), value(timing.get("latenessSeconds") or [], index),
+                        value(timing.get("failedPoints") or [], index), value(timing.get("nPoints") or [], index),
+                        (trace.metadata or {}).get("value_unit", "counts"),
+                    ])
+        return path
+
+    def _write_map_comparison_export(self, out: Path, stem: str) -> Path:
+        path = out / f"{stem}__map_comparison.csv"
+        overlay = self._map_overlay_data
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["x_low", "x_high", "y_low", "y_high", "primary_recorded", "secondary_recorded", "red", "green", "blue", "coverage"])
+            for row, col in np.ndindex(overlay.primary.shape):
+                first, second = overlay.primary[row, col], overlay.secondary[row, col]
+                writer.writerow([overlay.x_edges[col], overlay.x_edges[col + 1], overlay.y_edges[row], overlay.y_edges[row + 1],
+                                 first if np.isfinite(first) else "", second if np.isfinite(second) else "", *overlay.rgba[row, col]])
+        return path
 
     def on_save_results(self):
         if self.ctx.trace is None or self.ctx.x is None or self.ctx.y is None:
@@ -11677,6 +12257,10 @@ class SmartFitterMainWindow(QMainWindow):
                 for k, v in provenance.items():
                     writer.writerow([f"provenance:{k}", json.dumps(v) if isinstance(v, (list, dict)) else v])
             saved_paths.append(csv_path)
+        if self.ctx.trace.experiment_type == "TimeTrace" and (self.exp_csv_chk.isChecked() or self.exp_origin_chk.isChecked()):
+            saved_paths.append(self._write_time_trace_export(out, base_stem))
+        if self._map_overlay_data is not None and self.exp_origin_chk.isChecked():
+            saved_paths.append(self._write_map_comparison_export(out, base_stem))
 
             if any(self._scan_spot_results.values()):
                 spot_csv_path = out / f"{base_stem}__spots.csv"

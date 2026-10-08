@@ -111,6 +111,14 @@ Basic GUI workflow:
 - Use `File > Save Analysis Session...` to resume a named analysis later, including overlays, masks, transforms, locks, plot/map state, detector scope, and still-valid per-detector fit results
 - For 2D scans, use the labeled `Map controls` inspector beside the plot to change colormap, percentiles or exact color limits, type X/Y bounds, pan, box-zoom, wheel-zoom, reset the view, swap X/Y, or toggle equal physical axis scaling; axis swapping and equal physical scaling are on by default
 - In a dual 2D comparison, the synchronized maps have separate colorbars and independent ranges by default. Select `Shared` only when one common color range is desired; manual limits are remembered per detector.
+- Click `2D overlay` above a map for a pink/teal comparison; click it again to restore the previous layout, sources, and zoom. `Map > Compare with` chooses the other detector or a detector from another loaded file on the same plane. `View` offers RGB overlay, Maps + overlay, Separate maps, and Single map. Turn `Detectors` off or click `Primary only` to return to the active detector alone.
+- Overlay colors include pink/teal, green/magenta, and red/cyan. Independent ranges normalize each map separately; Shared uses one recorded-value scale for matching observables/units. Overlay background subtracts the selected percentile (default 10%). Normalization and color/source assignments are labeled on the plot.
+- Map comparisons preserve recorded coordinates and missing coverage, including different resolutions, descending axes, and opposite stored axis orders. Different grids use physical scaling and native pixel rectangles; they are not stretched to the same image size.
+- Time-trace files load as `Time trace` under Auto, including fixed-frequency ODMR, fixed-duration Rabi/DD, and RF-free fluorescence. The axis and ROI are elapsed seconds at measured midpoints, relative to the first midpoint. Cadence is not used to reconstruct timestamps or rescale intensities.
+- Reference-only fluorescence automatically uses Reference; signal, contrast, and difference are unavailable. Both recorded detector streams remain selectable/comparable, with recorded counts or counts/s preserved. Successful acquisition retries are retained.
+- `Events` shows saved optimization/pause intervals; inspecting a sample shows scheduled start, lateness, and retries. File details retain source-sequence/fixed-value and timing context. Time traces can overlay other time traces, but do not share an axis with pulse-duration or spatial scans.
+- Optional `TimeTraceDecay` fits background + amplitude * exp(-elapsed_s / tau_s); tau_s is a descriptive drift/bleaching time in seconds. FFT is unavailable for measured time traces. Batch Auto plots time traces; choose TimeTraceDecay explicitly to fit them.
+- CSV export adds `<name>__time_trace.csv` with both detectors, original sample indices, elapsed seconds, recorded values, units, and timing diagnostics. Scheduled starts refer to trace start; elapsed times/events refer to the first midpoint. Origin bundle adds `<name>__map_comparison.csv` for RGB comparisons. Sessions retain event visibility and map-comparison choices; JSON retains numeric timing/events and map sources/normalization.
 - For an XY scan, open `Map > Fluorescent spots` and choose `Detect and fit`. The tool estimates a local background, detects bright and/or dark departures, and fits a rotated elliptical Gaussian to each object. The table reports physical X/Y center coordinates, half-maximum major/minor radii, angle, and R-squared; hover a row for contrast, SNR, and axis ratio. `Copy spot table` puts a compact, tab-separated and PowerPoint-friendly table on the clipboard while file exports retain the complete machine-readable table.
 - `Auto fluorescence` uses the raw Signal map when it contains structure, even if Contrast is flat. `Display analyzed source` shows the map actually used by the fit. `Show fitted shapes` toggles the ellipses and centers, while `Show numbers` controls labels. With `Apply to: Both detectors`, each detector is characterized independently and both overlays/results are retained.
 - Select one or more rows in the spot table to remove false positives or keep only the selected objects. `Restore removed` and Ctrl+Z restore the previous list. `Compare detector spots` reports the physical center offset, radius/orientation and amplitude ratios, plus local profile correlation, and highlights the compared pair on both detector maps.
@@ -208,3 +216,11 @@ Fits look wrong
 - Try `contrast` mode first
 - Reduce smoothing or tighten the ROI
 - For folders of files, try batch mode with `--robust`
+
+Fluorescence peaks in 1D spatial scans
+- In the model inspector, choose GaussianPeaks and set Number of peaks (1-8).
+- Choose the fluorescence observable (Reference or Signal), set the fit ROI if
+  needed, then Run Fit. Each peak is a positive Gaussian on a shared constant
+  background. Centers, sigma widths, and FWHM use the scan axis units.
+- Peak count is saved with sessions and presets. Use one peak unless the data
+  support additional components; a fitted component is not proof of a separate emitter.

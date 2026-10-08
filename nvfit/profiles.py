@@ -13,6 +13,7 @@ ProfileName = Literal[
     "ODMR",
     "LineScan",
     "Scan2D",
+    "TimeTrace",
     "DEERFrequency",
     "DEERDuration",
     "DEERDecay",
@@ -34,6 +35,12 @@ class FitProfile:
 
 
 PROFILES: dict[ProfileName, FitProfile] = {
+    "TimeTrace": FitProfile(
+        name="TimeTrace", mode="contrast", bin_size=1, smooth_window=1,
+        roi_head_fraction=None, candidate_models=("TimeTraceDecay",), r2_min=0.60,
+        max_bound_hits=2,
+        notes="Measured midpoint time in seconds. Optional exponential drift/bleaching fit; fluorescence uses reference only.",
+    ),
     "Ramsey": FitProfile(
         name="Ramsey",
         mode="contrast",
@@ -106,10 +113,10 @@ PROFILES: dict[ProfileName, FitProfile] = {
         bin_size=1,
         smooth_window=1,
         roi_head_fraction=None,
-        candidate_models=("SpinEcho",),
+        candidate_models=("GaussianPeaks",),
         r2_min=0.60,
         max_bound_hits=4,
-        notes="Fallback profile for unknown experiments.",
+        notes="Fit one or more Gaussian fluorescence peaks; widths use the scan axis units.",
     ),
     "Scan2D": FitProfile(
         name="Scan2D",

@@ -5,3 +5,8 @@ h5py
 PySide6
 qtawesome
 pytest
+plotly
+pywebview
+pillow
+svglib
+reportlab

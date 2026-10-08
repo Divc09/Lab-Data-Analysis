@@ -141,6 +141,8 @@ def infer_experiment_type(
     parameter_l = parameter.lower()
     identifier_l = identifier.lower()
     combined = " ".join([fn, notes_l, parameter_l, identifier_l, *scan_types_l])
+    if "elapsed time" in combined or "time trace" in combined or "time_trace" in combined:
+        return "TimeTrace"
     dd_keywords = ("xy8", "cpmg", "dynamic decoupling", "dynamical decoupling")
     stage_keywords = ("stage x", "stage y", "stage z", "stage_x", "stage_y", "stage_z")
 
@@ -380,7 +382,7 @@ def _finalize_trace(
             valid_iters_use = None
     elif has_stage_axes == 1 or (_plot_only_scan_type(experiment_type) and len(scan_vectors) >= 1):
         scan_dim = "scan1d"
-        fit_allowed = False
+        fit_allowed = experiment_type == "LineScan"
         if scan_vectors:
             ax = scan_vectors[0]
             L1 = min(len(ax), len(y), len(signal), len(reference))
@@ -395,6 +397,8 @@ def _finalize_trace(
         experiment_type = "Scan2D"
 
     metadata_out = dict(metadata or {})
+    if experiment_type == "TimeTrace":
+        fit_allowed = len(x_ns) > 3
     metadata_out.setdefault("x_min_ns", float(np.min(x_ns)))
     metadata_out.setdefault("x_max_ns", float(np.max(x_ns)))
     return ExperimentTrace(
@@ -577,6 +581,16 @@ def _parse_extended_sequence_metadata(file_name: str, notes: str, params: object
             if value is not None and key not in metadata:
                 metadata[key] = int(round(value)) if key == "dd_pulse_count" else value
 
+    if params is not None:
+        # An explicit pulse count is more reliable than a filename suffix.
+        # In XY8-m, m is a cycle count, so the refocusing count is 8*m.
+        count = _safe_float_attr(params, "nPiPulses")
+        nxy = _safe_float_attr(params, "nXY")
+        sets = _safe_float_attr(params, "setsXYN")
+        if count is None and nxy is not None and sets is not None:
+            count = nxy * sets
+        if count is not None and np.isfinite(count) and count > 0 and float(count).is_integer():
+            metadata["dd_pulse_count"] = int(count)
     return metadata
 
 
@@ -786,6 +800,14 @@ def _physical_dd_axis_if_needed(
     if exp_type != "DynamicDecoupling":
         return axis, x_label
     dd_pulse_count = metadata.get("dd_pulse_count")
+    label = x_label.lower()
+    if "total evolution" in label or "pulse width" in label:
+        return axis, x_label
+    if "pulse-center spacing" in label or "cpmg tau" in label:
+        if dd_pulse_count is None:
+            return axis, x_label
+        metadata["dd_axis_transform"] = "dd_pulse_count * programmed pulse-center spacing"
+        return float(dd_pulse_count) * np.asarray(axis, dtype=float), "Total evolution time (ns)"
     reduced_tau_half = metadata.get("reduced_tau_by_two_time_ns")
     if dd_pulse_count is None or reduced_tau_half is None:
         return axis, x_label
@@ -867,6 +889,10 @@ def _extract_snapshot_metadata(raw: dict[str, Any]) -> dict[str, object]:
 
     if params is not None:
         detector_mode = _safe_text_attr(params, "detectorMode")
+        per_second = _safe_int_attr(params, "perSecond")
+        if per_second is not None:
+            metadata["per_second"] = bool(per_second)
+            metadata["value_unit"] = "counts/s" if per_second else "counts"
         if detector_mode:
             metadata["detector_mode"] = detector_mode.lower()
         for attr_name, key in (
@@ -1023,6 +1049,157 @@ def _snapshot_acquired_cell_count(data: object) -> int:
     return count
 
 
+def _is_time_trace_snapshot(raw: dict[str, Any]) -> bool:
+    data, meta, params, scan = (raw.get(key) for key in ("Data", "metadata", "params", "scanInfo"))
+    scan_mode = _safe_text_attr(params, "scanMode").lower()
+    scans = _as_snapshot_scan_list(scan)
+    axes = tuple(_safe_text_attr(entry, "parameter").lower() for entry in scans)
+    elapsed_axis = any("elapsed time" in axis for axis in axes)
+    # A reused MATLAB experiment can retain Data.timeTrace after switching back
+    # to a stage/parameter scan. The current scan declaration is authoritative.
+    if not elapsed_axis and (scan_mode == "parameter" or len(scans) > 1 or _stage_axis_count(axes)):
+        return False
+    return bool(
+        hasattr(data, "timeTrace") or hasattr(meta, "timeTrace")
+        or scan_mode == "time" or elapsed_axis
+    )
+
+
+def _time_trace_numeric(obj: object, field: str) -> np.ndarray:
+    try:
+        return np.asarray(getattr(obj, field, []), dtype=float).ravel()
+    except (TypeError, ValueError):
+        return np.array([], dtype=float)
+
+
+def _time_trace_saved_value(value: object) -> object:
+    """Keep portable metadata without trying to decode MATLAB MCOS datetimes."""
+    if hasattr(value, "_fieldnames"):
+        return {key: _time_trace_saved_value(getattr(value, key)) for key in value._fieldnames}
+    if isinstance(value, np.ndarray):
+        if value.dtype.names:
+            return {"storage": "MATLAB object; retained in the source MAT file"}
+        return [_time_trace_saved_value(item) for item in value.ravel()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _load_time_trace_snapshot(
+    mat_path: Path, raw: dict[str, Any], mode: DataMode, detector_id: str,
+) -> ExperimentTrace:
+    stored_data = raw["Data"]
+    params, scan, meta = (raw.get(key) for key in ("params", "scanInfo", "metadata"))
+    timing = getattr(stored_data, "timeTrace", None)
+    saved_timing = getattr(meta, "timeTrace", None)
+    source = _safe_text_attr(timing, "sourceExperiment") or _safe_text_attr(saved_timing, "sourceExperiment")
+    reference_only = bool(_safe_int_attr(params, "referenceOnly")) or source.lower() == "fluorescencetrace"
+    requested_mode = mode
+    if reference_only:
+        mode = "reference"
+
+    # Cadence, bounds and stepSize describe scheduling. They cannot recover the
+    # measured midpoint axis, particularly after retries or stage optimization.
+    x = _time_trace_numeric(timing, "elapsedSeconds")
+    axis_source = "Data.timeTrace.elapsedSeconds"
+    if not x.size:
+        x = _time_trace_numeric(scan, "points")
+        axis_source = "scanInfo.points"
+    root_analysis = raw.get("analysis")
+    analysis = getattr(root_analysis, "detector2", None) if detector_id == "detector2" else root_analysis
+    if not x.size:
+        metric = getattr(analysis, "averageReference", None)
+        if "elapsed" in _safe_text_attr(metric, "xLabel").lower():
+            x = _time_trace_numeric(metric, "x")
+            axis_source = "analysis.averageReference.x"
+    if not x.size:
+        raise MatDataError("Time trace has no measured elapsed timestamps or completed samples.", detector_id=detector_id)
+    if not np.all(np.isfinite(x)) or (x.size > 1 and np.any(np.diff(x) <= 0)):
+        raise MatDataError("Time-trace midpoint timestamps must be finite and strictly increasing.", detector_id=detector_id)
+
+    data = _snapshot_detector_data(stored_data, detector_id)
+    values = np.asarray(data.values)
+    n = len(x)
+    if n == 1:
+        cells = [values]
+    elif values.dtype != object and values.ndim == 2 and values.shape[1] == 2:
+        cells = list(values)
+    else:
+        cells = list(values.ravel())
+    if len(cells) < n:
+        raise MatDataError("Time trace has fewer raw measurements than midpoint timestamps.", detector_id=detector_id)
+    reference, signal = np.full(n, np.nan), np.full(n, np.nan)
+    iterations = _time_trace_numeric(stored_data, "iteration")
+    for index, cell in enumerate(cells[:n]):
+        if iterations.size and (index >= iterations.size or not np.isfinite(iterations[index]) or iterations[index] <= 0):
+            continue
+        try:
+            pair = np.asarray(cell, dtype=float).ravel()
+        except (TypeError, ValueError):
+            continue
+        if pair.size:
+            reference[index] = pair[0]
+        if not reference_only and pair.size > 1:
+            signal[index] = pair[1]
+    per_second = bool(_safe_int_attr(params, "perSecond"))
+    units = "counts/s" if per_second else "counts"
+    if reference_only:
+        y, y_label = reference.copy(), f"Fluorescence [{units}]"
+    else:
+        y, y_label = _compose_observable(signal, reference, mode)
+        if mode != "contrast":
+            y_label = f"{mode.title()} [{units}]"
+    keep = np.isfinite(y)
+    indices = np.flatnonzero(keep)
+    metadata = _extract_snapshot_metadata(raw)
+    metadata.update({
+        "is_time_trace": True, "reference_only": reference_only,
+        "available_observables": ["reference"] if reference_only else ["contrast", "signal", "reference", "difference"],
+        "x_unit": "s", "value_unit": units, "per_second": per_second,
+        "time_axis_source": axis_source, "time_origin": "first measurement midpoint",
+        "source_experiment": source or infer_experiment_type(mat_path.name, notes=_safe_text_attr(scan, "notes")),
+        "time_trace_point_count": n, "source_point_indices": indices.tolist(),
+        "acquired_raw_points": len(indices), "complete_iterations": 0,
+        "analysis_source": "raw_time_trace_measurements",
+    })
+    sequence_time = _safe_float_attr(params, "sequenceTimePerDataPoint")
+    if sequence_time is not None:
+        metadata["sequence_time_per_data_point_s"] = sequence_time
+    if requested_mode != mode:
+        metadata["observable_fallback"] = f"{requested_mode} unavailable for reference-only fluorescence; using reference"
+    time_metadata: dict[str, object] = {}
+    for obj in (saved_timing, timing):
+        for name in ("schemaVersion", "sourceExperiment", "sourceScan", "fixedValue", "timing", "durationSeconds", "cadenceSeconds", "checkpointSeconds", "events"):
+            if hasattr(obj, name):
+                time_metadata[name] = _time_trace_saved_value(getattr(obj, name))
+    if isinstance(time_metadata.get("events"), dict):
+        time_metadata["events"] = [time_metadata["events"]]
+    for name, parameter_name in (("timing", "timeTraceTiming"), ("durationSeconds", "timeTraceDurationSeconds"), ("cadenceSeconds", "timeTraceCadenceSeconds"), ("fixedValue", "timeTraceFixedValue")):
+        if name not in time_metadata and hasattr(params, parameter_name):
+            time_metadata[name] = _time_trace_saved_value(getattr(params, parameter_name))
+    for field in ("scheduledSeconds", "latenessSeconds"):
+        array = _time_trace_numeric(timing, field)
+        if array.size >= n:
+            time_metadata[field] = array[:n][keep].tolist()
+    for field in ("failedPoints", "nPoints"):
+        array = _time_trace_numeric(stored_data, field)
+        if array.size >= n:
+            time_metadata[field] = array[:n][keep].tolist()
+    time_metadata["elapsedSeconds"] = x[keep].tolist()
+    time_metadata["scheduledSecondsOrigin"] = "trace start (elapsedSeconds is relative to the first measurement midpoint)"
+    metadata["time_trace"] = time_metadata
+    cadence = np.diff(x[keep])
+    metadata["time_sampling_irregular"] = bool(cadence.size and not np.allclose(cadence, np.median(cadence), rtol=1e-4, atol=1e-9))
+    return _finalize_trace(
+        mat_path=mat_path, experiment_type="TimeTrace", scan_axes=("Elapsed time (s)",),
+        scan_vectors=[x[keep]], x_ns=x[keep], signal=signal[keep], reference=reference[keep],
+        y=y[keep], y_label=y_label, x_label="Elapsed time (s)", mode=mode,
+        raw_x=x[keep], raw_x_label="Elapsed time (s)", metadata=metadata,
+    )
+
+
 def _load_snapshot_run(
     mat_path: Path,
     raw: dict[str, Any],
@@ -1040,6 +1217,9 @@ def _load_snapshot_run(
         else root_analysis
     )
     params = raw.get("params")
+
+    if _is_time_trace_snapshot(raw):
+        return _load_time_trace_snapshot(mat_path, raw, mode, detector_id)
 
     scan_axes, scan_vectors, axis_meta, parameter, identifier, notes = _snapshot_axis_descriptors(scan_info)
     metadata = _extract_snapshot_metadata(raw)

@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 from .fit_engine import FitResult, fit_model_multistart
 from .models import (
+    gaussian_peaks,
+    time_trace_decay,
     build_custom_expression_model,
     odmr_lorentzian,
     odmr_multi_lorentzian,
@@ -37,6 +39,7 @@ LockMap = Mapping[str, tuple[float, bool, float | None, float | None]]
 @dataclass(frozen=True)
 class FitWorkflowConfig:
     multistart: int = 12
+    gaussian_peak_count: int = 1
     rabi_use_sem: bool = True
     rabi_pi_lock: bool = False
     rabi_pi_ns: float = 200.0
@@ -52,6 +55,89 @@ class FitWorkflowConfig:
     t1_model_family: str = "Stretched exponential"
     custom_spec: dict | None = None
     custom_expr: str = ""
+
+
+def _fit_time_trace_decay(x, y, n_starts, locks=None) -> FitResult:
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if len(x) <= 3 or not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+        raise ValueError("Exponential time-trace fitting needs at least four finite samples.")
+    spacing = np.diff(np.unique(x))
+    span, variation = float(np.ptp(x)), float(np.ptp(y))
+    if not spacing.size or variation <= np.finfo(float).eps * max(1.0, float(np.max(np.abs(y)))):
+        raise ValueError("Time-trace fitting needs distinct timestamps and a varying observable.")
+    names = ["background", "amplitude", "tau_s"]
+    lower = [float(np.min(y) - 5 * variation), -10 * variation, float(np.min(spacing)) / 10]
+    upper = [float(np.max(y) + 5 * variation), 10 * variation, 100 * span]
+    seeds = []
+    for tau in np.geomspace(max(lower[2] * 2, span / 20), 5 * span, max(1, n_starts)):
+        design = np.column_stack([np.ones_like(x), np.exp(-x / tau)])
+        background, amplitude = np.linalg.lstsq(design, y, rcond=None)[0]
+        seed = np.array([background, amplitude, tau])
+        _apply_locks(names, lower, upper, seed, locks)
+        seeds.append(seed)
+    result = fit_model_multistart(
+        model_name="TimeTraceDecay", model_func=time_trace_decay, x=x, y=y,
+        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac",
+        selection_note="Descriptive exponential drift/bleaching; tau_s is in seconds, not a spin lifetime",
+    )
+    result.extras["parameter_units"] = {"tau_s": "s"}
+    return result
+
+
+def _fit_gaussian_peaks(x, y, count, n_starts, locks=None) -> FitResult:
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    count = int(count)
+    if not 1 <= count <= 8:
+        raise ValueError("Choose between 1 and 8 Gaussian peaks.")
+    if len(x) <= 1 + 3 * count or not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+        raise ValueError("The fit needs more finite samples than fitted parameters (1 + 3 per peak).")
+    order = np.argsort(x)
+    sx, sy = x[order], y[order]
+    spacing = np.diff(np.unique(sx))
+    if not spacing.size:
+        raise ValueError("Peak fitting needs distinct scan positions.")
+    dx, span = float(np.median(spacing)), float(np.ptp(sx))
+    amplitude = float(np.ptp(sy))
+    if amplitude <= np.finfo(float).eps:
+        raise ValueError("The scan has no variation to fit.")
+    baseline = float(np.percentile(sy, 10))
+    peaks, properties = find_peaks(sy, prominence=0.03 * amplitude, distance=max(1, len(x) // 40))
+    ranked = peaks[np.argsort(properties["prominences"])[::-1]][:count].tolist()
+    # Additional starts can separate overlapping peaks with only one local maximum.
+    for index in np.argsort(sy)[::-1]:
+        if len(ranked) >= count:
+            break
+        if all(abs(sx[index] - sx[other]) >= span / (3 * count) for other in ranked):
+            ranked.append(int(index))
+    if len(ranked) < count:
+        raise ValueError("The selected range cannot resolve the requested number of peaks.")
+    names, seed = ["background"], [baseline]
+    lower, upper = [float(np.min(sy) - amplitude)], [float(np.max(sy) + amplitude)]
+    min_sigma = max(float(np.min(spacing)) / 4, span * 1e-8)
+    for i, index in enumerate(sorted(ranked, key=lambda k: sx[k]), 1):
+        sigma = span / (6 * count)
+        if index in peaks:
+            _, _, left, right = peak_widths(sy, [index], rel_height=0.5)
+            sigma = float(np.diff(np.interp([left[0], right[0]], np.arange(len(sx)), sx))[0]) / 2.354820045
+        names += [f"amplitude_{i}", f"center_{i}", f"sigma_{i}"]
+        seed += [max(float(sy[index] - baseline), amplitude * 0.1), float(sx[index]), max(sigma, dx)]
+        lower += [0.0, float(sx[0]), min_sigma]
+        upper += [5 * amplitude, float(sx[-1]), span]
+    seed = np.asarray(seed)
+    _apply_locks(names, lower, upper, seed, locks)
+    rng = np.random.default_rng(42)
+    seeds = [seed.copy()]
+    scales = np.array([amplitude * 0.05] + [amplitude * 0.1, span / (12 * count), span / (20 * count)] * count)
+    seeds += [seed + rng.normal(size=len(seed)) * scales for _ in range(max(1, n_starts) - 1)]
+    result = fit_model_multistart(
+        model_name="GaussianPeaks", model_func=gaussian_peaks, x=x, y=y,
+        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac",
+        selection_note=f"{count} Gaussian peak(s) on a constant background; centers and widths in scan axis units",
+    )
+    result.extras["peak_fwhm"] = {
+        f"peak_{i}": float(2.354820045 * result.params[3 * i]) for i in range(1, count + 1)
+    }
+    return result
 
 
 def _scaled_perturbation(lower: list[float], upper: list[float], frac: float = 0.05) -> list[float]:
@@ -1099,6 +1185,12 @@ def fit_non_ramsey(
     trace: "ExperimentTrace | None" = None,
 ) -> FitResult:
     cfg = config or FitWorkflowConfig()
+    if trace is not None and trace.experiment_type == "TimeTrace" and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}:
+        raise ValueError("Elapsed-time data require TimeTraceDecay or a custom model with x in seconds.")
+    if exp_type in {"TimeTrace", "TimeTraceDecay"}:
+        return _fit_time_trace_decay(x, y, cfg.multistart, locks)
+    if exp_type == "GaussianPeaks":
+        return _fit_gaussian_peaks(x, y, cfg.gaussian_peak_count, cfg.multistart, locks)
     requested_exp_type = exp_type
     if exp_type == "DEERFrequency":
         exp_type = "ODMR"

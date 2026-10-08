@@ -32,6 +32,15 @@ from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _json_default(value):
+    """Serialize numpy values left in fit extras (e.g. the T1 ``plot_y`` series)."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -866,7 +875,7 @@ def run_batch(
                 fit_allowed=False,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                json.dump(rj, f, indent=2)
+                json.dump(rj, f, indent=2, default=_json_default)
             summary_rows.append(sr)
             validation_rows.append(vr)
             if progress_callback:
@@ -886,7 +895,7 @@ def run_batch(
         if custom_spec is not None:
             exp_type = "CustomModel"
 
-        profile = PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
+        profile = PROFILES["TimeTrace"] if trace.experiment_type == "TimeTrace" else PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
 
         fit_png = output_dir / f"{stem}_fit.png"
         trace_metadata = dict(trace.metadata or {})
@@ -901,7 +910,7 @@ def run_batch(
             "app_name": "SmartFitterPy",
             "app_version": "2026.08",
             "timestamp_utc": _now_utc_iso(),
-            "mode": mode,
+            "mode": trace.mode,
             "relative_path": relative_path,
             "detector_id": detector_id,
             "detector_label": detector_label,
@@ -929,7 +938,7 @@ def run_batch(
                 relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                json.dump(rj, f, indent=2)
+                json.dump(rj, f, indent=2, default=_json_default)
             summary_rows.append(sr)
             validation_rows.append(vr)
             if progress_callback:
@@ -954,7 +963,7 @@ def run_batch(
                 relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                json.dump(rj, f, indent=2)
+                json.dump(rj, f, indent=2, default=_json_default)
             if write_origin_bundles:
                 _write_origin_bundle(output_dir, stem, x, y, None,
                                      {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
@@ -962,20 +971,26 @@ def run_batch(
             validation_rows.append(vr)
             continue
 
-        if trace.scan_dim == "scan1d" and not trace.fit_allowed:
+        time_plot_only = trace.experiment_type == "TimeTrace" and (not trace.fit_allowed or (not model_override and custom_spec is None))
+        # Auto mode: 1D spatial line scans are plot-only (choose a model explicitly to fit)
+        line_scan_auto_plot = (
+            trace.scan_dim == "scan1d" and trace.experiment_type == "LineScan"
+            and exp_type == "LineScan" and not model_override and custom_spec is None
+        )
+        if (trace.scan_dim == "scan1d" and not trace.fit_allowed) or line_scan_auto_plot or (time_plot_only and not excluded):
             _plot_scan1d(
                 fit_png, x, y,
-                title=f"{mat_file.name} | {detector_label} | 1D scan",
+                title=f"{mat_file.name} | {detector_label} | {'Time trace' if time_plot_only else '1D scan'}",
                 x_label=(trace.scan_axes[0] if trace.scan_axes else trace.x_label),
                 y_label=trace.y_label, dpi=dpi,
             )
             rj, sr, vr = _build_result_row(
                 mat_file, exp_type, profile, None,
-                "PASS", "1D scan plotted (no fit expected)", file_meta, trace_metadata, provenance, "scan1d_plot_only",
+                "PASS", "Time trace plotted; exponential fitting is optional" if time_plot_only else ("1D line scan plotted (no fit expected; choose GaussianPeaks to fit)" if line_scan_auto_plot else "1D scan plotted (no fit expected)"), file_meta, trace_metadata, provenance, "time_trace_plot_only" if time_plot_only else "scan1d_plot_only",
                 relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                json.dump(rj, f, indent=2)
+                json.dump(rj, f, indent=2, default=_json_default)
             if write_origin_bundles:
                 _write_origin_bundle(output_dir, stem, x, y, None,
                                      {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
@@ -995,7 +1010,7 @@ def run_batch(
                 relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                json.dump(rj, f, indent=2)
+                json.dump(rj, f, indent=2, default=_json_default)
             if write_origin_bundles:
                 _write_origin_bundle(output_dir, stem, x, y, None,
                                      {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
@@ -1005,6 +1020,8 @@ def run_batch(
 
         # --- Fitting ---
         try:
+            if trace.experiment_type == "TimeTrace" and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}:
+                raise ValueError("Elapsed-time data require TimeTraceDecay or a custom model with x in seconds.")
             if robust:
                 result = _run_robust_fit(
                     exp_type, x, y, n_starts=multistart,
@@ -1024,6 +1041,8 @@ def run_batch(
                 model_note = "single_model"
         except Exception as exc:
             try:
+                if trace.experiment_type == "TimeTrace":
+                    raise ValueError("The selected time-trace fit failed; no spin-decay fallback is applied.") from exc
                 result = _fit_non_ramsey("SpinEcho", x, y, n_starts=multistart)
                 model_note = f"fallback_after_error:{type(exc).__name__}"
             except Exception as fallback_exc:
@@ -1037,7 +1056,7 @@ def run_batch(
                     relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-                    json.dump(rj, f, indent=2)
+                    json.dump(rj, f, indent=2, default=_json_default)
                 summary_rows.append(sr)
                 validation_rows.append(vr)
                 if progress_callback:
@@ -1060,7 +1079,7 @@ def run_batch(
             relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
         )
         with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
-            json.dump(rj, f, indent=2)
+            json.dump(rj, f, indent=2, default=_json_default)
         if write_origin_bundles:
             nv = _extract_nv_metrics(exp_type, result, trace_metadata)
             _write_origin_bundle(
@@ -1145,7 +1164,7 @@ def main():
     parser.add_argument("--plugin-file", type=Path, default=None,
                         help="Custom model JSON spec.")
     parser.add_argument("--model-override", type=str, default=None,
-                        choices=["Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition"],
+                        choices=["Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "TimeTraceDecay"],
                         help="Force a specific model for ALL files.")
     parser.add_argument("--multistart", type=int, default=12,
                         help="Number of random-seed restarts per fit (default: 12).")

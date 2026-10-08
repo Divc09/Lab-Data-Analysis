@@ -29,9 +29,34 @@ class FitResult:
 
 
 def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
+    """Parameter covariance from the Jacobian.
+
+    Columns are equilibrated to unit norm first so parameters with wildly
+    different units (e.g. T in ns vs. chirp2 in ns^-2) do not make J^T J
+    numerically singular, which previously made ``pinv`` silently discard
+    real directions and return fake, tiny variances.  Parameters that remain
+    unidentifiable (numerically null Jacobian direction) get NaN variance.
+    """
     s_sq = (2.0 * cost) / max(1, dof)
-    jtj = jac.T @ jac
-    return s_sq * np.linalg.pinv(jtj)
+    jac = np.asarray(jac, dtype=float)
+    n = jac.shape[1]
+    norms = np.linalg.norm(jac, axis=0)
+    ok = np.isfinite(norms) & (norms > 0.0)
+    cov = np.full((n, n), np.nan)
+    if not np.any(ok):
+        return cov
+    idx = np.flatnonzero(ok)
+    js = jac[:, idx] / norms[idx]
+    _, sv, vt = np.linalg.svd(js, full_matrices=False)
+    keep = sv > sv[0] * 1e-8
+    inv_s2 = np.where(keep, 1.0 / np.where(keep, sv, 1.0) ** 2, 0.0)
+    cov_s = (vt.T * inv_s2) @ vt
+    # a parameter is unidentifiable if it loads on a dropped (null) direction
+    null_load = np.sum(vt[~keep, :] ** 2, axis=0) if not np.all(keep) else np.zeros(len(idx))
+    cov_s[np.ix_(null_load > 1e-2, np.ones(len(idx), bool))] = np.nan
+    cov_s[np.ix_(np.ones(len(idx), bool), null_load > 1e-2)] = np.nan
+    cov[np.ix_(idx, idx)] = s_sq * cov_s / np.outer(norms[idx], norms[idx])
+    return cov
 
 
 def fit_model_multistart(
@@ -92,8 +117,10 @@ def fit_model_multistart(
     p_opt = best.x
     y_fit = model_func(x, *p_opt)
     dof = len(y) - len(p_opt)
-    cov = _estimate_covariance(best.jac, best.cost, dof=max(1, dof))
-    p_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    # best.cost is the robust-loss sum for soft_l1 etc.; use the actual (weighted) residuals for s^2
+    raw_cost = 0.5 * float(np.sum(np.square(best.fun)))
+    cov = _estimate_covariance(best.jac, raw_cost, dof=max(1, dof))
+    p_err = np.sqrt(np.maximum(np.diag(cov), 0.0))  # NaN propagates for unidentifiable parameters
 
     message = str(best.message)
     if failed_attempts:

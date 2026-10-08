@@ -218,7 +218,9 @@ def fit_rabi_envelope(
     rmse = float(np.sqrt(np.mean(resid**2)))
     dof = max(1, len(fit_amp) - len(opt))
     try:
-        cov = (2.0 * float(best.cost) / dof) * np.linalg.pinv(best.jac.T @ best.jac)
+        from .fit_engine import _estimate_covariance
+
+        cov = _estimate_covariance(best.jac, 0.5 * ss_res, dof)  # raw residuals, not robust best.cost
         errors = np.sqrt(np.maximum(np.diag(cov), 0.0))
     except Exception:
         errors = np.full_like(opt, np.nan, dtype=float)
