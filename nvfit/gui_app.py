@@ -12538,5 +12538,11 @@ def run_gui():
 
 
 if __name__ == "__main__":
-    run_gui()
+    if "--legacy" in sys.argv:
+        sys.argv.remove("--legacy")
+        run_gui()
+    else:
+        sys.stderr.write("SmartFitter v2 is now the default app; the legacy Qt app is deprecated (use --legacy to start it).\n")
+        from smartfitter.__main__ import main as _smartfitter_v2_main
+        _smartfitter_v2_main()
 

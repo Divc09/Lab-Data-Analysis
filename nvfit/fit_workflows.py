@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Mapping
 import numpy as np
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 
-from .fit_engine import FitResult, fit_model_multistart
+from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights
 from .models import (
     gaussian_peaks,
     time_trace_decay,
@@ -41,6 +41,7 @@ class FitWorkflowConfig:
     multistart: int = 12
     gaussian_peak_count: int = 1
     rabi_use_sem: bool = True
+    sem_weights: bool = False  # SEM weighting for non-Rabi models (Rabi uses rabi_use_sem)
     rabi_pi_lock: bool = False
     rabi_pi_ns: float = 200.0
     rabi_pi2_ns: float = 100.0
@@ -57,7 +58,7 @@ class FitWorkflowConfig:
     custom_expr: str = ""
 
 
-def _fit_time_trace_decay(x, y, n_starts, locks=None) -> FitResult:
+def _fit_time_trace_decay(x, y, n_starts, locks=None, weights=None) -> FitResult:
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     if len(x) <= 3 or not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
         raise ValueError("Exponential time-trace fitting needs at least four finite samples.")
@@ -77,14 +78,14 @@ def _fit_time_trace_decay(x, y, n_starts, locks=None) -> FitResult:
         seeds.append(seed)
     result = fit_model_multistart(
         model_name="TimeTraceDecay", model_func=time_trace_decay, x=x, y=y,
-        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac",
+        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac", weights=weights,
         selection_note="Descriptive exponential drift/bleaching; tau_s is in seconds, not a spin lifetime",
     )
     result.extras["parameter_units"] = {"tau_s": "s"}
     return result
 
 
-def _fit_gaussian_peaks(x, y, count, n_starts, locks=None) -> FitResult:
+def _fit_gaussian_peaks(x, y, count, n_starts, locks=None, weights=None) -> FitResult:
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     count = int(count)
     if not 1 <= count <= 8:
@@ -131,7 +132,7 @@ def _fit_gaussian_peaks(x, y, count, n_starts, locks=None) -> FitResult:
     seeds += [seed + rng.normal(size=len(seed)) * scales for _ in range(max(1, n_starts) - 1)]
     result = fit_model_multistart(
         model_name="GaussianPeaks", model_func=gaussian_peaks, x=x, y=y,
-        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac",
+        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac", weights=weights,
         selection_note=f"{count} Gaussian peak(s) on a constant background; centers and widths in scan axis units",
     )
     result.extras["peak_fwhm"] = {
@@ -376,6 +377,55 @@ def _rabi_long_scan_features(x: np.ndarray, y: np.ndarray) -> dict[str, float | 
         "decay_ratio": float(decay_ratio),
         "is_long_decayed": is_long,
     }
+
+
+def aligned_indices(trace: "ExperimentTrace | None", x: np.ndarray) -> np.ndarray | None:
+    """Indices into ``trace.x_ns`` matching each ``x`` by exact abscissa value (handles range
+    cuts and exclusions).  None if x was re-binned/transformed or a point is not matched uniquely."""
+    if trace is None:
+        return None
+    tx = np.asarray(trace.x_ns, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if tx.size == 0 or x.size == 0:
+        return None
+    order = np.argsort(tx)
+    if tx.size > 1:
+        pos = np.clip(np.searchsorted(tx[order], x), 1, tx.size - 1)
+        cand = np.stack([order[pos - 1], order[pos]])
+        best = cand[np.argmin(np.abs(tx[cand] - x), axis=0), np.arange(x.size)]
+    else:
+        best = np.zeros(x.size, dtype=int)
+    if not np.allclose(tx[best], x, rtol=1e-9, atol=1e-9 * max(1.0, float(np.max(np.abs(x))))):
+        return None
+    if len(np.unique(best)) != len(best):
+        return None
+    return best
+
+
+def aligned_sem(trace: "ExperimentTrace | None", x: np.ndarray) -> np.ndarray | None:
+    """Per-point SEM of ``trace`` matched to ``x`` (see ``aligned_indices``); None if unavailable."""
+    if trace is None or trace.y_sem is None:
+        return None
+    sem = np.asarray(trace.y_sem, dtype=float)
+    if sem.shape != np.asarray(trace.x_ns).shape:
+        return None
+    idx = aligned_indices(trace, x)
+    return None if idx is None else sem[idx]
+
+
+def _attach_sem_chi2(result: FitResult, y: np.ndarray, sem: np.ndarray, n_locked: int, t1_span: float, *, weighted: bool) -> FitResult:
+    y_ref = np.asarray(result.extras.get("plot_y", y), dtype=float)
+    sem_eff = np.asarray(sem, dtype=float)
+    if result.extras.get("t1_prep_mode") == "normalized_1_minus_data":
+        sem_eff = sem_eff / max(t1_span, 1e-9)  # T1 series is 1 - (base-lo)/span
+    if len(y_ref) != len(result.y_fit) or len(sem_eff) != len(y_ref):
+        return result
+    chi2 = reduced_chi2(y_ref, result.y_fit, sem_eff, len(result.params) - n_locked)
+    if np.isfinite(chi2):
+        result.extras["reduced_chi2"] = chi2
+        tag = "SEM-weighted fit" if weighted else "SEM available"
+        result.selection_note = f"{result.selection_note}; {tag}, reduced chi2={chi2:.2f} (absolute 1/sem^2)".lstrip("; ")
+    return result
 
 
 def _rabi_fit_weights(trace: "ExperimentTrace | None", x: np.ndarray, *, enabled: bool) -> np.ndarray | None:
@@ -925,6 +975,7 @@ def _fit_t1(
     *,
     trace: "ExperimentTrace | None" = None,
     locks: LockMap | None = None,
+    weights: np.ndarray | None = None,
 ) -> FitResult:
     y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace)
     rng = np.random.default_rng(41)
@@ -960,6 +1011,7 @@ def _fit_t1(
         lower=lower,
         upper=upper,
         seeds=seeds,
+        weights=weights,
         selection_note=f"selected {prep_used} T1 with {'stretched' if use_stretch else 'regular'} exponential model",
     )
     plot_label = "Normalized 1 - data [a.u.]" if prep_used == "normalized_1_minus_data" else "T1 signal [a.u.]"
@@ -1065,6 +1117,7 @@ def _fit_odmr_single(
     polarity: str,
     locks: LockMap | None = None,
     center_range: tuple[float, float] | None = None,
+    weights: np.ndarray | None = None,
 ) -> FitResult:
     rng = np.random.default_rng(29)
     y_scale = max(float(np.percentile(y, 95) - np.percentile(y, 5)), 1e-9)
@@ -1082,6 +1135,7 @@ def _fit_odmr_single(
         lower=lower,
         upper=upper,
         seeds=seeds,
+        weights=weights,
     )
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 
@@ -1094,6 +1148,7 @@ def _fit_odmr_multi(
     max_peaks: int,
     polarity: str,
     center_ranges: list[tuple[float, float]] | None = None,
+    weights: np.ndarray | None = None,
 ) -> FitResult:
     rng = np.random.default_rng(31)
     y_scale = max(float(np.percentile(y, 95) - np.percentile(y, 5)), 1e-9)
@@ -1130,6 +1185,7 @@ def _fit_odmr_multi(
         lower=lower,
         upper=upper,
         seeds=seeds,
+        weights=weights,
     )
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 
@@ -1173,7 +1229,7 @@ def _select_odmr_candidate(single: FitResult, multi: FitResult | None, peak_indi
     return _with_selection(single, "selected single-peak ODMR candidate by parsimony", {"detected_peaks": detected})
 
 
-def fit_non_ramsey(
+def _fit_non_ramsey_impl(
     exp_type: str,
     x: np.ndarray,
     y: np.ndarray,
@@ -1183,14 +1239,16 @@ def fit_non_ramsey(
     custom_spec: dict | None = None,
     trace_experiment_type: str | None = None,
     trace: "ExperimentTrace | None" = None,
+    sem: np.ndarray | None = None,
 ) -> FitResult:
     cfg = config or FitWorkflowConfig()
+    w_sem = sem_to_weights(sem) if cfg.sem_weights and sem is not None else None
     if trace is not None and trace.experiment_type == "TimeTrace" and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}:
         raise ValueError("Elapsed-time data require TimeTraceDecay or a custom model with x in seconds.")
     if exp_type in {"TimeTrace", "TimeTraceDecay"}:
-        return _fit_time_trace_decay(x, y, cfg.multistart, locks)
+        return _fit_time_trace_decay(x, y, cfg.multistart, locks, w_sem)
     if exp_type == "GaussianPeaks":
-        return _fit_gaussian_peaks(x, y, cfg.gaussian_peak_count, cfg.multistart, locks)
+        return _fit_gaussian_peaks(x, y, cfg.gaussian_peak_count, cfg.multistart, locks, w_sem)
     requested_exp_type = exp_type
     if exp_type == "DEERFrequency":
         exp_type = "ODMR"
@@ -1252,7 +1310,7 @@ def fit_non_ramsey(
         return _semantic_result(_attach_rabi_envelope(_choose_rabi_model(x=x, y=y, phase_ramp=phase_ramp, constant=constant, chirped=chirped, adaptive=adaptive, long_damped=long_damped), x, y))
 
     if exp_type == "T1":
-        return _semantic_result(_fit_t1(x, y, cfg, trace=trace, locks=locks))
+        return _semantic_result(_fit_t1(x, y, cfg, trace=trace, locks=locks, weights=w_sem))
 
     if exp_type in ("SpinEcho", "DynamicDecoupling"):
         names = ["y0", "A", "T2", "n"]
@@ -1272,6 +1330,7 @@ def fit_non_ramsey(
             lower=lower,
             upper=upper,
             seeds=seeds,
+            weights=w_sem,
             selection_note="selected stretched-exponential decay model",
         ))
 
@@ -1288,7 +1347,7 @@ def fit_non_ramsey(
                 strengths = _odmr_detection_signal(y, polarity)[peak_indices]
                 single_range = constrained_ranges[int(np.argmax(strengths))]
             single = _fit_odmr_single(
-                x, y, n_starts, polarity, locks=locks, center_range=single_range
+                x, y, n_starts, polarity, locks=locks, center_range=single_range, weights=w_sem
             )
             multi: FitResult | None = None
             if cfg.odmr_multipeak or len(peak_indices) > 1:
@@ -1304,6 +1363,7 @@ def fit_non_ramsey(
                         max_peaks=max_peaks,
                         polarity=polarity,
                         center_ranges=constrained_ranges or None,
+                        weights=w_sem,
                     )
             candidates.append(_select_odmr_candidate(single, multi, peak_indices, x))
         best = min(candidates, key=lambda item: (sum(item.bound_hits), item.bic, -item.r2))
@@ -1335,6 +1395,7 @@ def fit_non_ramsey(
             lower=lower,
             upper=upper,
             seeds=seeds,
+            weights=w_sem,
             selection_note="selected custom model",
         ))
 
@@ -1354,6 +1415,42 @@ def fit_non_ramsey(
         lower=lower,
         upper=upper,
         seeds=seeds,
+        weights=w_sem,
         selection_note="fallback to stretched-exponential decay model",
     )
     return _semantic_result(result)
+
+
+def fit_non_ramsey(
+    exp_type: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    config: FitWorkflowConfig | None = None,
+    locks: LockMap | None = None,
+    custom_spec: dict | None = None,
+    trace_experiment_type: str | None = None,
+    trace: "ExperimentTrace | None" = None,
+) -> FitResult:
+    """Fit a non-Ramsey experiment.  With ``config.sem_weights`` (or Rabi SEM weighting) the
+    per-point SEM of the mean trace weights the fit and ``extras['reduced_chi2']`` is reported
+    (sum((y-fit)/sem)^2/dof, absolute 1/sem^2 weights)."""
+    cfg = config or FitWorkflowConfig()
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    sem = aligned_sem(trace, x)
+    result = _fit_non_ramsey_impl(
+        exp_type, x, y, config=cfg, locks=locks, custom_spec=custom_spec,
+        trace_experiment_type=trace_experiment_type, trace=trace, sem=sem,
+    )
+    if sem is None:
+        if cfg.sem_weights and trace is not None:
+            result.extras["sem_weights_applied"] = False
+        return result
+    rabi = result.model_name.startswith("Rabi") or exp_type in {"Rabi", "DEERDuration"}
+    weighted = bool(cfg.sem_weights) or (rabi and _rabi_fit_weights(trace, x, enabled=bool(cfg.rabi_use_sem)) is not None)
+    if not weighted:
+        return result
+    n_locked = sum(1 for n in result.param_names if locks and n in locks and locks[n][1])
+    base = trace.y if trace is not None and len(trace.y) == len(y) else y
+    result.extras["sem_weights_applied"] = True
+    return _attach_sem_chi2(result, y, sem, n_locked, float(np.ptp(base)), weighted=True)

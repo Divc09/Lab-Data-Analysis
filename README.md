@@ -4,7 +4,7 @@ SmartFitter is a Python application for loading, visualizing, fitting, and expor
 
 ## SmartFitter v2 (new interface)
 
-`smartfitter/` is a new desktop interface built on the same `nvfit` loaders, fits, spot detection, map overlays and batch pipeline. The original Qt app (`python -m nvfit.gui_app`) is unchanged and still available.
+`smartfitter/` is a new desktop interface built on the same `nvfit` loaders, fits, spot detection, map overlays and batch pipeline. SmartFitter v2 is now the default app: `python -m nvfit.gui_app` and `Launch SmartFitter.vbs` start it. The original Qt app is deprecated and kept for reference; start it with `python -m nvfit.gui_app --legacy`.
 
 Launch it:
 
@@ -94,7 +94,8 @@ python -m pip install -r requirements.txt
 Start SmartFitter:
 
 ```bash
-python -m nvfit.gui_app
+python -m smartfitter
+# legacy Qt app (deprecated): python -m nvfit.gui_app --legacy
 ```
 
 On Windows, after creating `.venv`, you can also double-click `Launch SmartFitter.vbs`.
@@ -151,6 +152,10 @@ python -m nvfit.pro_batch --single-file "path/to/data.mat" --output-dir "path/to
 Run `python -m nvfit.pro_batch --help` for all options. Batch results include fit figures, JSON records, CSV summaries, validation reports, and aggregate reports.
 
 Batch processes both available detector streams by default. Use `--detector detector1` or `--detector detector2` to restrict it. Dual-file outputs use `__detector1` and `__detector2` suffixes; single-detector output names remain unchanged.
+
+## Portable build (no Python needed)
+
+`powershell -File tools\build_portable.ps1` builds `dist\SmartFitter\SmartFitter.exe` (PyInstaller onedir, no PySide6) and `dist\SmartFitter-portable-<version>.zip`. Lab-mates unzip and run `SmartFitter.exe` (same options as `python -m smartfitter`; settings stay in `%APPDATA%\SmartFitter`). It uses the WebView2 runtime that ships with Windows 11 and falls back to an Edge app window. Update notices are informational only: git checkouts compare with `origin/main` (update with `git pull --ff-only origin main`), portable builds compare with the latest GitHub release.
 
 ## Tests
 

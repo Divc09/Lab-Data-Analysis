@@ -9,6 +9,15 @@ import { resultLines } from './plotstyle.js';
 let overlayEl, trendEl, alignNoteEl;
 const C = () => S.compare;
 
+const GF_MODELS = {
+  SpinEcho: ['y0', 'A', 'T2', 'n'], T1Exp: ['y0', 'A', 'T1'], T1Stretch: ['y0', 'A', 'T1', 'n'], T1NormExp: ['y0', 'A', 'T1'], T1NormStretch: ['y0', 'A', 'T1', 'n'],
+  RamseySimple: ['y0', 'A', 'f', 'phi', 'tau', 'n'], RabiCosine: ['c', 'a', 'T', 'beta', 'f', 'phi'], ODMR: ['y0', 'C', 'w', 'x0'],
+  GaussianPeaks: ['background', 'amplitude', 'center', 'sigma'], TimeTraceDecay: ['background', 'amplitude', 'tau_s'],
+};
+const GF_DEFAULT_SHARED = { SpinEcho: 'T2', T1Exp: 'T1', T1Stretch: 'T1', T1NormExp: 'T1', T1NormStretch: 'T1', RamseySimple: 'f', RabiCosine: 'f', ODMR: 'x0', GaussianPeaks: 'center', TimeTraceDecay: 'tau_s' };
+const visibleSet = () => C().set.filter((p) => S.files[p] && !C().hidden.includes(p));
+const gfKey = () => visibleSet().join('|');
+
 function colorFor(i) { return PALETTES.lab[i % PALETTES.lab.length]; }
 
 // Offset/scale so that (y - off) / scale is the normalized curve; the same transform is applied to fits.
@@ -72,6 +81,8 @@ export function renderCompare(root) {
   c.align = c.align || 'none';
   alignNoteEl = h('div', { class: 'note' });
   const set = c.set.filter((p) => S.files[p]);
+  if (c.global && c.global.key !== gfKey()) c.global = null; // the set (or visibility) changed
+  c.gf = c.gf || { model: 'RabiCosine', shared: ['f'] };
   overlayEl = overlayEl || h('div', { class: 'plot' });
   trendEl = trendEl || h('div', { class: 'plot' });
   const fitted = set.filter((p) => c.results[p]);
@@ -122,6 +133,7 @@ export function renderCompare(root) {
       h('div', { class: 'g2' }, field('Range from', input(c.spec.range_min ?? '', (v) => { c.spec.range_min = num(v); }, { placeholder: 'all' })), field('to', input(c.spec.range_max ?? '', (v) => { c.spec.range_max = num(v); }, { placeholder: 'all' }))),
       h('div', { class: 'note' }, 'The same model, range and processing are applied to every file; each keeps its own result.'),
       h('button', { class: 'btn primary block', disabled: !set.length || c.fitting, onclick: fitAll }, c.fitting ? `Fitting ${c.fitting}` : `Fit all ${set.length} files`)),
+    globalCard(),
     h('div', { class: 'card pad' }, h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, 'Trend table'), h('span', { class: 'sp' }), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => copyText(trendTable(pts), 'Trend table copied') }, 'Copy'), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => saveCsv(pts) }, 'Save CSV')),
       pts.length ? h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, h('th', {}, 'File'), h('th', {}, c.param), h('th', {}, '±')),
         pts.map((q) => h('tr', { class: `click ${c.sel?.includes(q.p) ? 'sel' : ''}`, onclick: () => toggleSel(q.p, pts) }, h('td', { class: 'txt ellip', style: 'max-width:140px', title: q.p }, c.against === 'time' ? fmtTime(q.x / 1000) : basename(q.p).slice(0, 18)), h('td', {}, fmt(q.v, 6)), h('td', {}, q.e ? fmt(q.e, 2) : '–'))))
@@ -133,6 +145,50 @@ export function renderCompare(root) {
   mount(root, left, main, right);
   drawOverlay(set);
   drawTrend(pts, reg);
+}
+
+function globalCard() {
+  const c = C(), g = c.gf, names = GF_MODELS[g.model], res = c.global?.res;
+  const nvis = visibleSet().length;
+  const keyParams = () => res.param_names.filter((n) => !res.shared_names.includes(n)).slice(0, 3);
+  return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
+    h('span', { style: 'font-weight:600' }, 'Global fit'),
+    field('Model', select(Object.keys(GF_MODELS), g.model, (v) => { g.model = v; g.shared = [GF_DEFAULT_SHARED[v]]; c.global = null; emit(); })),
+    h('div', { class: 'lbl' }, 'Shared parameters'),
+    h('div', { class: 'row wrap', style: 'gap:10px' }, names.map((n) => h('label', { class: 'row', style: 'gap:4px;cursor:pointer' },
+      h('input', { type: 'checkbox', checked: g.shared.includes(n), onchange: (e) => { g.shared = e.target.checked ? [...g.shared, n] : g.shared.filter((q) => q !== n); } }), h('span', { class: 'mono' }, n)))),
+    h('div', { class: 'note' }, 'Fits all visible files at once; shared parameters take one common value. Linear least squares (SEM-weighted when available), so errors are approximate.'),
+    h('button', { class: 'btn primary block', disabled: nvis < 2 || c.gfBusy, onclick: runGlobal }, c.gfBusy ? 'Fitting…' : `Run global fit on ${nvis} files`),
+    res ? h('div', { style: 'display:flex;flex-direction:column;gap:6px' },
+      res.shared_names.length ? h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Shared'), h('th', {}, 'Value'), h('th', {}, '±')),
+        res.shared_names.map((n) => h('tr', {}, h('td', { class: 'txt' }, n), h('td', {}, fmt(res.shared[n].value, 6)), h('td', {}, Number.isFinite(res.shared[n].error) ? fmt(res.shared[n].error, 2) : '–')))) : null,
+      h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'File'), keyParams().map((n) => h('th', {}, n)), h('th', {}, 'R²')),
+        res.datasets.map((d) => h('tr', {}, h('td', { class: 'txt ellip', style: 'max-width:110px', title: d.path }, basename(d.path).replace(/\.mat$/i, '').slice(0, 16)),
+          keyParams().map((n) => h('td', {}, fmtPm(d.params[n], d.errors[n]))), h('td', {}, fmt(d.r2, 3))))),
+      h('div', { class: 'mono', style: 'font-size:12px' }, `χ²ᵣ ${fmt(res.reduced_chi2, 4)} · ΔAIC ${fmt(res.delta_aic, 4)} · ΔBIC ${fmt(res.delta_bic, 4)}`),
+      h('div', { class: 'note' }, `${res.verdict} (Δ = global − independent; negative favours sharing.)`),
+      res.success ? null : h('div', { class: 'note' }, 'Optimizer did not report convergence.'),
+      h('button', { class: 'btn sm', onclick: () => copyText(globalTable(res), 'Global fit results copied') }, 'Copy results')) : null);
+}
+
+function globalTable(res) {
+  const rows = [['Model', res.model], ['Shared', res.shared_names.join(', ') || 'none'], ['reduced chi2', res.reduced_chi2], ['dAIC', res.delta_aic], ['dBIC', res.delta_bic], ['Verdict', res.verdict], [],
+    ...res.shared_names.map((n) => [`shared ${n}`, res.shared[n].value, res.shared[n].error]), [],
+    ['File', ...res.param_names.flatMap((n) => [n, `${n} error`]), 'R2']];
+  res.datasets.forEach((d) => rows.push([basename(d.path), ...res.param_names.flatMap((n) => [d.params[n], d.errors[n]]), d.r2]));
+  return rows.map((r) => r.join('\t')).join('\n');
+}
+
+async function runGlobal() {
+  const c = C(), vis = visibleSet();
+  const items = vis.map((p) => ({ path: p, detector: S.files[p].detector, mode: S.files[p].mode, proc: S.files[p].proc }));
+  c.gfBusy = true; emit();
+  try {
+    const res = await call('global_fit', { items, model: c.gf.model, shared: c.gf.shared, spec: {} }, { label: 'Global fit' });
+    c.global = { key: vis.join('|'), res };
+  } catch (e) { /* toast shown */ }
+  c.gfBusy = false;
+  emit();
 }
 
 function toggleSel(p, pts) {
@@ -188,6 +244,12 @@ function drawOverlay(set) {
       fy = fy.map((v) => (v - np_.off) / np_.scale);
       if (c.layout === 'waterfall') fy = fy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
       data.push({ type: 'scatter', mode: 'lines', x: (r.dense?.x || r.x).map((v) => (v === null ? NaN : v + sh)), y: fy, name: 'fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dot' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
+    }
+    const gd = c.global?.res.datasets.find((q) => q.path === p);
+    if (gd?.curve) {
+      let gy = gd.curve.y.map((v) => (v === null ? NaN : (v - np_.off) / np_.scale));
+      if (c.layout === 'waterfall') gy = gy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
+      data.push({ type: 'scatter', mode: 'lines', x: gd.curve.x.map((v) => (v === null ? NaN : v + sh)), y: gy, name: 'global fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dash' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
     if (c.layout === 'grid') {
       const col = k % cols, row = Math.floor(k / cols);

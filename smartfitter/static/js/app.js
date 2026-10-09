@@ -6,6 +6,8 @@ import { renderAnalyze, renderInspector, runFit, saveResults, copyFigure, resetV
 import { renderCompare } from './compare.js';
 import { renderFigure } from './figure.js';
 import { renderBatch } from './batch.js';
+import { renderDay } from './day.js';
+import { renderStack } from './stack.js';
 
 const app = document.getElementById('app');
 const els = {};
@@ -55,6 +57,8 @@ function render() {
     else if (v === 'compare') renderCompare(els.full);
     else if (v === 'figure') renderFigure(els.full);
     else if (v === 'batch') renderBatch(els.full);
+    else if (v === 'day') renderDay(els.full);
+    else if (v === 'stack') renderStack(els.full);
     applyPanelWidths();
     renderStatus(0, '');
   });
@@ -74,17 +78,18 @@ const SHORTCUTS = [['Open files', 'Ctrl O'], ['Add files', 'Ctrl Shift O'], ['Se
 
 // ------------------------------------------------------------------ top bar
 function renderTop() {
-  const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['batch', 'Batch']];
+  const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['day', 'Day'], ['stack', 'Stacks'], ['batch', 'Batch']];
   mount(els.top,
-    h('div', { class: 'brand', title: 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 22, '#5AA9F0'), 'SmartFitter'),
+    h('div', { class: 'brand', title: 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 20, '#5AA9F0'), h('span', { class: 'brand-name' }, 'SmartFitter')),
     h('nav', { class: 'nav', 'aria-label': 'Workspaces' }, nav.map(([k, l]) => h('button', { class: S.view === k || (k === 'analyze' && S.view === 'home' && active()) ? 'on' : '', onclick: () => { S.view = k; emit(); } }, l))),
-    h('button', { class: 'btn search-btn', onclick: openPalette }, h('span', { class: 'row' }, icon('search', 14), 'Search files and commands'), h('span', { class: 'kbd' }, 'Ctrl K')),
     h('div', { class: 'sp' }),
-    h('button', { class: 'ibtn', title: 'Keyboard shortcuts (?)', 'aria-label': 'Keyboard shortcuts', onclick: openShortcuts }, '?'),
-    h('button', { class: 'ibtn', title: 'Undo (Ctrl+Z)', disabled: !canUndo(), onclick: undo }, icon('undo')),
-    h('button', { class: 'ibtn', title: 'Redo (Ctrl+Y)', disabled: !canRedo(), onclick: redo }, icon('redo')),
-    h('button', { class: 'btn', onclick: openFilesDialog }, icon('open', 14), 'Open', h('span', { class: 'kbd' }, 'Ctrl O')),
-    h('button', { class: 'btn primary', disabled: !active(), onclick: () => saveResults(active()) }, 'Save results', h('span', { class: 'kbd' }, 'Ctrl S')));
+    h('button', { class: 'search-btn', title: 'Search files and commands (Ctrl+K, Ctrl+Shift+P)', onclick: openPalette }, icon('search', 13), h('span', {}, 'Search'), h('span', { class: 'kbd' }, 'Ctrl K')),
+    h('div', { class: 'tgroup' },
+      h('button', { class: 'ibtn', title: 'Undo (Ctrl+Z)', 'aria-label': 'Undo', disabled: !canUndo(), onclick: undo }, icon('undo', 15)),
+      h('button', { class: 'ibtn', title: 'Redo (Ctrl+Y)', 'aria-label': 'Redo', disabled: !canRedo(), onclick: redo }, icon('redo', 15)),
+      h('button', { class: 'ibtn', title: 'Keyboard shortcuts (?)', 'aria-label': 'Keyboard shortcuts', onclick: openShortcuts }, '?')),
+    h('button', { class: 'btn', title: 'Open files (Ctrl+O) · add files (Ctrl+Shift+O)', onclick: openFilesDialog }, icon('open', 14), 'Open'),
+    h('button', { class: 'btn primary', title: 'Save results (Ctrl+S)', disabled: !active(), onclick: () => saveResults(active()) }, icon('save', 14), 'Save'));
 }
 
 function renderStatus(n, label) {
@@ -95,7 +100,7 @@ function renderStatus(n, label) {
     S.library.watching ? h('span', { class: 'row', style: 'gap:5px;color:var(--ok)' }, h('span', { class: 'watch-dot' }), 'Watching folder') : null,
     busy,
     h('span', { class: 'sp' }),
-    h('span', {}, 'Alt 1–7 inspector · Ctrl+K search · Ctrl+F fit · Ctrl+Shift+C copy figure'),
+    h('span', { title: 'Press ? for all shortcuts' }, '? shortcuts'),
     h('span', { class: 'mono' }, `v${S.version}`));
 }
 
@@ -215,6 +220,7 @@ function renderLibrary() {
         icon('folder', 14, '#A2AAB7'),
         h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'ellip' }, listing.name),
           h('div', { style: 'font-size:11px;color:var(--text3)' }, lib.watching ? h('span', { style: 'color:var(--ok)' }, '● Watching · new files appear live') : `${listing.files.length} .mat file${listing.files.length === 1 ? '' : 's'}`)),
+        h('button', { class: 'ibtn', title: isFavorite(listing.path) ? 'Remove from favorite folders' : 'Add to favorite folders', 'aria-label': 'Toggle favorite folder', style: isFavorite(listing.path) ? 'color:#F5C451' : '', onclick: (e) => { e.stopPropagation(); toggleFavorite(listing.path); } }, isFavorite(listing.path) ? '★' : '☆'),
         h('button', { class: `btn sm ${lib.watching ? 'primary' : ''}`, title: 'Watch this folder for new and updated files', onclick: (e) => { e.stopPropagation(); lib.watching = !lib.watching; toast(lib.watching ? 'Watching for new files and checkpoint updates.' : 'Stopped watching.'); emit(); } }, lib.watching ? 'Watching' : 'Watch'))
         : h('button', { class: 'btn block', onclick: chooseFolder }, 'Choose a data folder'),
       filterEl,
@@ -266,11 +272,25 @@ function startResize(e, name) {
   document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
 }
 
+function favoriteFolders() { return Array.isArray(S.settings.favorite_folders) ? S.settings.favorite_folders : []; }
+function isFavorite(p) { return !!p && favoriteFolders().includes(p); }
+function toggleFavorite(p) {
+  if (!p) return;
+  const favs = favoriteFolders();
+  S.settings.favorite_folders = favs.includes(p) ? favs.filter((x) => x !== p) : [...favs, p];
+  call('settings_set', { patch: { favorite_folders: S.settings.favorite_folders } }, { quiet: true }).catch(() => {});
+  toast(isFavorite(p) ? 'Added to favorite folders.' : 'Removed from favorite folders.');
+  emit();
+}
+
 function folderMenu(e) {
   const cur = S.library.listing?.path;
+  const favItems = favoriteFolders().map((p) => ({ label: `★ ${p === cur ? '✓ ' : ''}${basename(p) || p}  —  ${p}`, run: () => openFolder(p) }));
   const items = (S.settings.recent_folders || []).slice(0, 8).map((p) => ({ label: `${p === cur ? '✓ ' : ''}${basename(p) || p}  —  ${p}`, run: () => openFolder(p) }));
   contextMenu(e.clientX, e.clientY, [
+    ...favItems,
     ...items,
+    cur ? { label: isFavorite(cur) ? '☆ Remove current folder from favorites' : '★ Add current folder to favorites', run: () => toggleFavorite(cur) } : null,
     { label: 'Choose folder…', run: chooseFolder },
     S.library.listing?.parent ? { label: 'Parent folder', run: () => openFolder(S.library.listing.parent) } : null,
   ]);
@@ -354,12 +374,17 @@ function renderHome(main) {
   const st = S.settings;
   const recentFolders = (st.recent_folders || []).slice(0, 8);
   const recentFiles = (st.recent_files || []).slice(0, 8);
+  const favFolders = favoriteFolders();
   mount(main, h('div', { style: 'width:100%;max-width:1180px;margin:0 auto;padding:20px 12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px;align-content:start' },
     h('section', { style: 'grid-column:1/-1' }, h('h1', { style: 'margin:0;font-size:26px;font-weight:600' }, 'Open data'),
       h('p', { class: 'muted', style: 'margin:6px 0 0' }, 'MATLAB .mat files from the acquisition code: snapshots, checkpoints, legacy savedData, time traces, 1D and 2D scans.')),
     h('section', { class: 'card dropzone', style: 'grid-column:1/-1' }, icon('up', 32, '#7DBBF5'), h('div', { style: 'font-size:16px' }, 'Drop .mat files or a folder anywhere on this window'),
       h('div', { class: 'row wrap', style: 'justify-content:center' }, h('button', { class: 'btn primary', onclick: () => openFilesDialog() }, 'Open files', h('span', { class: 'kbd' }, 'Ctrl O')),
         h('button', { class: 'btn', onclick: chooseFolder }, 'Open folder'), h('button', { class: 'btn', onclick: openSessionDialog }, 'Open session', h('span', { class: 'kbd' }, 'Ctrl Alt O')))),
+    h('section', { class: 'card', style: 'padding:14px;display:flex;flex-direction:column;gap:2px' }, h('div', { class: 'lbl', style: 'padding:0 10px 6px' }, 'Favorite folders'),
+      favFolders.length ? favFolders.map((p) => h('div', { class: 'frow', title: p, onclick: () => { openFolder(p); S.view = 'analyze'; S.libCollapsed = false; emit(); } }, h('span', { style: 'color:#F5C451' }, '★'), h('span', { class: 'ellip', style: 'flex:1' }, basename(p)), h('span', { class: 'dim ellip', style: 'font-size:11px;max-width:45%' }, dirname(p)),
+        h('button', { class: 'ibtn', title: 'Remove from favorites', onclick: (e) => { e.stopPropagation(); toggleFavorite(p); } }, '✕')))
+        : h('div', { class: 'note', style: 'padding:0 10px' }, 'Star a folder in the Library to pin it here.')),
     h('section', { class: 'card', style: 'padding:14px;display:flex;flex-direction:column;gap:2px' }, h('div', { class: 'lbl', style: 'padding:0 10px 6px' }, 'Recent folders'),
       recentFolders.length ? recentFolders.map((p) => h('div', { class: 'frow', title: p, onclick: () => { openFolder(p); S.view = 'analyze'; S.libCollapsed = false; emit(); } }, icon('folder', 14, '#A2AAB7'), h('span', { class: 'ellip', style: 'flex:1' }, basename(p)), h('span', { class: 'dim ellip', style: 'font-size:11px;max-width:45%' }, dirname(p))))
         : h('div', { class: 'note', style: 'padding:0 10px' }, 'Folders you open appear here.')),
@@ -384,6 +409,7 @@ function commands() {
     ['Save results', 'Ctrl S', () => f && saveResults(f)], ['Save session…', 'Ctrl Shift S', saveSessionAs], ['Open session…', 'Ctrl Alt O', openSessionDialog],
     ['Copy figure', 'Ctrl Shift C', () => f && copyFigure(f)], ['Reset plot view', 'Ctrl Home', () => f && resetView(f)], ['Edit plot', '', () => { S.editor.open = true; emit(); }],
     ['Go to Analyze', '', () => { S.view = 'analyze'; emit(); }], ['Go to Compare', '', () => { S.view = 'compare'; emit(); }], ['Go to Figure composer', '', () => { S.view = 'figure'; emit(); }], ['Go to Batch', '', () => { S.view = 'batch'; emit(); }],
+    ['Go to Day view', '', () => { S.view = 'day'; emit(); }], ['Go to Stacks', '', () => { S.view = 'stack'; emit(); }],
     ['Add current plot to Figure', '', () => import('./figure.js').then((m) => m.addCurrentPlot())],
     ['Toggle library', '', () => { S.libCollapsed = !S.libCollapsed; emit(); }],
     ['Watch current folder', '', () => { S.library.watching = !S.library.watching; emit(); }],
@@ -484,7 +510,8 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.key === 'Escape') {
     document.querySelectorAll('.popover,.ctx').forEach((p) => p.remove());
-    if (f?.pins?.length) { f.pins = []; emit(); }
+    if (f?.tool === 'select') { f.tool = 'zoom'; emit(); }
+    else if (f?.pins?.length) { f.pins = []; emit(); }
     else if (f?.measure?.length) { f.measure = []; emit(); }
     else if (S.editor.open) { S.editor.open = false; emit(); }
   }

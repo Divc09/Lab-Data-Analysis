@@ -7,9 +7,12 @@ import { figureMaps, linecuts, CMAP_GRADIENT, visibleSpots, peakCell, displayMap
 import { plotConfig, resultLines, baseStyle, MODE_LABEL, friendlyAxis } from './plotstyle.js';
 import { renderImage, copyImage, copyText } from './export.js';
 import { openSeriesEditor, editorPanel, applyPlotlyEdit } from './ploteditor.js';
+import * as sci from './science.js';
 
+let lastMapHover = null; // last heatmap cell under the mouse (for the right-click menu)
 let plotEl = null, plotBound = false, cutEl = null, plotPending = false;
 const roomy = (el) => el.clientWidth >= 40 && el.clientHeight >= 40;
+let fftEl = null; // readout span showing the FFT dominant frequency
 let readoutLive = null; // span in the readout bar that hover updates in place (null when something is pinned)
 const overlayCache = {};
 
@@ -196,6 +199,7 @@ function toolbar(f) {
       h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, disabled: !its, title: its ? 'Show individual iterations (choose which in Process)' : 'No per-iteration data',
         onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its ? (f.iterSel?.length || its.count) : '–')),
       layerChip(f, 'meanSd', 'Mean ± SD', null, { disabled: !its }),
+      layerChip(f, 'conf', 'Confidence', '#F08A3C', { tall: true, disabled: !fit?.dense?.band, title: fit?.dense?.band ? 'Fit confidence band' : 'No confidence band for this fit' }),
       layerChip(f, 'envelope', 'Envelope', '#7A4FD6', { disabled: !fit?.envelope, title: 'Rabi decay envelope (T2ρ)' }),
       layerChip(f, 'sigref', 'Signal + Ref (right axis)', null, { disabled: f.mode !== 'contrast' || f.info.reference_only }),
       layerChip(f, 'fft', 'FFT', null, { disabled: f.info.irregular }),
@@ -211,7 +215,9 @@ function toolbar(f) {
     h('button', { class: `ibtn ${f.tool === 'pan' ? 'on' : ''}`, title: 'Pan', onclick: () => setTool(f, 'pan') }, icon('pan')),
     tt ? h('button', { class: `btn sm ${f.ttPick === 'a' ? 'primary' : ''}`, title: 'Then drag a box on the plot to set window A', onclick: () => setWindowByDrag(f, 'a') }, 'Set A') : null,
     tt ? h('button', { class: `btn sm ${f.ttPick === 'b' ? 'primary' : ''}`, title: 'Then drag a box on the plot to set window B', onclick: () => setWindowByDrag(f, 'b') }, 'Set B') : null,
-    tt ? null : h('button', { class: `ibtn ${f.tool === 'select' ? 'on' : ''}`, title: 'Box-select points to exclude from the fit', onclick: () => setTool(f, 'select') }, icon('edit')),
+    tt ? null : (f.tool === 'select'
+      ? h('button', { class: 'btn sm primary', title: 'Drag a box around points to exclude them. Click again or press Esc to cancel.', onclick: () => setTool(f, 'zoom') }, icon('edit', 13), 'Drag to exclude · cancel')
+      : h('button', { class: 'ibtn', title: 'Exclude points: drag a box around them (one-shot)', onclick: () => setTool(f, 'select') }, icon('edit'))),
     h('button', { class: `ibtn ${f.tool === 'measure' ? 'on' : ''}`, title: 'Measure: click two points', onclick: () => { setTool(f, f.tool === 'measure' ? 'zoom' : 'measure'); f.measure = []; } }, icon('measure')),
     h('span', { class: 'sep' }),
     h('button', { class: 'btn', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), S.editor.open ? 'Close editor' : 'Edit plot'),
@@ -250,6 +256,7 @@ function drawPlot(f) {
   else if (k === 'tt') fig = figureTT(f);
   else fig = figureMaps(f, overlayCache[f.path]);
   if (!fig) return;
+  if (fftEl?.isConnected) { const pk = fig.fftPeak; fftEl.textContent = f.layers.fft && pk && Number.isFinite(pk.f) ? `FFT peak ≈ ${fmt(pk.f, 5)} ${pk.unit || ''}` : ''; }
   fig.layout.dragmode = f.ttPick && k === 'tt' ? 'select' : f.tool === 'pan' ? 'pan' : f.tool === 'select' ? 'select' : 'zoom';
   requestAnimationFrame(() => {
     if (!roomy(el)) { plotPending = true; return; }
@@ -402,6 +409,7 @@ function bindPlot(el) {
     const idx = new Set(f.proc.excluded);
     ev.points.filter((p) => p.data.meta?.key === 'data').forEach((p) => (d.proc.groups[p.pointIndex] || []).forEach((r) => idx.add(r)));
     toast(`Excluded ${ev.points.length} point(s). Undo with Ctrl+Z.`);
+    f.tool = 'zoom'; // one-shot: return to zoom after excluding
     setProc(f, { excluded: [...idx] }, 'exclude selection');
   });
   el.addEventListener('dblclick', (e) => {
@@ -410,10 +418,21 @@ function bindPlot(el) {
     const t = e.target.closest('.scatterlayer .trace, .legendtext, .legendtoggle');
     if (t && e.target.closest('.legend')) return; // handled by legend events
   });
+  el.addEventListener('mousedown', (e) => { if (e.button === 2) e.stopPropagation(); }, true);
+  el.on('plotly_hover', (ev) => { const p = ev.points?.[0]; if (p?.data?.type === 'heatmap') lastMapHover = [p.x, p.y]; });
   el.addEventListener('contextmenu', (e) => {
     const f = active(); if (!f) return;
     e.preventDefault();
+    e.stopPropagation();
+    const map = kindOf(f) === '2d';
+    const cutAt = (pos, mode) => { if (!pos) return; f.map.cursor = pos; f.map.linecut = mode; emit(); };
     contextMenu(e.clientX, e.clientY, [
+      map && lastMapHover ? { label: 'Horizontal cut here', run: () => cutAt(lastMapHover, 'h') } : null,
+      map && lastMapHover ? { label: 'Vertical cut here', run: () => cutAt(lastMapHover, 'v') } : null,
+      map && lastMapHover ? { label: 'Both cuts here', run: () => cutAt(lastMapHover, 'cross') } : null,
+      map ? { label: 'Cut at peak', run: () => cutAt(peakCell(f, f.detector), f.map.linecut === 'none' ? 'cross' : f.map.linecut) } : null,
+      map ? { label: 'Cut at dip', run: () => cutAt(peakCell(f, f.detector, true), f.map.linecut === 'none' ? 'cross' : f.map.linecut) } : null,
+      map && f.map.cursor ? { label: 'Clear cut', run: () => { f.map.cursor = null; f.map.linecut = 'none'; emit(); } } : null,
       { label: 'Edit plot…', run: () => { S.editor.open = true; emit(); } },
       { label: 'Copy figure', kbd: 'Ctrl Shift C', run: () => copyFigure(f) },
       { label: 'Reset view', kbd: 'Ctrl Home', run: () => resetView(f) },
@@ -472,7 +491,7 @@ function readout(f) {
   const d = f.data[f.detector];
   const fit = f.fit[f.detector];
   const row = h('div', { class: 'readout' });
-  readoutLive = null;
+  readoutLive = null; fftEl = null;
   if (f.tool === 'measure') {
     const m = f.measure || [];
     if (m.length < 2) row.append(h('span', { class: 'muted' }, `Measure: click ${2 - m.length} point${m.length ? '' : 's'} on the plot.`));
@@ -483,10 +502,12 @@ function readout(f) {
   if (!f.pins.length) {
     const hint = h('span', { class: 'dim' }, kindOf(f) === 'tt' ? 'Click a sample to inspect its timing. Set windows A/B in the Stats tab.' : 'Click a point to pin it · Ctrl-click adds more · Esc clears · double-click a legend entry to style it · right-click for more');
     hint.dataset.def = hint.textContent; readoutLive = hint;
-    row.append(hint, h('span', { class: 'sp' }), h('button', { class: 'btn sm', title: 'Copy the processed data (and fit, residual) as a tab-separated table', onclick: () => copyData(f) }, 'Copy data'));
+    fftEl = f.layers.fft ? h('span', { class: 'mono' }) : null;
+    row.append(hint, fftEl, h('span', { class: 'sp' }), h('button', { class: 'btn sm', title: 'Copy the processed data (and fit, residual) as a tab-separated table', onclick: () => copyData(f) }, 'Copy data'));
     return row;
   }
   const p = f.pins[f.pins.length - 1];
+  if (f.layers.fft && kindOf(f) === '1d') { fftEl = h('span', { class: 'mono' }); row.append(fftEl); }
   row.append(h('span', { class: 'row', style: 'gap:6px' }, h('span', { style: 'width:9px;height:9px;border-radius:5px;border:2px solid #E0A400;display:inline-block' }), h('span', { class: 'muted' }, f.pins.length > 1 ? `${f.pins.length} pinned` : 'Pinned')),
     h('span', { class: 'mono' }, `x ${p.x}`), h('span', { class: 'mono' }, `y ${p.y}`));
   if (kindOf(f) === 'tt') {
@@ -596,8 +617,22 @@ export function renderInspector(f, insp) {
   if (!tabs.some(([t]) => t === f.tab)) f.tab = tabs[0][0];
   const body = h('div', { class: 'insp-body' });
   const builders = { fit: fitTab, proc: procTab, plot: plotTab, export: exportTab, info: infoTab, stats: statsTab, map: mapTab, spots: spotsTab, compare: mapCompareTab };
-  body.append(builders[f.tab](f));
+  const pane = builders[f.tab](f);
+  if (f.tab === 'stats') pane.append(sci.ttSciCard(f));
+  body.append(pane);
   mount(insp, h('div', { class: 'tabs', role: 'tablist' }, tabs.map(([t, l]) => h('button', { class: f.tab === t ? 'on' : '', role: 'tab', onclick: () => { f.tab = t; emit('insp'); } }, l))), body);
+}
+
+// ---- ODMR display controls (rendering lives in plot1d.js; stored in f.display = { invert, xscale, xoffset })
+function displayControls(f) {
+  f.display = f.display || { invert: false, xscale: 1, xoffset: 0 };
+  const D = f.display;
+  const upd = (patch) => { commit('display'); Object.assign(D, patch); emit(); };
+  return h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Display'),
+    seg([[false, 'Peaks'], [true, 'Dips (invert)']], !!D.invert, (v) => upd({ invert: v })),
+    h('div', { class: 'g2' }, field('Axis scale (×)', input(D.xscale ?? 1, (v) => upd({ xscale: num(v) || 1 }), { title: 'Displayed x = scale · x + offset' })),
+      field('Axis offset', input(D.xoffset ?? 0, (v) => upd({ xoffset: num(v) ?? 0 })))),
+    h('div', { class: 'note' }, 'Display only: the fit and exported numbers stay in the file\'s own units.'));
 }
 
 // ---- Fit tab
@@ -622,6 +657,7 @@ function fitTab(f) {
   const generic = [['Auto', `Auto · ${fam}`], ['GaussianPeaks', 'Gaussian peaks'], ['CustomModel', 'Custom expression']];
   if (kindOf(f) === 'tt') generic.splice(0, 1, ['Auto', 'TimeTraceDecay · background + A·exp(−t/τ)']);
   out.append(field('Model', select(generic, s.model, (v) => set({ model: v }))));
+  if (fam === 'ODMR' && kindOf(f) === '1d') out.append(displayControls(f));
   if (s.model === 'Auto') {
     if (fam === 'Rabi') {
       out.append(field('Rabi model', select(MODELS_BY_FAMILY.Rabi, s.rabi_mode, (v) => set({ rabi_mode: v }))), h('div', { class: 'note' }, MODEL_HELP[s.rabi_mode] || ''));
@@ -659,22 +695,32 @@ function fitTab(f) {
     h('div', { class: 'row' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(Math.min(...fr.filter(Number.isFinite)), 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
       input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { placeholder: fr.length ? fmt(Math.max(...fr.filter(Number.isFinite)), 5) : 'max', style: 'width:90px' }),
       h('button', { class: 'btn sm', title: 'Use the current zoomed x range', onclick: () => set({ range_min: f.xrange?.[0] ?? null, range_max: f.xrange?.[1] ?? null }) }, 'Use view'),
-      h('button', { class: 'btn sm', onclick: () => set({ range_min: null, range_max: null }) }, 'All'))));
+      h('button', { class: 'btn sm', onclick: () => set({ range_min: null, range_max: null }) }, 'All'),
+      h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const xs = fr.filter(Number.isFinite); const lo = Math.min(...xs), hi = Math.max(...xs); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
+      h('button', { class: 'btn sm', title: 'Clear the range so the experiment profile chooses it', onclick: () => set({ range_min: null, range_max: null }) }, 'Profile default'))));
   // options
-  const opts = h('details', { class: 'card pad' }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : ''}${s.apply_both ? ' · both detectors' : ''}`),
+  const opts = h('details', { class: 'card pad' }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
     h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
       h('div', { class: 'g2' }, field('Multistart', input(s.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }))),
         fam === 'Rabi' ? field('Delay / dead time (ns)', input(s.dead_time_ns || '', (v) => set({ dead_time_ns: num(v) || 0 }), { placeholder: 'fit' })) : h('span')),
       fam === 'Rabi' ? [check('Weight by iteration SEM', s.sem_weights, (v) => set({ sem_weights: v })),
         check('Lock to π / π/2 times', s.pi_lock, (v) => set({ pi_lock: v })),
         s.pi_lock ? h('div', { class: 'g2' }, field('π (ns)', input(s.pi_ns, (v) => set({ pi_ns: num(v) }))), field('π/2 (ns)', input(s.pi2_ns, (v) => set({ pi2_ns: num(v) })))) : null] : null,
+      sci.semAllCheck(f, set),
       check('Fit smoothed data', s.fit_smoothed, (v) => set({ fit_smoothed: v })),
       f.proc.steps.length ? check('Fit the transformed data', s.fit_transformed, (v) => set({ fit_transformed: v })) : null,
       f.info.detectors.length > 1 ? field('Apply to', seg([[false, 'Active detector'], [true, 'Both detectors']], s.apply_both, (v) => set({ apply_both: v }))) : null));
+  out.append(presetCard(f));
   out.append(h('div', { class: 'row' },
     h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: f.fitting, onclick: () => runFit(f) }, f.fitting ? h('span', { class: 'spinner' }) : null, 'Run fit', h('span', { class: 'kbd' }, 'Ctrl F')),
     h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: f.fitting, title: 'Fits subsets of the data and keeps the candidate that best describes the full trace', onclick: () => runFit(f, { robust: true }) }, 'Robust fit', h('span', { class: 'kbd' }, 'Ctrl Shift F'))));
-  if (fit) out.append(resultCard(f, fit), paramCard(f, fit));
+  if (fit) out.append(resultCard(f, fit), paramCard(f, fit), sci.bootstrapCard(f, fit, () => {
+    const hs = f.fitHistory.find((e) => e.res === fit);
+    const spec = clone(hs ? hs.spec : f.fitSpec); spec.robust = false;
+    if (spec.model === 'CustomModel') spec.custom_spec = customSpec(spec);
+    return spec;
+  }));
+  if (fam === 'ODMR' && kindOf(f) === '1d') out.append(sci.nvFieldCard(f, () => { const spec = clone(f.fitSpec); spec.robust = false; return spec; }));
   if (f.fitHistory.length > 1) out.append(historyCard(f));
   return out;
 }
@@ -690,7 +736,8 @@ function resultCard(f, fit) {
     tiles.length ? h('div', { class: 'g2' }, tiles) : null,
     h('div', { class: 'kv' }, h('span', { class: 'k' }, 'R²'), h('span', { class: 'v' }, fmt(fit.r2, 5)), h('span', { class: 'k' }, 'RMSE'), h('span', { class: 'v' }, fmt(fit.rmse, 4)),
       h('span', { class: 'k' }, 'Durbin–Watson'), h('span', { class: 'v' }, fmt(fit.dw, 3)), h('span', { class: 'k' }, 'AIC / BIC'), h('span', { class: 'v' }, `${fmt(fit.aic, 5)} / ${fmt(fit.bic, 5)}`),
-      h('span', { class: 'k' }, 'Bound hits'), h('span', { class: 'v' }, String(fit.bound_hits))),
+      h('span', { class: 'k' }, 'Bound hits'), h('span', { class: 'v' }, String(fit.bound_hits)), sci.chi2Rows(fit)),
+    sci.chi2Note(fit),
     fit.status !== 'PASS' ? h('div', { class: 'note', style: 'color:var(--warn)' }, fit.reason) : null,
     fit.candidates ? h('div', { class: 'note' }, 'Candidates: ' + fit.candidates.map((c) => `${c.model} R² ${fmt(c.r2, 3)}`).join(' · ')) : null,
     h('details', {}, h('summary', {}, 'All derived values'), h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(fit.metrics || {}).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v' }, typeof v === 'number' ? fmt(v, 6) : String(v))])),
@@ -746,7 +793,40 @@ async function savePreset(f) {
   if (!name) return;
   const presets = { ...(S.settings.fit_presets || {}), [name]: { ...clone(f.fitSpec), type: f.info.type } };
   S.settings = await call('settings_set', { patch: { fit_presets: presets } });
-  toast(`Saved preset “${name}”.`, 'ok');
+  toast(`Saved preset “${name}”.`, 'ok'); emit('insp');
+}
+
+function presetCard(f) {
+  const presets = S.settings.fit_presets || {};
+  const names = Object.keys(presets).sort((a, b) => (presets[b].type === f.info.type) - (presets[a].type === f.info.type) || a.localeCompare(b));
+  const keep = f.keepRange !== false;
+  const apply = (spec) => { commit('apply preset'); const { type, ...rest } = clone(spec); const r = keep ? { range_min: f.fitSpec.range_min, range_max: f.fitSpec.range_max } : {}; f.fitSpec = { ...defaultFitSpec(f.info), ...rest, ...r }; emit(); };
+  const del = async (name) => { const next = { ...presets }; delete next[name]; S.settings = await call('settings_set', { patch: { fit_presets: next } }); emit('insp'); toast(`Deleted preset “${name}”.`); };
+  const picker = h('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+  picker.addEventListener('change', () => {
+    const file = picker.files[0]; if (!file) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const j = JSON.parse(String(rd.result));
+        const pn = j.param_names || [];
+        if (!j.expression) throw new Error('no "expression" field');
+        const lim = (v) => (v === undefined || v === null || Math.abs(v) >= 1e299 ? null : v);
+        commit('import custom model');
+        Object.assign(f.fitSpec, { model: 'CustomModel', custom_expr: j.expression,
+          custom_params: pn.map((n, i) => ({ name: n, seed: j.seed?.[i] ?? 1, min: lim(j.lower?.[i]), max: lim(j.upper?.[i]) })) });
+        toast(`Imported custom model${j.name ? ` “${j.name}”` : ''}.`, 'ok'); emit();
+      } catch (e) { toast(`Could not import model JSON: ${e.message}`, 'err'); }
+    };
+    rd.readAsText(file); picker.value = '';
+  });
+  return h('details', { class: 'card pad' }, h('summary', {}, `Presets (${names.length})`),
+    h('div', { style: 'display:flex;flex-direction:column;gap:6px;margin-top:8px' },
+      check('Keep current fit range when applying', keep, (v) => { f.keepRange = v; emit('insp'); }),
+      names.length ? names.map((n) => h('div', { class: 'row' }, h('span', { class: 'ellip', style: 'flex:1', title: presets[n].type || '' }, n, presets[n].type ? h('span', { class: 'dim' }, ` · ${presets[n].type}`) : null),
+        h('button', { class: 'btn sm', onclick: () => apply(presets[n]) }, 'Apply'), h('button', { class: 'btn sm', onclick: () => del(n) }, 'Delete')))
+        : h('div', { class: 'note' }, 'None yet. Use Seeds & bounds › Save as preset.'),
+      h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => picker.click() }, 'Import custom model JSON…'), picker)));
 }
 
 function historyCard(f) {
@@ -777,6 +857,12 @@ function procTab(f) {
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Excluded points'),
     nEx ? h('div', { class: 'row wrap' }, h('span', { class: 'mono' }, `${f.proc.excluded.length} point(s)`), h('button', { class: 'btn sm', onclick: () => setProc(f, { excluded: [], exclusion_ranges: [] }, 'restore points') }, 'Restore all'))
       : h('div', { class: 'note' }, 'None. Click a point and press Exclude, or use the box-select tool (pencil) to exclude several. Excluded points are dropped from fits but never from the file.')));
+  const exr = f.proc.exclusion_ranges || [];
+  const exIn = [h('input', { class: 'field', placeholder: 'x from', style: 'width:80px' }), h('input', { class: 'field', placeholder: 'to', style: 'width:80px' })];
+  out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Exclude x range'),
+    h('div', { class: 'row' }, exIn, h('button', { class: 'btn sm', onclick: () => { const a = num(exIn[0].value), b = num(exIn[1].value); if (a === null || b === null) { toast('Enter both ends of the range.'); return; } setProc(f, { exclusion_ranges: [...exr, [Math.min(a, b), Math.max(a, b)]] }, 'exclude range'); } }, 'Add')),
+    exr.map((r, i) => h('div', { class: 'row' }, h('span', { class: 'mono', style: 'flex:1' }, `${fmt(r[0], 6)} to ${fmt(r[1], 6)}`),
+      h('button', { class: 'ibtn', title: 'Remove range', onclick: () => setProc(f, { exclusion_ranges: exr.filter((_, j) => j !== i) }, 'remove exclusion range') }, icon('close', 14))))));
   // baseline file
   const others = Object.values(S.files).filter((o) => o.path !== f.path && o.info.dim !== 'scan2d');
   out.append(field('Subtract another file', select([['', 'None'], ...others.map((o) => [o.path, o.info.name])], f.proc.baseline?.path || '',
@@ -798,6 +884,7 @@ function procTab(f) {
   out.append(h('div', { class: 'f' }, h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Transform steps · in order'), h('span', { class: 'sp' }),
     select([['', 'Add step…'], ...KINDS], '', (v) => { if (v) setProc(f, { steps: [...clone(f.proc.steps), { kind: v, params: {}, enabled: true }] }, 'add transform'); }, { style: 'width:120px;height:26px' })),
   stepRows.length ? stepRows : h('div', { class: 'note' }, 'Steps change only the analysed copy. Fits use the untransformed data unless "Fit the transformed data" is ticked in Fit › Options.')));
+  if (kindOf(f) === '1d') out.append(sci.deerCard(f));
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Overlays'), h('div', { class: 'note' }, 'Tick other 1D files in the Library to overlay them. Overlays follow this file\'s detector and observable.'),
     S.overlays.filter((p) => p !== f.path).map((p) => h('div', { class: 'row' }, h('span', { class: 'ellip', style: 'flex:1' }, basename(p)), h('button', { class: 'btn sm', onclick: () => { S.overlays = S.overlays.filter((q) => q !== p); emit(); } }, 'Remove')))));
   return out;
@@ -818,6 +905,7 @@ function plotTab(f) {
       (v) => { commit('legend'); if (v === 'hidden') f.layers.legend = false; else { f.layers.legend = true; st.legend = { ...(st.legend || {}), pos: v, x: null, y: null }; } emit(); })),
     kindOf(f) === '1d' ? field('Results box', seg([['off', 'Off'], ['compact', 'Compact'], ['pm', 'With errors']], !f.layers.results ? 'off' : (s.results.format === 'pm' ? 'pm' : 'compact'),
       (v) => { commit('results box'); f.layers.results = v !== 'off'; st.results = { ...(st.results || {}), format: v === 'pm' ? 'pm' : 'sig4' }; emit(); })) : null,
+    kindOf(f) === '1d' ? displayControls(f) : null,
     kindOf(f) === '1d' ? field('Uncertainty', seg([['band', 'Band'], ['bars', 'Error bars']], f.errorMode, (v) => { f.errorMode = v; f.layers.band = true; emit(); })) : null,
     h('div', { class: 'g3' }, field('Width (in)', input(s.width_in, (v) => set({ width_in: num(v) || 8.5 }))), field('Height (in)', input(s.height_in, (v) => set({ height_in: num(v) || 5.5 }))), field('DPI', input(s.dpi, (v) => set({ dpi: num(v) || 300 })))),
     h('div', { class: 'row wrap' }, check('Grid', s.grid, (v) => set({ grid: v })), check('Mirror ticks', s.mirror, (v) => set({ mirror: v })), kindOf(f) === '1d' ? check('Residual panel', f.layers.res, (v) => { f.layers.res = v; emit(); }) : null),
@@ -837,7 +925,8 @@ function exportTab(f) {
     h('div', { class: 'note' }, `${st.width_in} × ${st.height_in} in at ${st.dpi} dpi. Change size in Plot. PDF embeds the ${st.dpi}-dpi image; use SVG for editable vector output.`),
     h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Data files'),
       c('json', 'Results JSON (settings, fit, provenance)'),
-      k === '1d' ? [c('csv', 'Fit parameters CSV'), c('origin', 'Origin bundle CSV (x, y, smooth, fit, residual)'), c('report', 'Report PNG (figure + all metrics)')] : null,
+      k === '1d' ? [c('csv', 'Fit parameters CSV'), c('origin', 'Origin bundle CSV (x, y, smooth, fit, residual)'), c('report', 'Report PNG (figure + all metrics)'), c('report_pdf', 'Report PDF (figure + all metrics)')] : null,
+      k === '1d' && f.fit[f.detector] ? reportPicker(f) : null,
       k === 'tt' ? [c('time_trace', '__time_trace.csv (both detectors, indices, timing)'), c('csv', 'Fit parameters CSV')] : null,
       k === '2d' ? [c('spots_csv', '__spots.csv (full spot table)'), c('map_csv', '__map_comparison.csv (cells, values, RGB)', !overlayCache[f.path])] : null,
       f.info.detectors.length > 1 ? c('detectors_raw', '__detectors_raw.csv') : null,
@@ -861,7 +950,13 @@ export async function saveResults(f) {
   if (e.png || e.pdf) { const png = await renderImage(fig, size); if (e.png) images.png = png; if (e.pdf) images.pdf_png = png; }
   if (e.svg || e.pdf) { const svg = await renderImage(fig, { ...size, format: 'svg' }); if (e.svg) images.svg = svg; if (e.pdf) images.pdf_svg = svg; }
   const fit = f.fit[f.detector];
-  if (e.report && fit) images.report_png = await renderImage(reportFigure(f, fig, fit), { width_in: st.width_in + 3.2, height_in: st.height_in, dpi: st.dpi });
+  let reportImgs = null;
+  if ((e.report || e.report_pdf) && fit) {
+    const rs = { width_in: st.width_in + 3.2, height_in: st.height_in, dpi: st.dpi }, rf = reportFigure(f, fig, fit);
+    const rpng = await renderImage(rf, rs);
+    if (e.report) images.report_png = rpng;
+    if (e.report_pdf) reportImgs = { pdf_png: rpng, pdf_svg: await renderImage(rf, { ...rs, format: 'svg' }) };
+  }
   const dir = f.expDir || `${dirname(f.path)}\\SmartFitter results`;
   const det = f.info.detectors.length > 1 ? `__${f.detector}` : '';
   const stemName = (f.expStem || stem(f.path)) + det;
@@ -870,19 +965,37 @@ export async function saveResults(f) {
   const res = await call('export', { req: {
     output_dir: dir, stem: stemName, images, dpi: st.dpi, source: f.path, detector: f.detector, mode: f.mode, processing: f.proc, fit_spec: f.fitSpec,
     fit: fit ? { ...fit, raw: undefined, dense: undefined } : null, json: e.json, csv: e.csv && !!fit, origin: e.origin, detectors_raw: e.detectors_raw, time_trace: e.time_trace,
-    spots: spotsRows, spots_csv: e.spots_csv && spotsRows?.length, plot_state: { style: f.style, layers: f.layers },
+    spots: spotsRows, spots_csv: e.spots_csv && spotsRows?.length, plot_state: { style: f.style, layers: f.layers, sample: f.sample, display: f.display },
     map_comparison_csv: e.map_csv && overlayCache[f.path], map_comparison_request: k === '2d' && overlayCache[f.path] ? [{ path: f.path, detector: f.detector, mode: f.mode }, { ...(M.compareWith || { path: f.path, detector: f.info.detectors.find((x) => x !== f.detector) }), mode: f.mode }, { shared: M.overlayScale === 'shared', background: M.background, palette: M.palette }] : null,
   } }, { label: 'Saving results' });
+  if (reportImgs) await call('export', { req: { output_dir: dir, stem: `${stemName}_report`, images: reportImgs, dpi: st.dpi, json: false } }, { label: 'Saving report PDF' });
   if (e.session) { const { saveSession } = await import('./app.js'); await saveSession(`${dir}\\${stemName}.sfsession.json`); }
   toast(`Saved ${res.written.length} file(s) to ${res.folder}`, 'ok');
   return res;
 }
 
+function reportKeyList(f, fit) {
+  const base = resultLines(fit, f.info).map((l) => [l.key, l.label]);
+  return [['model', 'Model + status'], ...base, ['rmse', 'RMSE / Durbin–Watson'], ['aicbic', 'AIC / BIC'], ['params', 'Parameters table']];
+}
+function reportPicker(f) {
+  const fit = f.fit[f.detector];
+  const all = reportKeyList(f, fit);
+  const cur = new Set(f.reportKeys || all.map(([k]) => k));
+  return h('details', { class: 'card pad' }, h('summary', {}, `Report contents (${all.filter(([k]) => cur.has(k)).length}/${all.length})`),
+    h('div', { style: 'display:flex;flex-direction:column;gap:4px;margin-top:6px' },
+      all.map(([k, lab]) => check(lab, cur.has(k), (v) => { v ? cur.add(k) : cur.delete(k); f.reportKeys = all.map(([q]) => q).filter((q) => cur.has(q)); emit('insp'); }))));
+}
+
 function reportFigure(f, fig, fit) {
-  const lines = resultLines(fit, f.info).map((l) => `${l.label} = ${l.err ? fmtPm(l.value, l.err) : fmt(l.value, 5)}${l.unit ? ' ' + l.unit : ''}`);
+  const has = (k) => !f.reportKeys || f.reportKeys.includes(k);
+  const lines = resultLines(fit, f.info).filter((l) => has(l.key)).map((l) => `${l.label} = ${l.err ? fmtPm(l.value, l.err) : fmt(l.value, 5)}${l.unit ? ' ' + l.unit : ''}`);
   const params = fit.params.map((p) => `${p.name} = ${fmt(p.value, 5)}${p.error ? ' ± ' + fmt(p.error, 2) : ''}`);
-  const txt = [`<b>${f.info.name}</b>`, `${fit.model} · ${MODE_LABEL[f.mode]}`, `Status ${fit.status}`, '', ...lines, '', '<b>Parameters</b>', ...params,
-    '', `RMSE ${fmt(fit.rmse, 4)} · DW ${fmt(fit.dw, 3)}`].join('<br>');
+  const sam = f.sample || {};
+  const sampleLine = [sam.id, sam.condition, sam.power, sam.date].filter(Boolean).join(' · ');
+  const txt = [`<b>${f.info.name}</b>`, sampleLine || null, has('model') ? `${fit.model} · ${MODE_LABEL[f.mode]}` : null, has('model') ? `Status ${fit.status}` : null, '', ...lines,
+    has('params') ? '<br><b>Parameters</b>' : null, ...(has('params') ? params : []),
+    has('rmse') || has('aicbic') ? '' : null, has('rmse') ? `RMSE ${fmt(fit.rmse, 4)} · DW ${fmt(fit.dw, 3)}` : null, has('aicbic') ? `AIC ${fmt(fit.aic, 5)} · BIC ${fmt(fit.bic, 5)}` : null].filter((t) => t !== null).join('<br>');
   const layout = clone(fig.layout);
   layout.margin = { ...(layout.margin || {}), r: 320 };
   layout.annotations = [...(layout.annotations || []).filter((a) => a.name !== 'results'), { xref: 'paper', yref: 'paper', x: 1.03, y: 1, xanchor: 'left', yanchor: 'top', align: 'left', showarrow: false, text: txt, font: { family: 'Consolas, monospace', size: 11 } }];
@@ -894,7 +1007,16 @@ function infoTab(f) {
   const i = f.info;
   const meta = i.metadata || {};
   const rows = [['File', i.path], ['Type', i.type], ['Scan', i.dim], ['Axes', (i.axes || []).join(', ')], ['Detectors', i.detectors.map((d) => detLabel(f, d)).join(', ')], ['Units', i.unit || '–']];
+  f.sample = f.sample || {};
+  const sm = (key, label, props = {}) => field(label, input(f.sample[key] ?? '', (v) => { commit('sample'); f.sample[key] = v; emit('insp'); }, props));
+  const notes = h('textarea', { class: 'field', rows: 3 }, f.sample.notes || '');
+  notes.addEventListener('change', () => { f.sample.notes = notes.value; });
+  notes.addEventListener('keydown', (e) => e.stopPropagation());
   return h('div', { style: 'display:flex;flex-direction:column;gap:12px' },
+    h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Sample (saved with the session and in results JSON)'),
+      h('div', { class: 'g2' }, sm('id', 'Sample ID'), sm('condition', 'Condition')),
+      h('div', { class: 'g2' }, sm('power', 'Power'), sm('date', 'Date', { placeholder: 'YYYY-MM-DD' })),
+      field('Notes', notes)),
     h('div', { class: 'kv' }, rows.flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v', style: 'font-size:11.5px' }, v)])),
     i.detectors.length > 1 ? h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Detector labels (this session, saved in exports)'),
       i.detectors.map((d) => input(detLabel(f, d), (v) => { f.labels[d] = v; emit(); }))) : null,
@@ -1007,7 +1129,7 @@ function spotsTab(f) {
     h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', onclick: run }, 'Detect and fit'), f.info.detectors.length > 1 ? seg([['both', 'Both detectors'], ['active', 'Active']], o.scope, (v) => set({ scope: v })) : null),
     h('div', { class: 'g2' }, field('Analyze', select([['auto', 'Auto fluorescence'], ['value', 'Current observable'], ['signal', 'Signal'], ['reference', 'Reference'], ['difference', 'Difference']], o.source, (v) => set({ source: v }))),
       field('Polarity', select(['Auto', 'Bright', 'Dark', 'Bright and dark'], o.polarity, (v) => set({ polarity: v })))),
-    h('div', { class: 'g3' }, field('Threshold (σ)', input(o.threshold, (v) => set({ threshold: num(v) || 3 }))), field('Min pixels', input(o.min_pixels, (v) => set({ min_pixels: num(v) || 4 }))), field('Background', input(o.bg_window || 'auto', (v) => set({ bg_window: num(v) || 0 })))),
+    h('div', { class: 'g3' }, field('Max spots', input(o.max_spots ?? '', (v) => set({ max_spots: num(v) }), { placeholder: 'auto' })), field('Threshold (σ)', input(o.threshold, (v) => set({ threshold: num(v) || 3 }))), field('Min pixels', input(o.min_pixels, (v) => set({ min_pixels: num(v) || 4 }))), field('Background', input(o.bg_window || 'auto', (v) => set({ bg_window: num(v) || 0 })))),
     h('div', { class: 'row wrap' }, check('Fitted shapes', M.showShapes, (v) => { M.showShapes = v; emit(); }), check('Centers', M.showCenters, (v) => { M.showCenters = v; emit(); }), check('Numbers', M.showNumbers, (v) => { M.showNumbers = v; emit(); })),
     h('div', { class: 'card pad' },
       h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, `${rows.length} spot${rows.length === 1 ? '' : 's'}`), h('span', { class: 'sp' }),

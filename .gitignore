@@ -30,3 +30,7 @@ Thumbs.db
 
 # Machine-specific launcher created by smartfitter.install
 SmartFitter.lnk
+
+# Portable build output
+build/
+dist/

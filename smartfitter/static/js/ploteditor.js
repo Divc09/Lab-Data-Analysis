@@ -108,19 +108,19 @@ export function applyPreset(f, name) {
 // ------------------------------------------------------------ editor drawer
 export function editorPanel(f) {
   const tab = S.editor.tab;
-  const tabs = [['series', 'Series'], ['legend', 'Legend'], ['axes', 'Axes & ticks'], ['text', 'Text & results'], ['style', 'Layout & style']];
+  const tabs = [['series', 'Series'], ['legend', 'Legend'], ['axes', 'Axes & ticks'], ['text', 'Text & results'], ...(kindOf(f) === '1d' ? [['inset', 'Inset & breaks']] : []), ['style', 'Layout & style']];
   const body = h('div', { class: 'insp-body' });
-  body.append({ series: seriesTab, legend: legendTab, axes: axesTab, text: textTab, style: styleTab }[tab](f));
+  body.append(({ series: seriesTab, legend: legendTab, axes: axesTab, text: textTab, inset: insetTab, style: styleTab }[tab] || seriesTab)(f));
   return h('frag', {},
     h('div', { class: 'row', style: 'padding:12px 12px 0' }, h('span', { style: 'font-weight:600' }, 'Plot editor'), h('span', { class: 'sp' }),
       h('button', { class: 'btn sm', title: 'Undo (Ctrl+Z)', onclick: () => import('./state.js').then((m) => m.undo()) }, icon('undo', 13)),
       h('button', { class: 'btn sm primary', onclick: () => { S.editor.open = false; emit(); } }, 'Done')),
     h('div', { class: 'row wrap', style: 'padding:8px 12px 0;gap:4px' }, h('span', { class: 'lbl' }, 'Add'),
-      ['Text', 'Arrow', 'V line', 'H line', 'Region', 'Fit value'].map((k) => h('button', { class: 'btn sm', onclick: (e) => addDecoration(f, k, e) }, k))),
+      ['Text', 'Arrow', 'V line', 'H line', 'Region', 'Fit value', ...(kindOf(f) === '1d' ? ['Inset'] : [])].map((k) => h('button', { class: 'btn sm', onclick: (e) => addDecoration(f, k, e) }, k))),
     h('div', { class: 'etabs', role: 'tablist' }, tabs.map(([k, l]) => h('button', { class: tab === k ? 'on' : '', onclick: () => { S.editor.tab = k; emit('insp'); } }, l))),
     body,
     h('div', { class: 'row wrap', style: 'padding:10px 12px;border-top:1px solid var(--line)' },
-      h('button', { class: 'btn sm', onclick: async () => { S.settings = await call('settings_set', { patch: { plot_style: { ...clone(f.style), shapes: [], title: '', x: {}, y: {}, y2: {} } } }); toast('Saved as your default style for new files.', 'ok'); } }, 'Save as my default'),
+      h('button', { class: 'btn sm', onclick: async () => { S.settings = await call('settings_set', { patch: { plot_style: { ...clone(f.style), shapes: [], inset: undefined, xbreak: undefined, title: '', x: {}, y: {}, y2: {} } } }); toast('Saved as your default style for new files.', 'ok'); } }, 'Save as my default'),
       h('button', { class: 'btn sm', onclick: () => { commit('reset style'); f.style = clone(S.settings.plot_style || {}); emit(); } }, 'Reset to default'),
       h('button', { class: 'btn sm', title: 'Apply this presentation to every open file of the same type', onclick: () => applyToType(f) }, 'Apply to same type')));
 }
@@ -139,6 +139,16 @@ function addDecoration(f, kind, ev) {
   const ya = el.layout?.yaxis?.range || f.yrange || [0, 1];
   const cx = (xa[0] + xa[1]) / 2, cy = (ya[0] + ya[1]) / 2;
   f.style.shapes = f.style.shapes || [];
+  if (kind === 'Inset') {
+    commit('add inset');
+    const third = (xa[1] - xa[0]) / 3;
+    const zoomed = f.xrange || el.layout?.xaxis?.autorange === false;
+    f.style.inset = { pos: 'ur', size: 0.35, y: null, ...(f.style.inset || {}), enabled: true, x0: zoomed ? xa[0] : xa[0] + third, x1: zoomed ? xa[1] : xa[0] + 2 * third };
+    S.editor.tab = 'inset';
+    emit();
+    toast('Inset added. Edit its range and corner in Inset & breaks.');
+    return;
+  }
   const pinX = f.pins?.[0]?.x;
   if (kind === 'Fit value') {
     const fit = f.fit[f.detector];
@@ -212,6 +222,28 @@ function axesTab(f) {
     f.layers.sigref || f.compareDetectors ? axisCard(f, 'y2', 'Right Y axis') : h('div', { class: 'note' }, 'A right-hand axis appears automatically when Signal + Reference counts or a second detector in counts are shown.'),
     field('Ticks', seg([['outside', 'Outside'], ['inside', 'Inside'], ['none', 'None']], st.ticks, (v) => { commit('ticks'); f.style.ticks = v; emit(); })),
     h('div', { class: 'row wrap' }, check('Mirror ticks on top/right', st.mirror, (v) => { commit('mirror'); f.style.mirror = v; emit(); }), check('Grid', st.grid, (v) => { commit('grid'); f.style.grid = v; emit(); })));
+}
+
+function insetTab(f) {
+  const ins = f.style.inset || {};
+  const xb = f.style.xbreak || {};
+  const blocked = currentFigure(f)?.xbreakBlocked;
+  const setI = (patch) => { commit('inset'); f.style.inset = { pos: 'ur', size: 0.35, ...(f.style.inset || {}), ...patch }; emit(); };
+  const setB = (patch) => { commit('x break'); f.style.xbreak = { ...(f.style.xbreak || {}), ...patch }; emit(); };
+  const yAuto = !ins.y;
+  return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
+    h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, h('span', { style: 'font-weight:600' }, 'Inset zoom'),
+      check('Show inset', !!ins.enabled, (v) => setI({ enabled: v })),
+      h('div', { class: 'g2' }, field('Zoom from x', input(ins.x0 ?? '', (v) => setI({ x0: num(v) }))), field('Zoom to x', input(ins.x1 ?? '', (v) => setI({ x1: num(v) })))),
+      field('Corner', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right']], ins.pos || 'ur', (v) => setI({ pos: v }))),
+      field('Size (fraction of plot width)', input(ins.size ?? 0.35, (v) => setI({ size: Math.min(0.7, Math.max(0.1, num(v) ?? 0.35)) }))),
+      check('Automatic y range', yAuto, (v) => setI({ y: v ? null : { y0: 0, y1: 1 } })),
+      yAuto ? null : h('div', { class: 'g2' }, field('y min', input(ins.y.y0, (v) => setI({ y: { ...ins.y, y0: num(v) } }))), field('y max', input(ins.y.y1, (v) => setI({ y: { ...ins.y, y1: num(v) } })))),
+      h('div', { class: 'note' }, 'Magnifies the data and fit between the two x values; a dashed box marks the region on the main plot. Use Add > Inset to start from the current zoom.')),
+    h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, h('span', { style: 'font-weight:600' }, 'Broken x axis'),
+      check('Hide an x interval', !!xb.enabled, (v) => setB({ enabled: v }), { disabled: !!blocked }),
+      h('div', { class: 'g2' }, field('Gap starts at x', input(xb.from ?? '', (v) => setB({ from: num(v) }))), field('Gap ends at x', input(xb.to ?? '', (v) => setB({ to: num(v) })))),
+      h('div', { class: 'note' }, blocked ? `Broken axis is switched off while the ${blocked} is shown.` : 'Two x panels share the y axis; useful for long Rabi or T1 scans. Needs from < to inside the data range.')));
 }
 
 function textTab(f) {

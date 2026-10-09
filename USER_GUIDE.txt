@@ -77,14 +77,16 @@ python -m pip install -r requirements.txt
 5. Start the GUI
 ----------------
 Windows, without a terminal:
-- Double-click `Launch SmartFitter.vbs` in this folder.
+- Double-click `Launch SmartFitter.vbs` in this folder (starts SmartFitter v2, the default app).
 - It starts the GUI without leaving a terminal window open.
 - For one-click desktop access, right-click the launcher and choose `Send to > Desktop (create shortcut)`.
 
 Terminal alternative:
 Run:
 
-python -m nvfit.gui_app
+python -m smartfitter [files...]
+
+SmartFitter v2 is the default app (`python -m nvfit.gui_app` now starts it too). The original Qt app is deprecated and kept for reference; start it with `python -m nvfit.gui_app --legacy`.
 
 Basic GUI workflow:
 - Use `Open MAT...` in the command bar, press Ctrl+O, or drop a MATLAB file onto the window

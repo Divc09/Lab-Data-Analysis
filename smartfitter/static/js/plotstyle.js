@@ -31,7 +31,14 @@ const AXIS_NAMES = {
   duration: 'Pulse duration [ns]', 'pulse duration (ns)': 'Pulse duration [ns]', frequency: 'RF frequency [GHz]',
   'rf frequency': 'RF frequency [GHz]', 'stage x': 'Stage X [um]', 'stage y': 'Stage Y [um]', 'stage z': 'Stage Z [um]',
 };
-export const friendlyAxis = (label) => AXIS_NAMES[(label || '').trim().toLowerCase()] || label || 'X';
+// With a resolved unit (core.describe info.x_unit / axis_units) the label is "<name> [<unit>]"; without one the map above applies.
+export const friendlyAxis = (label, unit) => {
+  const key = (label || '').trim().toLowerCase();
+  if (!unit) return AXIS_NAMES[key] || label || 'X';
+  const mapped = AXIS_NAMES[key];
+  const base = (mapped || label || 'X').replace(/\s*[\[(][^\])]*[\])]\s*$/, '').trim() || 'X';
+  return `${base} [${unit}]`;
+};
 
 export const MODE_LABEL = { contrast: 'Contrast', signal: 'Signal', reference: 'Reference', difference: 'Difference' };
 

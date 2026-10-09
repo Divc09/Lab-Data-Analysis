@@ -24,7 +24,7 @@ import numpy as np
 from nvfit.analysis_tools import AnalysisStep, process_series
 from nvfit.app_state import fit_result_to_dict, json_safe
 from nvfit.fit_engine import FitResult
-from nvfit.fit_workflows import FitWorkflowConfig, fit_non_ramsey
+from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
 from nvfit.io_mat import ExperimentDataset, ExperimentTrace, load_experiment_dataset
 from nvfit.map_comparison import axis_edges, axis_key, build_map_overlay, compatible_axes
 from nvfit.models import MODEL_REGISTRY
@@ -299,6 +299,8 @@ def describe(ds: ExperimentDataset, tr: ExperimentTrace) -> dict:
         "axes": list(tr.scan_axes),
         "x_label": tr.x_label,
         "raw_x_label": tr.raw_x_label,
+        "x_unit": meta.get("x_unit"),
+        "axis_units": meta.get("axis_units") if isinstance(meta.get("axis_units"), dict) else None,
         "y_label": tr.y_label,
         "detectors": list(ds.available_detectors),
         "detector_labels": {k: v.detector_label for k, v in ds.detectors.items()},
@@ -442,7 +444,8 @@ def _evaluate(result: FitResult, x: np.ndarray, x_data: np.ndarray) -> np.ndarra
         return None
 
 
-def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict, spec: dict) -> dict:
+def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict, spec: dict):
+    """Select the fit data exactly as run_fit does: (trace, x, y, exp_type, cfg, locks)."""
     tr = ws.trace(path, detector, mode)
     if tr.scan_dim == "scan2d":
         raise ValueError("2D maps are characterized with spot detection, not the 1D fitter.")
@@ -463,6 +466,12 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         raise ValueError("Fewer than 5 points in the fit range.")
     exp_type = spec.get("experiment") or tr.experiment_type
     model = spec.get("model") or "Auto"
+    if model == "Auto" and tr.experiment_type == "LineScan" and not spec.get("experiment"):
+        # 1D stage/fluorescence scans: Auto means a Gaussian peak fit (the LineScan profile's model).
+        model = "GaussianPeaks"
+        spec = {**spec, "peaks": spec.get("peaks") or 1}
+    elif model == "Auto" and not tr.fit_allowed and tr.experiment_type != "TimeTrace" and not spec.get("experiment"):
+        raise ValueError("This scan is plot-only under Auto. Choose Gaussian peaks or a custom model to fit it.")
     if tr.experiment_type == "TimeTrace":
         exp_type = "TimeTraceDecay" if model in ("Auto", "TimeTraceDecay") else model
     if model == "GaussianPeaks":
@@ -473,6 +482,7 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         multistart=int(spec.get("multistart", 20)),
         gaussian_peak_count=int(spec.get("peaks", 1)),
         rabi_use_sem=bool(spec.get("sem_weights", True)),
+        sem_weights=bool(spec.get("sem_weights_all", False)),  # non-Rabi SEM weighting is opt-in (UI default off)
         rabi_pi_lock=bool(spec.get("pi_lock", False)),
         rabi_pi_ns=float(spec.get("pi_ns", 200.0)),
         rabi_pi2_ns=float(spec.get("pi2_ns", 100.0)),
@@ -488,21 +498,68 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         custom_expr=str(spec.get("custom_expr", "")),
         custom_spec=spec.get("custom_spec"),
     )
-    locks = _locks(spec)
-    t0 = time.perf_counter()
+    return tr, x, y, exp_type, cfg, _locks(spec)
+
+
+def fit_dispatch(tr: ExperimentTrace, x: np.ndarray, y: np.ndarray, exp_type: str, cfg: FitWorkflowConfig, locks, spec: dict):
+    """Run the model-family fit; returns (FitResult, ramsey candidate summaries | None)."""
     family = FIT_FAMILY.get(exp_type, exp_type)
     candidates = None
     if spec.get("robust"):
         result = pro_batch._run_robust_fit(exp_type if exp_type != "DynamicDecoupling" else "SpinEcho", x, y,
                                            n_starts=cfg.multistart, odmr_multipeak=cfg.odmr_multipeak)
     elif family == "Ramsey":
-        sel = fit_ramsey_physics_first(x, y)
+        sel = fit_ramsey_physics_first(x, y, sem=aligned_sem(tr, x) if cfg.sem_weights else None)
         wanted = {"Simple damped cosine": "RamseySimple", "N14 hyperfine": "RamseyHyperfine", "Extended": "RamseyExtended"}.get(spec.get("ramsey_model", ""), None)
         result = next((c for c in sel.candidates if c.model_name == wanted), sel.best) if wanted else sel.best
         candidates = [{"model": c.model_name, "r2": c.r2, "bic": c.bic} for c in sel.candidates]
     else:
         result = fit_non_ramsey(exp_type, x, y, config=cfg, locks=locks,
                                 custom_spec=spec.get("custom_spec"), trace_experiment_type=tr.experiment_type, trace=tr)
+    return result, candidates
+
+
+def _conf_band(result: FitResult, dense_x: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
+    """1-sigma delta-method band of the fitted model: sigma(x)^2 = J(x) C J(x)^T.
+
+    J is a central-difference Jacobian of the registered model wrt the fitted parameters (same x_offset handling as
+    _evaluate); C comes from fit_engine._estimate_covariance with cost = 0.5*sum(r^2) (unweighted residuals y - model)
+    at the solution. Locked (zero-sensitivity) parameters contribute nothing; NaN if the covariance is unidentifiable."""
+    from nvfit.fit_engine import _estimate_covariance
+    model = MODEL_REGISTRY.get(result.model_name)
+    if model is None:
+        return None
+    try:
+        p0 = np.asarray(result.params, float)
+        offset = float((result.extras or {}).get("x_offset_ns") or 0.0) if isinstance(result.extras, dict) else 0.0
+
+        def jac_at(xs: np.ndarray) -> np.ndarray:
+            cols = []
+            for i in range(len(p0)):
+                h = 1e-6 * max(abs(p0[i]), 1e-3)
+                hi, lo = p0.copy(), p0.copy()
+                hi[i] += h
+                lo[i] -= h
+                cols.append((np.asarray(model(xs - offset, *hi), float) - np.asarray(model(xs - offset, *lo), float)) / (2 * h))
+            return np.column_stack(cols)
+
+        j_fit = jac_at(np.asarray(x, float))
+        resid = np.asarray(y, float) - np.asarray(model(np.asarray(x, float) - offset, *p0), float)
+        cov = _estimate_covariance(j_fit, 0.5 * float(np.sum(resid ** 2)), dof=len(x) - len(p0))
+        j_d = jac_at(np.asarray(dense_x, float))
+        dead = ~(np.linalg.norm(j_fit, axis=0) > 0)
+        cov = np.where(np.isnan(cov) & (dead[:, None] | dead[None, :]), 0.0, cov)
+        j_d = np.where(dead[None, :], 0.0, j_d)
+        var = np.einsum("ij,jk,ik->i", j_d, cov, j_d)
+        return np.sqrt(np.where(var >= 0, var, np.nan))
+    except Exception:
+        return None
+
+
+def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict, spec: dict) -> dict:
+    tr, x, y, exp_type, cfg, locks = fit_inputs(ws, path, detector, mode, proc, spec)
+    t0 = time.perf_counter()
+    result, candidates = fit_dispatch(tr, x, y, exp_type, cfg, locks, spec)
     elapsed = time.perf_counter() - t0
 
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
@@ -551,7 +608,7 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         "x": arr(x), "y_fit": arr(result.y_fit), "residuals": arr(residuals),
         "plot_y": arr(plot_y) if plot_y is not None else None,
         "plot_y_label": extras.pop("plot_y_label", None),
-        "dense": {"x": arr(dense_x), "y": arr(dense_y)} if dense_y is not None else None,
+        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(_conf_band(result, dense_x, x, y))} if dense_y is not None else None,
         "envelope": envelope,
         "candidates": candidates,
         "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},

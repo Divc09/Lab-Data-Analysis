@@ -59,6 +59,35 @@ def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
     return cov
 
 
+def sem_to_weights(sem) -> np.ndarray | None:
+    """Relative inverse-variance weights (1/sem^2, median-normalised) from per-point SEM.
+
+    Non-finite or non-positive SEM entries are replaced by the median valid SEM (and
+    SEM is floored at 1e-3 of that median) so one bad point cannot dominate.  Returns
+    None when fewer than half of the entries are usable.
+    """
+    if sem is None:
+        return None
+    sem = np.asarray(sem, dtype=float).ravel()
+    good = np.isfinite(sem) & (sem > 0)
+    if sem.size == 0 or np.count_nonzero(good) < 0.5 * sem.size:
+        return None
+    med = float(np.median(sem[good]))
+    sem = np.where(good, np.maximum(sem, 1e-3 * med), med)
+    w = 1.0 / np.square(sem)
+    return w / float(np.median(w))
+
+
+def reduced_chi2(y, y_fit, sem, n_free: int) -> float:
+    """sum((y - y_fit)^2 / sem^2) / dof with absolute weights; NaN if SEM unusable."""
+    y, y_fit, sem = (np.asarray(v, dtype=float).ravel() for v in (y, y_fit, sem))
+    ok = np.isfinite(y) & np.isfinite(y_fit) & np.isfinite(sem) & (sem > 0)
+    dof = int(np.count_nonzero(ok)) - int(n_free)
+    if dof < 1:
+        return float("nan")
+    return float(np.sum(((y - y_fit)[ok] / sem[ok]) ** 2) / dof)
+
+
 def fit_model_multistart(
     *,
     model_name: str,

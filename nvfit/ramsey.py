@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .fit_engine import FitResult, fit_model_multistart
+from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights
 from .models import ramsey_extended, ramsey_hyperfine_n14, ramsey_simple
 
 
@@ -92,11 +92,14 @@ def _seed_ramsey_extended(x_ns: np.ndarray, y: np.ndarray, n_starts: int = 24) -
     return seeds
 
 
-def fit_ramsey_physics_first(x_ns: np.ndarray, y: np.ndarray) -> RamseySelectionResult:
+def fit_ramsey_physics_first(x_ns: np.ndarray, y: np.ndarray, sem: np.ndarray | None = None) -> RamseySelectionResult:
     # Use full trace, with slight tail down-weighting for robustness to late-time noise.
     weights = np.ones_like(y)
     weights[x_ns > 2200] = 0.7
     weights[x_ns > 3200] = 0.5
+    w_sem = sem_to_weights(sem) if sem is not None and len(sem) == len(y) else None
+    if w_sem is not None:  # optional per-point SEM weighting, combined with the tail down-weighting
+        weights = weights * w_sem
 
     candidates: list[FitResult] = []
 
@@ -138,6 +141,14 @@ def fit_ramsey_physics_first(x_ns: np.ndarray, y: np.ndarray) -> RamseySelection
         weights=weights,
     )
     candidates.append(extended)
+
+    if w_sem is not None:
+        for c in candidates:
+            chi2 = reduced_chi2(y, c.y_fit, sem, len(c.params))
+            if np.isfinite(chi2):
+                c.extras["reduced_chi2"] = chi2
+                c.extras["sem_weights_applied"] = True
+                c.selection_note = f"{c.selection_note}; SEM-weighted fit, reduced chi2={chi2:.2f} (absolute 1/sem^2)".lstrip("; ")
 
     # Physics-first selection with fit-quality guard:
     # 1) prefer candidates that clear a minimum quality target (R^2 >= 0.85)

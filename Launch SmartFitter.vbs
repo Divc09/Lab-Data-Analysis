@@ -31,7 +31,8 @@ If WScript.Arguments.Named.Exists("check") Then
 End If
 
 shell.CurrentDirectory = projectRoot
-command = Chr(34) & pythonExe & Chr(34) & " -m nvfit.gui_app"
+' SmartFitter v2 (default). Legacy Qt app (deprecated): command = Chr(34) & pythonExe & Chr(34) & " -m nvfit.gui_app --legacy"
+command = Chr(34) & pythonExe & Chr(34) & " " & Chr(34) & fileSystem.BuildPath(projectRoot, "smartfitter\launch.pyw") & Chr(34)
 
 On Error Resume Next
 launchResult = shell.Run(command, 0, False)

@@ -45,6 +45,7 @@ function newFileState(path, info, settings) {
     labels: { ...(st.detector_labels || {}), ...info.detector_labels },
     proc: { bin: 1, smooth: 5, roi_min: null, roi_max: null, excluded: [], exclusion_ranges: [], steps: [] },
     data: {}, fit: {}, fitHistory: [],
+    display: { invert: false, xscale: 1, xoffset: 0 }, sample: {}, reportKeys: null,
     fitSpec: defaultFitSpec(info),
     layers: { ...DEFAULT_LAYERS, ...(info.type === 'TimeTrace' ? { res: false, legend: true } : {}) },
     styleMode: 'both', errorMode: 'band',
@@ -94,7 +95,7 @@ export const detLabel = (f, d) => (f.labels && f.labels[d]) || (d === 'detector2
 
 // ---- undo / redo: snapshots of the analysis-relevant parts of the active file ----
 const undoStack = [], redoStack = [];
-const SNAP_KEYS = ['mode', 'detector', 'proc', 'fitSpec', 'fit', 'layers', 'styleMode', 'errorMode', 'style', 'map', 'spots', 'spotRemoved', 'tt', 'compareDetectors', 'pins'];
+const SNAP_KEYS = ['mode', 'detector', 'proc', 'fitSpec', 'fit', 'layers', 'styleMode', 'errorMode', 'style', 'map', 'spots', 'spotRemoved', 'tt', 'compareDetectors', 'pins', 'display'];
 const snap = (f) => ({ path: f.path, state: clone(Object.fromEntries(SNAP_KEYS.map((k) => [k, f[k]]))) });
 
 export function commit(label = '') {
@@ -127,7 +128,7 @@ export function sessionDoc() {
     fit: Object.fromEntries(Object.entries(f.fit).map(([d, r]) => [d, { ...r, raw: undefined }])),
     layers: f.layers, styleMode: f.styleMode, errorMode: f.errorMode, style: f.style, map: f.map, spotOpts: f.spotOpts,
     spots: f.spots, spotRemoved: f.spotRemoved, tt: { ...f.tt, pgram: null }, compareDetectors: f.compareDetectors, pins: f.pins,
-    xrange: f.xrange, yrange: f.yrange, tab: f.tab,
+    xrange: f.xrange, yrange: f.yrange, tab: f.tab, display: f.display, sample: f.sample, reportKeys: f.reportKeys,
   }));
   return { files: files.map((x) => x.path), state: files, primary: S.primary, overlays: S.overlays, compare: { ...S.compare, results: {} }, figure: S.figure, library: { folder: S.library.folder, extra: S.library.extra } };
 }

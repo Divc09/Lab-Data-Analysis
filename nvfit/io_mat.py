@@ -401,6 +401,10 @@ def _finalize_trace(
         fit_allowed = len(x_ns) > 3
     metadata_out.setdefault("x_min_ns", float(np.min(x_ns)))
     metadata_out.setdefault("x_max_ns", float(np.max(x_ns)))
+    try:
+        _annotate_axis_units(metadata_out, tuple(scan_axes), x_label)
+    except Exception:
+        pass
     return ExperimentTrace(
         source_path=str(mat_path.resolve()),
         file_name=mat_path.name,
@@ -429,6 +433,55 @@ def _finalize_trace(
         signal2d=signal2d,
         reference2d=reference2d,
     )
+
+
+def resolve_axis_unit(identifier: str = "", parameter: str = "", legacy_type: str = "") -> tuple[str | None, str | None]:
+    """Return (label, unit) for a scan axis. MATLAB files store no unit field; units are implied by the instrument
+    (PI stage config conversionFactor mm->um, SRS RF in GHz, PulseBlaster durations in ns, time in s). Unknown -> (None, None)."""
+    ident = (identifier or "").strip().lower()
+    par = (parameter or "").strip().lower()
+    leg = (legacy_type or "").strip().lower()
+    text = f"{ident} {par} {leg}"
+    for axis in ("x", "y", "z"):
+        if f"stage {axis}" in leg or (("pi stage" in ident or "stage" in ident) and re.search(rf"(^|[^a-z]){axis}($|[^a-z])", par)) \
+                or f"stage {axis}" in par:
+            return f"Stage {axis.upper()}", "µm"
+    if "srs" in ident or "rf" in ident.split() or "frequency" in par or "rf frequency" in leg:
+        if "frequency" in par or "frequency" in leg or "frequency" in ident:
+            return "RF frequency", "GHz"
+    if "pulse blaster" in ident or "pulseblaster" in ident or "duration" in par or "pulse duration" in leg:
+        if "duration" in par or "duration" in leg or not par:
+            return "Pulse duration", "ns"
+    if "time" in text.split() or par == "time" or ident == "time" or leg == "time":
+        return "Elapsed time", "s"
+    return None, None
+
+
+def _unit_from_label(label: str) -> str | None:
+    m = re.search(r"[\[(]\s*([^\])]+?)\s*[\])]\s*$", label or "")
+    return m.group(1) if m else None
+
+
+def _annotate_axis_units(metadata_out: dict, scan_axes: tuple[str, ...], x_label: str) -> None:
+    idents = [s.strip() for s in str(metadata_out.get("scan_identifier", "")).split(" | ")] if metadata_out.get("scan_identifier") else []
+    pars = [s.strip() for s in str(metadata_out.get("scan_parameter", "")).split(" | ")] if metadata_out.get("scan_parameter") else []
+    units: dict[str, str] = {}
+    for i, name in enumerate(scan_axes):
+        ident = idents[i] if i < len(idents) else (idents[0] if len(idents) == 1 else "")
+        par = pars[i] if i < len(pars) else (pars[0] if len(pars) == 1 else "")
+        _, unit = resolve_axis_unit(ident, par, name)
+        unit = unit or _unit_from_label(name)
+        if unit:
+            units[name] = unit
+    x_unit = _unit_from_label(x_label)
+    if x_unit is None and scan_axes:
+        x_unit = units.get(scan_axes[0])
+    if x_unit is None and "elapsed time" in (x_label or "").lower():
+        x_unit = "s"
+    if x_unit:
+        metadata_out.setdefault("x_unit", x_unit)
+    if units:
+        metadata_out.setdefault("axis_units", units)
 
 
 def _label_from_parameter(parameter: str) -> str:

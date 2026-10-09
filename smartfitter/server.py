@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import traceback
@@ -15,8 +16,13 @@ from typing import Any, Callable
 
 from . import core
 
-STATIC = Path(__file__).with_name("static")
-PLOTLY_JS = Path(__import__("plotly").__file__).parent / "package_data" / "plotly.min.js"
+if getattr(sys, "frozen", False):  # PyInstaller build: data files live under sys._MEIPASS
+    _BUNDLE = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    STATIC = _BUNDLE / "smartfitter" / "static"
+    PLOTLY_JS = _BUNDLE / "plotly" / "package_data" / "plotly.min.js"
+else:
+    STATIC = Path(__file__).with_name("static")
+    PLOTLY_JS = Path(__import__("plotly").__file__).parent / "package_data" / "plotly.min.js"
 
 
 class Api:
@@ -241,6 +247,14 @@ def _tk_dialog(kind, title, directory, filename, filters):
 
 def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
     methods: dict[str, Callable] = {name: getattr(api, name) for name in dir(api) if not name.startswith("_") and callable(getattr(api, name))}
+    # Feature modules (smartfitter/ext_*.py) add endpoints via ENDPOINTS = {name: fn(ws, **kwargs)}.
+    import importlib
+    import pkgutil
+    for info in pkgutil.iter_modules([str(Path(__file__).parent)]):
+        if info.name.startswith("ext_"):
+            module = importlib.import_module(f"{__package__}.{info.name}")
+            for name, fn in getattr(module, "ENDPOINTS", {}).items():
+                methods[name] = (lambda f: lambda **kw: f(api.ws, **kw))(fn)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
