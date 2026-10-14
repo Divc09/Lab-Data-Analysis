@@ -31,6 +31,8 @@ MODEL_PARAMS: dict[str, list[str]] = {
     "T1Stretch": ["y0", "A", "T1", "n"],
     "T1NormExp": ["y0", "A", "T1"],
     "T1NormStretch": ["y0", "A", "T1", "n"],
+    "T1DecayExp": ["y0", "A", "T1"],
+    "T1DecayStretch": ["y0", "A", "T1", "n"],
     "RamseySimple": ["y0", "A", "f", "phi", "tau", "n"],
     "RabiCosine": ["c", "a", "T", "beta", "f", "phi"],
     "ODMR": ["y0", "C", "w", "x0"],
@@ -63,10 +65,10 @@ def _defaults(model: str, x: np.ndarray, y: np.ndarray):
     amp = 4 * yamp
     tlo, thi = span * 1e-3, span * 1e3
     first, last = float(y[np.argmin(x)]), float(y[np.argmax(x)])
-    if model in ("SpinEcho", "T1NormExp", "T1NormStretch"):
+    if model in ("SpinEcho", "T1NormExp", "T1NormStretch", "T1DecayExp", "T1DecayStretch"):
         s = [last, first - last, span / 3]
         lo, hi = [ylo, -amp, tlo], [yhi, amp, thi]
-        if model != "T1NormExp":
+        if model not in ("T1NormExp", "T1DecayExp"):
             s.append(1.0); lo.append(0.2); hi.append(6.0)
         if model == "SpinEcho":
             s = [s[0], s[1], s[2], 1.0]

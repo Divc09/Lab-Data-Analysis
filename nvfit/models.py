@@ -215,6 +215,8 @@ MODEL_REGISTRY = {
     "T1Stretch": t1_rise_stretched_model,
     "T1NormExp": t1_decay_exponential_model,
     "T1NormStretch": t1_decay_stretched_model,
+    "T1DecayExp": t1_decay_exponential_model,
+    "T1DecayStretch": t1_decay_stretched_model,
     "ODMR": odmr_lorentzian,
     "ODMRMulti": odmr_multi_lorentzian,
 }

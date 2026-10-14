@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from nvfit.app_state import fit_result_to_dict, json_safe
 from nvfit.fit_engine import FitResult
 from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
 from nvfit.io_mat import ExperimentDataset, ExperimentTrace, load_experiment_dataset
+from nvfit.iterations import iteration_matrix, selected_trace, selection_indices, iteration_sources, matrix_stats, combine_datasets
 from nvfit.map_comparison import axis_edges, axis_key, build_map_overlay, compatible_axes
 from nvfit.models import MODEL_REGISTRY
 from nvfit.preprocess import smooth_trace
@@ -95,20 +96,25 @@ def load_settings() -> dict[str, Any]:
     return data
 
 
+_SETTINGS_LOCK = threading.RLock()
+
+
 def save_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    data = load_settings()
-    data.update(patch or {})
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(clean(data), indent=2), encoding="utf-8")
-    os.replace(tmp, SETTINGS_PATH)
-    return data
+    with _SETTINGS_LOCK:
+        data = load_settings()
+        data.update(patch or {})
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(clean(data), indent=2), encoding="utf-8")
+        os.replace(tmp, SETTINGS_PATH)
+        return data
 
 
 def remember(kind: str, path: str, limit: int = 15) -> None:
-    settings = load_settings()
-    items = [p for p in settings.get(kind, []) if os.path.normcase(p) != os.path.normcase(path)]
-    save_settings({kind: [path, *items][:limit]})
+    with _SETTINGS_LOCK:
+        settings = load_settings()
+        items = [p for p in settings.get(kind, []) if os.path.normcase(p) != os.path.normcase(path)]
+        save_settings({kind: [path, *items][:limit]})
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +138,15 @@ class Workspace:
         self._disk_saved = -1e9
         self._pool = ThreadPoolExecutor(max_workers=4)
         self.jobs: dict[str, dict] = {}
+        self.combined: dict[str, dict] = {}
 
     # -- datasets ---------------------------------------------------------
     def dataset(self, path: str, mode: str = "contrast") -> ExperimentDataset:
+        if path.startswith("combined:"):
+            recipe = self.combined.get(path)
+            if recipe is None:
+                raise ValueError("Combined dataset is not registered. Reopen its saved analysis session.")
+            return combine_datasets(self.dataset, recipe, mode)
         p = str(Path(path))
         mtime = Path(p).stat().st_mtime_ns
         key = (os.path.normcase(p), mode)
@@ -159,6 +171,9 @@ class Workspace:
 
     def peek(self, path: str) -> dict:
         """Lightweight description used by the library list (cached by mtime)."""
+        if path.startswith("combined:"):
+            ds = self.dataset(path)
+            return describe(ds, next(iter(ds.detectors.values())))
         p = Path(path)
         try:
             mtime = p.stat().st_mtime_ns
@@ -256,22 +271,7 @@ def list_dir(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _iteration_matrix(tr: ExperimentTrace, mode: str) -> np.ndarray | None:
-    if mode == "contrast":
-        m = tr.iteration_contrast
-    elif mode == "signal":
-        m = tr.iteration_signal
-    elif mode == "reference":
-        m = tr.iteration_reference
-    elif tr.iteration_reference is not None and tr.iteration_signal is not None:
-        m = np.asarray(tr.iteration_reference, float) - np.asarray(tr.iteration_signal, float)
-    else:
-        m = None
-    if m is None:
-        return None
-    m = np.asarray(m, dtype=float)
-    if tr.iteration_valid is not None and np.shape(tr.iteration_valid) == m.shape:
-        m = np.where(np.asarray(tr.iteration_valid, bool), m, np.nan)
-    return m if m.ndim == 2 and m.shape[0] == len(tr.x_ns) else None
+    return iteration_matrix(tr, mode)
 
 
 def reference_only(tr: ExperimentTrace) -> bool:
@@ -309,11 +309,25 @@ def describe(ds: ExperimentDataset, tr: ExperimentTrace) -> dict:
         "reference_only": ref_only,
         "observables": observables,
         "unit": meta.get("value_unit", ""),
+        "combined": meta.get("combined"),
+        "combined_recipe": ds.metadata.get("combined_recipe"),
         "is_time_trace": bool(meta.get("is_time_trace")),
         "irregular": bool(meta.get("time_sampling_irregular")),
         "timing": {k: timing.get(k) for k in ("timing", "durationSeconds", "cadenceSeconds", "checkpointSeconds", "sourceExperiment", "fixedValue", "events", "failedPoints", "scheduledSeconds", "latenessSeconds", "nPoints")} if timing else None,
         "metadata": {k: (v if isinstance(v, (int, float, bool)) or v is None else str(v)[:400]) for k, v in meta.items() if k not in ("time_trace", "source_point_indices")},
     })
+
+
+def smoothing_window(n: int, requested: int) -> int:
+    """Effective window used by nvfit.preprocess.smooth_trace."""
+    w = max(1, int(requested))
+    if w <= 1:
+        return 1
+    if w % 2 == 0:
+        w += 1
+    if w >= n:
+        w = n - 1 if n % 2 == 0 else n
+    return w if w >= 3 else 1
 
 
 def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict | None = None) -> dict:
@@ -338,8 +352,13 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
         }
         return clean(out)
 
+    original = tr
+    tr = selected_trace(tr, mode, proc.get("iterations"))
     x = np.asarray(tr.x_ns, float)
     y = np.asarray(tr.y, float)
+    its = _iteration_matrix(original, mode)
+    indices = selection_indices(its.shape[1], proc.get("iterations")) if its is not None else []
+    plot_its = its
     base = proc.get("baseline") or {}
     if base.get("path") and os.path.normcase(base["path"]) != os.path.normcase(path):
         # Subtract another loaded file (same observable), interpolated onto this file's axis.
@@ -349,6 +368,8 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
         order = np.argsort(bx[ok])
         bvals = np.interp(x, bx[ok][order], by[ok][order], left=np.nan, right=np.nan)
         y = y - bvals
+        if its is not None:
+            plot_its = its - bvals[:, None]
         out["baseline_note"] = f"Subtracted {btr.file_name} ({btr.detector_label}); points outside its range are dropped."
     steps = [AnalysisStep.from_dict(s) for s in proc.get("steps", []) if s.get("enabled", True)]
     ps = process_series(
@@ -361,18 +382,32 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
     )
     smooth_w = int(proc.get("smooth", 1) or 1)
     sem = np.asarray(tr.y_sem, float) if tr.y_sem is not None else None
-    proc_sem = None
-    if sem is not None and len(ps.source_groups) == len(ps.analysis_y) and not steps:
+    proc_sem, proc_sd, processed_its = None, None, None
+    if its is not None and not steps:
+        # Average within each bin *per iteration*, then estimate variation across iterations.
+        # This retains within-iteration point covariance instead of assuming independent x points.
+        processed_its = np.array([np.mean(plot_its[g], axis=0) for g in ps.source_groups]).reshape(-1, its.shape[1])
+        _, proc_sd, estimated_sem, _ = matrix_stats(processed_its[:, indices])
+        proc_sem = estimated_sem if len(indices) > 1 else None
+    elif sem is not None and len(ps.source_groups) == len(ps.analysis_y) and not steps:
         proc_sem = np.array([math.sqrt(float(np.nansum(sem[g] ** 2))) / max(1, len(g)) for g in ps.source_groups])
-    its = _iteration_matrix(tr, mode)
+    effective_window = smoothing_window(len(ps.analysis_y), smooth_w)
+    provenance = {"selected_iterations": [i + 1 for i in indices], "iteration_count": len(indices),
+                  "iteration_sources": iteration_sources(tr) if its is not None else [],
+                  "combined": info.get("combined"), "sem": "sample SD (ddof=1) / sqrt(n); undefined for n<2",
+                  "smoothing": {"method": "Savitzky-Golay", "requested_window": smooth_w, "window": effective_window, "polyorder": min(2, effective_window - 1)}}
+    out["provenance"] = provenance
     out.update({
         "raw": {"x": arr(x), "y": arr(y), "signal": arr(tr.signal), "reference": arr(tr.reference), "sem": arr(sem),
-                "raw_x": arr(tr.raw_x) if tr.raw_x is not None else None},
+                "raw_x": arr(tr.raw_x) if tr.raw_x is not None else None,
+                "trace_y": arr(tr.y) if out.get("baseline_note") else None},
         "proc": {"x": arr(ps.analysis_x), "y": arr(ps.analysis_y), "fit_x": arr(ps.fit_x), "fit_y": arr(ps.fit_y),
-                 "groups": [g.tolist() for g in ps.source_groups], "sem": arr(proc_sem),
-                 "smooth": arr(smooth_trace(ps.analysis_y, smooth_w)) if smooth_w > 1 and len(ps.analysis_y) > 3 else None,
-                 "provenance": ps.provenance},
-        "iterations": {"count": int(its.shape[1]), "values": arr(its.T)} if its is not None else None,
+                 "groups": [g.tolist() for g in ps.source_groups], "sem": arr(proc_sem), "sd": arr(proc_sd),
+                 "smooth": arr(smooth_trace(ps.analysis_y, smooth_w)) if effective_window > 1 else None,
+                 "smoothing_window": effective_window, "provenance": ps.provenance},
+        "iterations": {"count": int(its.shape[1]), "selected": indices, "values": arr(its.T),
+                       "x": arr(ps.fit_x), "processed_values": arr(processed_its.T) if processed_its is not None else None,
+                       "sources": iteration_sources(original)} if its is not None else None,
     })
     if tr.experiment_type == "TimeTrace":
         out["time"] = _time_trace_extras(tr)
@@ -449,12 +484,25 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     tr = ws.trace(path, detector, mode)
     if tr.scan_dim == "scan2d":
         raise ValueError("2D maps are characterized with spot detection, not the 1D fitter.")
+    tr = selected_trace(tr, mode, proc.get("iterations"))
     data = trace_payload(ws, path, detector, mode, proc)
-    key_x, key_y = ("x", "y") if spec.get("fit_transformed") and proc.get("steps") else ("fit_x", "fit_y")
+    transformed = bool(spec.get("fit_transformed") and any(s.get("enabled", True) for s in proc.get("steps", [])))
+    key_x, key_y = ("x", "y") if transformed else ("fit_x", "fit_y")
     x = np.asarray(data["proc"][key_x], float)
     y = np.asarray(data["proc"][key_y], float)
-    if spec.get("fit_smoothed") and data["proc"].get("smooth") and not proc.get("steps"):
-        y = np.asarray(data["proc"]["smooth"], float)
+    window = smoothing_window(len(y), int(proc.get("smooth", 1) or 1)) if spec.get("fit_smoothed") else 1
+    if spec.get("fit_smoothed"):
+        if window <= 1:
+            raise ValueError("Fit smoothed requires an effective smoothing window of at least 3 points. Set it in Process.")
+        y = smooth_trace(y, int(proc.get("smooth", 1) or 1))
+    provenance = {**data["provenance"], "fit_target": "smoothed" if spec.get("fit_smoothed") else "raw_mean",
+                  "fit_transformed": transformed, "smoothing_window": window,
+                  "uncertainty_note": "Smoothing correlates samples and underestimates ordinary fit uncertainties; no corrected estimate is supplied. SEM weights are disabled." if window > 1 else ""}
+    tr = replace(tr, metadata={**(tr.metadata or {}), "fit_provenance": provenance})
+    if not transformed and not proc.get("steps") and int(proc.get("bin", 1) or 1) > 1:
+        # Feed the existing weighting routines the SEM of binned iteration means on the actual fit grid.
+        tr = replace(tr, x_ns=x.copy(), y_sem=np.asarray(data["proc"]["sem"], float) if data["proc"]["sem"] is not None else None,
+                     iteration_contrast=None, iteration_signal=None, iteration_reference=None, iteration_valid=None)
     lo, hi = spec.get("range_min"), spec.get("range_max")
     keep = np.isfinite(x) & np.isfinite(y)
     if lo is not None:
@@ -462,6 +510,10 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     if hi is not None:
         keep &= x <= float(hi)
     x, y = x[keep], y[keep]
+    if spec.get("fit_smoothed"):
+        # Normalized T1 intentionally uses trace.y when lengths match; it must see the chosen smoothed target.
+        tr = replace(tr, x_ns=x.copy(), y=y.copy(), y_sem=None,
+                     iteration_contrast=None, iteration_signal=None, iteration_reference=None, iteration_valid=None)
     if len(x) < 5:
         raise ValueError("Fewer than 5 points in the fit range.")
     exp_type = spec.get("experiment") or tr.experiment_type
@@ -481,8 +533,8 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     cfg = FitWorkflowConfig(
         multistart=int(spec.get("multistart", 20)),
         gaussian_peak_count=int(spec.get("peaks", 1)),
-        rabi_use_sem=bool(spec.get("sem_weights", True)),
-        sem_weights=bool(spec.get("sem_weights_all", False)),  # non-Rabi SEM weighting is opt-in (UI default off)
+        rabi_use_sem=bool(spec.get("sem_weights", True)) and not spec.get("fit_smoothed"),
+        sem_weights=bool(spec.get("sem_weights_all", False)) and not spec.get("fit_smoothed"),  # non-Rabi SEM weighting is opt-in (UI default off)
         rabi_pi_lock=bool(spec.get("pi_lock", False)),
         rabi_pi_ns=float(spec.get("pi_ns", 200.0)),
         rabi_pi2_ns=float(spec.get("pi2_ns", 100.0)),
@@ -590,7 +642,16 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         val = float(result.params[i])
         # A standard error many orders below the value usually means a degenerate covariance.
         reliable = math.isfinite(err) and err > 0 and (val == 0 or err / max(abs(val), 1e-300) > 1e-7)
-        params.append({"name": name, "symbol": meta.symbol, "unit": meta.units, "desc": meta.description,
+        unit, desc = meta.units, meta.description
+        if result.model_name.startswith("T1"):
+            if name == "T1":
+                unit = tr.metadata.get("x_unit") or "ns"
+                desc = "T1 timescale in the file's x units (not display-calibrated units)."
+            elif name in ("A", "y0"):
+                normalized = extras.get("t1_prep_mode") == "normalized_1_minus_data"
+                unit = "normalized a.u." if normalized else ("dimensionless contrast" if mode == "contrast" else tr.metadata.get("value_unit") or "a.u.")
+                desc = f"{name} in normalized 1 - data space." if normalized else f"{name} in the measured {mode} space."
+        params.append({"name": name, "symbol": meta.symbol, "unit": unit, "desc": desc,
                        "value": val, "error": err if reliable else None,
                        "bound_hit": bool(result.bound_hits[i]) if i < len(result.bound_hits) else False})
     residuals = y - np.asarray(result.y_fit, float) if plot_y is None else np.asarray(plot_y, float) - np.asarray(result.y_fit, float)
@@ -598,6 +659,7 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         "model": result.model_name,
         "experiment": exp_type,
         "selection": result.selection_note,
+        "provenance": (tr.metadata or {}).get("fit_provenance"),
         "message": result.message,
         "success": result.success,
         "status": status, "reason": reason,
@@ -608,7 +670,7 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         "x": arr(x), "y_fit": arr(result.y_fit), "residuals": arr(residuals),
         "plot_y": arr(plot_y) if plot_y is not None else None,
         "plot_y_label": extras.pop("plot_y_label", None),
-        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(_conf_band(result, dense_x, x, y))} if dense_y is not None else None,
+        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(_conf_band(result, dense_x, x, np.asarray(plot_y, float) if plot_y is not None else y))} if dense_y is not None else None,
         "envelope": envelope,
         "candidates": candidates,
         "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
@@ -946,6 +1008,12 @@ def svg_to_pdf_bytes(svg: str) -> bytes:
 
 
 def export_results(ws: Workspace, req: dict) -> dict:
+    if req.get("combined_recipe"):
+        recipe = req["combined_recipe"]
+        # Validate virtual sources before writing any output.
+        combine_datasets(ws.dataset, recipe, req.get("mode", "contrast"))
+        with ws._lock:
+            ws.combined[recipe["path"]] = recipe
     out_dir = Path(req["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = req["stem"]
@@ -962,7 +1030,7 @@ def export_results(ws: Workspace, req: dict) -> dict:
     pdf_done = False
     if images.get("pdf_svg"):
         try:
-            p = out_dir / f"{stem}_fit.pdf"
+            p = out_dir / Path(req.get("pdf_filename") or f"{stem}_fit.pdf").name
             p.write_bytes(svg_to_pdf_bytes(images["pdf_svg"]))
             written.append(str(p))
             pdf_done = True
@@ -971,7 +1039,7 @@ def export_results(ws: Workspace, req: dict) -> dict:
     if images.get("pdf_png") and not pdf_done:
         from PIL import Image
 
-        p = out_dir / f"{stem}_fit.pdf"
+        p = out_dir / Path(req.get("pdf_filename") or f"{stem}_fit.pdf").name
         Image.open(io.BytesIO(_decode_data_url(images["pdf_png"]))).convert("RGB").save(p, "PDF", resolution=float(req.get("dpi", 300)))
         written.append(str(p))
     if images.get("report_png"):
@@ -983,6 +1051,7 @@ def export_results(ws: Workspace, req: dict) -> dict:
         "source": req.get("source"), "detector": req.get("detector"), "mode": req.get("mode"),
         "processing": req.get("processing"), "fit_spec": req.get("fit_spec"), "fit": req.get("fit"),
         "spots": req.get("spots"), "map_comparison": req.get("map_comparison"), "plot_state": req.get("plot_state"),
+        "provenance": req.get("provenance"), "iteration_fits": req.get("iteration_fits"), "combined_recipe": req.get("combined_recipe"),
     }
     if req.get("json", True):
         p = out_dir / f"{stem}_result.json"
@@ -1001,19 +1070,28 @@ def export_results(ws: Workspace, req: dict) -> dict:
                 w.writerow([k, v, "", ""])
             for k in ("r2", "rmse", "aic", "bic", "dw"):
                 w.writerow([k, fit.get(k), "", ""])
+            for key, value in (fit.get("provenance") or req.get("provenance") or {}).items():
+                w.writerow(["provenance." + key, json.dumps(clean(value), ensure_ascii=False), "", ""])
         written.append(str(p))
     if req.get("origin") and src:
         data = trace_payload(ws, src, req.get("detector"), req.get("mode", "contrast"), req.get("processing"))
         if "proc" in data:
             p = out_dir / f"{stem}_origin_bundle.csv"
-            fx = {round(v, 12): yf for v, yf in zip(fit.get("x") or [], fit.get("y_fit") or [])}
+            fx = {round(v, 12): i for i, v in enumerate(fit.get("x") or [])}
+            fp = fit.get("provenance") or {}
             with p.open("w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["x", "y", "y_smooth", "y_fit", "residual"])
+                w.writerow(["x", "y", "y_smooth", "y_fit", "residual", "fit_target_y", "x_unit", "y_unit", "fit_space", "fit_target", "smoothing_window", "selected_iterations", "iteration_sources", "uncertainty_note"])
                 sm = data["proc"].get("smooth") or [None] * len(data["proc"]["x"])
+                def at(key, i):
+                    values = fit.get(key) or []
+                    return values[i] if i is not None and i < len(values) else None
                 for xv, yv, sv in zip(data["proc"]["x"], data["proc"]["y"], sm):
-                    yf = fx.get(round(xv, 12)) if xv is not None else None
-                    w.writerow([xv, yv, sv, yf, (yv - yf) if yf is not None and yv is not None else None])
+                    i = fx.get(round(xv, 12)) if xv is not None else None
+                    w.writerow([xv, yv, sv, at("y_fit", i), at("residuals", i), at("plot_y", i),
+                                data["info"].get("x_unit"), "dimensionless" if req.get("mode", "contrast") == "contrast" else data["info"].get("unit"),
+                                fit.get("plot_y_label") or req.get("mode", "contrast"), fp.get("fit_target"), fp.get("smoothing_window"),
+                                json.dumps(fp.get("selected_iterations", [])), json.dumps(fp.get("iteration_sources", [])), fp.get("uncertainty_note", "")])
             written.append(str(p))
     if req.get("detectors_raw") and src:
         ds = ws.dataset(src, req.get("mode", "contrast"))

@@ -34,6 +34,11 @@ PARAM_METADATA: dict[str, ParamMeta] = {
     "tau_ramp": ParamMeta(r"\tau_r", "ns", "Microwave startup / pulse-area buildup timescale."),
     "beta": ParamMeta(r"\beta", "-", "Envelope stretch exponent."),
     "alpha": ParamMeta(r"\alpha", "1/ns^2", "Linear chirp term."),
+    # Adaptive pulse-area Rabi (nvfit.models.rabi_adaptive_pulse_area_model): cycles = f0 u + chirp1 u^2/2 + chirp2 u^3/3, u in ns.
+    "f0": ParamMeta("f_0", "GHz", "Effective Rabi frequency at the start of the pulse (cycles/ns)."),
+    "chirp1": ParamMeta("c_1", "GHz/ns", "Linear change of the effective Rabi frequency with pulse duration (pulse-area calibration, not a carrier chirp)."),
+    "chirp2": ParamMeta("c_2", "GHz/ns^2", "Quadratic change of the effective Rabi frequency with pulse duration."),
+    "delay": ParamMeta("delay", "ns", "Fitted timing delay before the pulse area starts accumulating."),
     "T2": ParamMeta("T_2", "ns", "Spin-echo coherence time."),
     "T2_star": ParamMeta("T_2*", "ns", "Ramsey dephasing time."),
     "n": ParamMeta("n", "-", "Stretch exponent (1=exp, 2=Gaussian-like)."),

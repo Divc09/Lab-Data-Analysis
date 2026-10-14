@@ -272,18 +272,29 @@ def _prepare_t1_series(
     *,
     prep_mode: str,
     trace: "ExperimentTrace | None" = None,
+    norm_extras: dict | None = None,
 ) -> tuple[np.ndarray, str]:
     mode = prep_mode.lower().strip()
+    if mode.startswith("direct decay"):
+        # Explicit form of Auto's falling-trace branch (used to keep per-iteration fits on one model).
+        return y, "direct_decay"
     auto = mode == "auto"
     corr = float(np.corrcoef(x, y)[0, 1]) if len(x) > 2 else 0.0
     use_normalized = mode.startswith("normalize") or (auto and corr > 0.25)
     if not use_normalized:
+        # A falling T1 trace (e.g. MW pi-referenced T1 contrast) is fitted directly with the decay model.
+        if auto and corr < -0.25:
+            return y, "direct_decay"
         return y, "direct"
     base = y.copy()
+    source = "y"
     if trace is not None and len(trace.y) == len(y):
         base = trace.y.astype(float, copy=True)
+        source = "trace.y"
     lo = float(np.min(base))
     span = max(float(np.max(base) - lo), 1e-9)
+    if norm_extras is not None:
+        norm_extras.update(t1_norm_lo=lo, t1_norm_span=span, t1_norm_source=source)
     normalized = (base - lo) / span
     return 1.0 - normalized, "normalized_1_minus_data"
 
@@ -977,7 +988,8 @@ def _fit_t1(
     locks: LockMap | None = None,
     weights: np.ndarray | None = None,
 ) -> FitResult:
-    y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace)
+    norm_extras = {}
+    y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace, norm_extras=norm_extras)
     rng = np.random.default_rng(41)
     tspan = float(np.max(x) - np.min(x))
     y0 = float(np.min(y_fit)) if prep_used == "direct" else float(np.percentile(y_fit, 10))
@@ -991,6 +1003,10 @@ def _fit_t1(
         base_name = "T1NormStretch" if use_stretch else "T1NormExp"
         model = t1_decay_stretched_model if use_stretch else t1_decay_exponential_model
         seed0 = np.array([max(0.0, y0), amp, max(100.0, tspan / 4.0)] + ([1.2] if use_stretch else []), dtype=float)
+    elif prep_used == "direct_decay":
+        base_name = "T1DecayStretch" if use_stretch else "T1DecayExp"
+        model = t1_decay_stretched_model if use_stretch else t1_decay_exponential_model
+        seed0 = np.array([y0, amp, max(100.0, tspan / 4.0)] + ([1.2] if use_stretch else []), dtype=float)
     else:
         base_name = "T1Stretch" if use_stretch else "T1Exp"
         model = t1_rise_stretched_model if use_stretch else t1_rise_exponential_model
@@ -1017,6 +1033,7 @@ def _fit_t1(
     plot_label = "Normalized 1 - data [a.u.]" if prep_used == "normalized_1_minus_data" else "T1 signal [a.u.]"
     result.extras.update(
         {
+            **norm_extras,
             "t1_prep_mode": prep_used,
             "t1_model_family": "stretched" if use_stretch else "regular",
             "plot_y": y_fit.copy(),

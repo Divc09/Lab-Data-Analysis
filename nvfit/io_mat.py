@@ -775,6 +775,7 @@ def _extract_complete_iteration_contrast_stats(
 
     meta = {
         "complete_iterations": int(contrast.shape[1]),
+        "complete_iteration_indices": [j + 1 for j in good_cols],
         "valid_iteration_points": int(np.sum(valid)),
         "iteration_capacity": int(values.shape[1]),
         "contrast_reduction": "mean_complete_iterations",

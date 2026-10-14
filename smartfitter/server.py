@@ -85,12 +85,38 @@ class Api:
         return {det: core.trace_payload(self.ws, path, det, mode, proc) for det in ds.detectors}
 
     def save_upload(self, name: str, data: str) -> str:
-        """Fallback for drag-and-drop outside the desktop window (no file path available)."""
-        folder = Path(tempfile.gettempdir()) / "SmartFitterDrops"
-        folder.mkdir(exist_ok=True)
+        """Fallback for drag-and-drop when no real path is available. Each distinct content gets its own subfolder, so
+        two different files with the same name (e.g. from two dated folders) never overwrite each other."""
+        import hashlib
+
+        raw = base64.b64decode(data.split(",", 1)[-1])
+        folder = Path(tempfile.gettempdir()) / "SmartFitterDrops" / hashlib.sha1(raw).hexdigest()[:12]
+        folder.mkdir(parents=True, exist_ok=True)
         target = folder / Path(name).name
-        target.write_bytes(base64.b64decode(data.split(",", 1)[-1]))
+        if not target.exists():
+            target.write_bytes(raw)
         return str(target)
+
+    # -- desktop drag & drop: real paths -----------------------------------
+    # pywebview only reveals full paths to Python-side DOM drop listeners (__main__ registers one); the page asks here.
+    def record_drop(self, paths: list[str]) -> None:
+        import time
+
+        with self.session_lock:
+            self._drops = [(time.monotonic(), p) for p in paths if p]
+
+    def drop_paths(self, names: list[str], wait_ms: int = 700) -> list[str | None]:
+        """Real paths for just-dropped files, matched by name (waits briefly for the Python-side listener)."""
+        import time
+
+        deadline = time.monotonic() + wait_ms / 1000
+        while True:
+            with self.session_lock:
+                recent = [p for t, p in getattr(self, "_drops", []) if time.monotonic() - t < 10]
+            found = [next((p for p in recent if Path(p).name == n), None) for n in names]
+            if all(found) or time.monotonic() >= deadline:
+                return found
+            time.sleep(0.05)
 
     # -- analysis ---------------------------------------------------------
     def fit(self, path: str, detector: str | None, mode: str, proc: dict, spec: dict) -> dict:
@@ -153,7 +179,10 @@ class Api:
         doc["format"] = "smartfitter-session"
         doc["version"] = 1
         doc["sources"] = {}
-        for src in doc.get("files", []):
+        physical_sources = [src for src in doc.get("files", []) if not src.startswith("combined:")]
+        for saved in doc.get("state", []):
+            physical_sources.extend(r["path"] for r in (saved.get("combinedRecipe") or {}).get("runs", []))
+        for src in dict.fromkeys(physical_sources):
             try:
                 doc["sources"][src] = source_descriptor(src, path)
             except OSError:
