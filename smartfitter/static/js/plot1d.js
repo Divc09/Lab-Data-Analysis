@@ -2,6 +2,10 @@
 import { S, detLabel } from './state.js';
 import { PALETTES, baseStyle, baseLayout, axisLayout, legendLayout, scatterTrace, resultsAnnotation, userDecorations, friendlyAxis, MODE_LABEL, seriesStyle } from './plotstyle.js';
 
+import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized } from './fitdisplay.js';
+import { xDisplay, resolveXAxis } from './unitdisplay.js';
+import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
+
 const nonNull = (a) => (a || []).map((v) => (v === null ? NaN : v));
 
 function modeFor(f, styleMode) {
@@ -11,9 +15,9 @@ function modeFor(f, styleMode) {
 export function yTitle(f) {
   const d = f.data[f.detector];
   const fit = f.fit[f.detector];
-  if (fit?.plot_y_label && fit.plot_y) return displayOf(f).inv ? `${fit.plot_y_label} (inverted)` : fit.plot_y_label;
-  const unit = f.info.unit ? ` [${f.info.unit}]` : '';
-  const base = f.mode === 'contrast' ? 'Contrast' : `${MODE_LABEL[f.mode] || f.mode}${unit}`;
+  if (displaySpace(f) !== 'original' && fit?.plot_y_label) return displayOf(f).inv ? `${fit.plot_y_label} (inverted)` : fit.plot_y_label;
+  const unit = f.info.unit ? ` [${f.info.unit}]` : ' [a.u.]';
+  const base = f.mode === 'contrast' ? 'Contrast [dimensionless]' : `${MODE_LABEL[f.mode] || f.mode}${unit}`;
   return displayOf(f).inv ? `${base} (inverted)` : base;
 }
 
@@ -24,12 +28,14 @@ const displayOf = (f) => {
 };
 
 export function xTitle(f) {
-  const t = friendlyAxis(f.info.x_label, f.info.x_unit);
-  return displayOf(f).cal ? `${t} (calibrated)` : t;
+  const d = xDisplay(f, comparisonFiles(f));
+  const t = friendlyAxis(f.info.x_label, d.unit, f.info.type);
+  return d.calibrated ? `${t} (calibrated)` : t;
 }
 
 // Returns { data, layout } for Plotly plus helpers the view needs.
 export function figure1D(f, { forExport = false } = {}) {
+  const xd = resolveXAxis(f, comparisonFiles(f));
   const st = baseStyle(f.style);
   const pal = PALETTES[st.palette] || PALETTES.lab;
   const L = f.layers;
@@ -40,19 +46,24 @@ export function figure1D(f, { forExport = false } = {}) {
   const traces = [];
   const showRes = L.res && fit && !L.fft;
   const bottom = showRes || (L.fft && !f.info.irregular);
-  const domainMain = bottom ? [0.3, 1] : [0, 1];
+  const countsPanel = L.sigref && !f.info.reference_only;
+  const domainMain = countsPanel ? (bottom ? [0.62, 1] : [0.42, 1]) : (bottom ? [0.3, 1] : [0, 1]);
   const mode = modeFor(f, f.styleMode);
 
   // display-only transforms (never touch stored data or fits): invert flips y, xscale/xoffset calibrate x
-  const dsp = displayOf(f);
-  const TX = (a) => (dsp.cal ? a.map((v) => v * dsp.xs + dsp.xo) : a);
+  const dsp = displayOf(f), primaryStyle = filePresentation(f, f);
+  const TX = (a, unit = f.info.x_unit || '') => xd.transform(a, unit);
+  const primaryName = legendLabel(f, f);
   const TY = (a) => (dsp.inv ? a.map((v) => -v) : a);
-  let xr = nonNull(d.proc.x), yr = nonNull(d.proc.y);
-  if (fit?.plot_y) { xr = nonNull(fit.x); yr = nonNull(fit.plot_y); }
+  const space = displaySpace(f), transformed = space !== 'original';
+  const shown = displaySeries(f, det, space, fit);
+  const xr = shown.x, yr = shown.y;
   const x = TX(xr), y = TY(yr);
 
   // uncertainty
-  const sem = !fit?.plot_y && d.proc.sem ? nonNull(d.proc.sem) : null;
+  const semByX = new Map((d.proc.x || []).map((v, i) => [v, d.proc.sem?.[i]]));
+  const sem = d.proc.sem && (space === 'original' || (space === 'normalized' && shown.normalization))
+    ? xr.map((v) => { const s = semByX.get(v); return s == null ? NaN : s / (space === 'normalized' ? shown.normalization.span : 1); }) : null;
   if (L.band && sem) {
     if (f.errorMode === 'bars') {
       // drawn on the data trace below
@@ -62,77 +73,120 @@ export function figure1D(f, { forExport = false } = {}) {
         fill: 'toself', fillcolor: hexA(s.color, 0.16), line: { width: 0 }, name: s.name, hoverinfo: 'skip', showlegend: s.legend, visible: s.visible === false ? 'legendonly' : true, meta: { key: 'band' } });
     }
   }
-  // iterations
+  // Iteration layers use the same selection, binning, exclusions and observable as the mean.
+  // Nonlinear display steps have no propagated SD; do not put raw statistics on a transformed axis.
   const its = d.iterations;
-  if (its && (L.iter || L.meanSd) && !fit?.plot_y) {
-    const rawX = TX(nonNull(d.raw.x));
-    const sel = f.iterSel && f.iterSel.length ? f.iterSel : its.values.map((_, i) => i);
+  const hasSteps = (f.proc?.steps || []).some((s) => s.enabled !== false);
+  const norm = shown.normalization;
+  const iterationY = (a) => TY(space === 'normalized' && norm ? toNormalized(nonNull(a), norm) : nonNull(a));
+  if (its && (L.iter || L.meanSd) && !hasSteps && space !== 'fit' && (!transformed || norm)) {
+    const ix = TX(nonNull(its.x || d.raw.x));
+    const sel = its.selected ?? f.proc?.iterations ?? f.iterSel ?? its.values.map((_, i) => i);
+    const vals = its.processed_values || its.values;
     if (L.iter) {
-      const s = seriesStyle(st, 'iter', { name: `Iterations (${sel.length})`, color: '#8C95A4', width: 0.8, opacity: 0.45 });
-      sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: rawX, y: TY(nonNull(its.values[k])), line: { color: s.color, width: s.width }, opacity: s.opacity,
-        name: s.name, legendgroup: 'iter', showlegend: j === 0 && s.legend, hovertemplate: `iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: 'iter' }, visible: s.visible === false ? 'legendonly' : true }));
+      const s = seriesStyle(st, 'iter', { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: 1, opacity: 0.6 });
+      sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: ix, y: iterationY(vals[k]), line: { color: s.color, width: s.width, dash: ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
+        name: s.name, legendgroup: 'iter', showlegend: j === 0 && s.legend, hovertemplate: `iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: 'iter', iteration: k + 1 }, visible: s.visible === false ? 'legendonly' : true }));
     }
-    if (L.meanSd) {
-      const n = rawX.length, mean = [], sd = [];
-      for (let i = 0; i < n; i++) {
-        const v = sel.map((k) => (dsp.inv ? -its.values[k][i] : its.values[k][i])).filter((q) => q !== null && Number.isFinite(q));
-        const m = v.reduce((a, b) => a + b, 0) / (v.length || 1);
-        mean.push(m); sd.push(v.length > 1 ? Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / (v.length - 1)) : 0);
+    if (L.meanSd && d.proc.sd && sel.length > 1) {
+      const mean = iterationY(d.proc.y), sd = nonNull(d.proc.sd).map((v) => space === 'normalized' ? v / norm.span : v);
+      const s = seriesStyle(st, 'meanSd', { name: 'Selected mean ± SD', color: pal[0] });
+      traces.push({ type: 'scatter', x: [...ix, ...[...ix].reverse()], y: [...mean.map((v, i) => v + sd[i]), ...mean.map((v, i) => v - sd[i]).reverse()], fill: 'toself',
+        fillcolor: hexA(s.color, 0.14), line: { width: 0 }, name: s.name, showlegend: s.legend, hoverinfo: 'skip', meta: { key: 'meanSd' } });
+    }
+  }
+  if (L.iterFits && !hasSteps && space !== 'fit') {
+    const result = f.iterationFits?.[det];
+    if (result?.mode === f.mode) for (const row of result.rows) {
+      const r = row.fit; if (!r || (its?.selected && !its.selected.includes(row.index))) continue;
+      let fy = nonNull(r.dense?.y || r.y_fit);
+      if (isNormalizedT1(r)) {
+        const rn = r.extras;
+        if (!Number.isFinite(rn.t1_norm_lo) || !Number.isFinite(rn.t1_norm_span)) continue;
+        fy = toOriginal(fy, { lo: rn.t1_norm_lo, span: rn.t1_norm_span });
       }
-      const s = seriesStyle(st, 'meanSd', { name: 'Iteration mean ± SD', color: '#7A4FD6' });
-      traces.push({ type: 'scatter', x: [...rawX, ...[...rawX].reverse()], y: [...mean.map((v, i) => v + sd[i]), ...mean.map((v, i) => v - sd[i]).reverse()], fill: 'toself',
-        fillcolor: hexA(s.color, 0.14), line: { width: 0 }, name: `${s.name} (band)`, showlegend: false, hoverinfo: 'skip', meta: { key: 'meanSd' } });
-      traces.push({ type: 'scatter', mode: 'lines', x: rawX, y: mean, line: { color: s.color, width: 1.2 }, name: s.name, meta: { key: 'meanSd' }, showlegend: s.legend });
+      if (space === 'normalized') { if (!norm) continue; fy = toNormalized(fy, norm); }
+      traces.push({ type: 'scatter', mode: 'lines', x: TX(nonNull(r.dense?.x || r.x)), y: TY(fy), line: { color: '#5B6474', width: 1.4, dash: ['dash', 'dot', 'dashdot'][row.index % 3] },
+        name: `Individual fits${result.fit_spec.fit_smoothed ? ' · SMOOTHED' : ''}`, legendgroup: 'iterFits', showlegend: row === result.rows.find((r) => r.fit),
+        hovertemplate: `iteration ${row.iteration} · ${row.status}<br>%{x:.5g} ${xd.unit}, %{y:.5g}<extra></extra>`, meta: { key: 'iterFits', iteration: row.iteration } });
     }
   }
   // overlays (other files, same observable)
-  S.overlays.filter((p) => p !== f.path && S.files[p]).forEach((p, i) => {
+  const rightSeries = [];
+  S.overlays.filter((p) => p !== f.path && S.files[p]).forEach((p) => {
     const o = S.files[p];
-    const od = o.data[o.info.detectors.includes(det) ? det : o.detector];
-    if (!od?.proc) return;
-    traces.push(scatterTrace(st, `ov:${p}`, { name: o.info.name.replace(/\.mat$/, ''), color: pal[(i + 2) % pal.length], mode }, TX(nonNull(od.proc.x)), TY(nonNull(od.proc.y))));
+    if (o.mode !== f.mode || o.info.dim === 'scan2d' || o.info.type === 'TimeTrace') return;
+    const odet = o.info.detectors.includes(det) ? det : o.detector;
+    const os = displaySeries(o, odet, space, fit);
+    if (!os) return;
+    const cfg = filePresentation(f, o), name = legendLabel(f, o);
+    const ox = TX(os.x, o.info.x_unit || '');
+    if (!ox) return; // Never overlay incompatible physical x dimensions.
+    const label = `${name}${space !== 'original' ? ` · ${os.normalization?.stored ? 'own fit norm.' : 'own data norm.'}` : ''}`;
+    const ofit = o.fit[odet], hasFit = cfg.fit && ofit && os.fitY;
+    // Per-series axis (left / right overlay axis y9) and uncertainty style (none / band / bars) from the Series panel.
+    const yx = cfg.axis === 'right' ? { yaxis: 'y9' } : {};
+    if (cfg.axis === 'right') rightSeries.push(cfg.label);
+    const od = o.data[odet], oy = TY(os.y);
+    let osem = null;
+    if (cfg.err && cfg.err !== 'none' && od?.proc?.sem && (space === 'original' || (space === 'normalized' && os.normalization))) {
+      const m = new Map((od.proc.x || []).map((v, i) => [v, od.proc.sem[i]]));
+      osem = os.x.map((v) => { const s = m.get(v); return s == null ? NaN : s / (space === 'normalized' ? os.normalization.span : 1); });
+    }
+    if (osem && cfg.err === 'band' && cfg.data) traces.push({ type: 'scatter', x: [...ox, ...[...ox].reverse()], y: [...oy.map((v, i) => v + osem[i]), ...oy.map((v, i) => v - osem[i]).reverse()],
+      fill: 'toself', fillcolor: hexA(cfg.color, 0.15), line: { width: 0 }, name: `${cfg.label} ±1 SEM`, showlegend: false, hoverinfo: 'skip', legendgroup: p, meta: { key: `ovband:${p}` }, ...yx });
+    traces.push(scatterTrace(st, `ov:${p}`, { name: label, color: cfg.color, mode: cfg.mode, marker: cfg.marker, dash: cfg.dash }, ox, oy,
+      { visible: cfg.data, showlegend: cfg.legend && (cfg.data || !hasFit), legendgroup: p,
+        ...(osem && cfg.err === 'bars' ? { error_y: { type: 'data', array: osem, visible: true, thickness: 1, width: 2, color: hexA(cfg.color, 0.65) } } : {}), ...yx,
+        hovertemplate: `${cfg.label} · ${detLabel(o, odet)} · ${o.mode}<br>${os.note}<br>%{x:.6g} ${xd.unit}, %{y:.6g}<extra></extra>` }));
+    if (ofit && os.fitY && f.display?.overlayFits !== false) traces.push(scatterTrace(st, `ovfit:${p}`,
+      { name: label, color: cfg.color, mode: 'lines', dash: cfg.fitDash, width: 2 }, TX(nonNull(ofit.dense?.x || ofit.x), o.info.x_unit || ''), TY(os.fitY),
+      { visible: !!hasFit, showlegend: cfg.legend && !cfg.data && !!hasFit, legendgroup: p, ...yx }));
   });
   // second detector on the same plot
   if (f.compareDetectors && f.info.detectors.length > 1) {
     const other = f.info.detectors.find((k) => k !== det);
     const od = f.data[other];
-    if (od?.proc) {
-      const right = f.mode !== 'contrast';
-      traces.push(scatterTrace(st, `det:${other}`, { name: detLabel(f, other), color: pal[2], mode }, TX(nonNull(od.proc.x)), TY(nonNull(od.proc.y)), right ? { yaxis: 'y2' } : {}));
+    const os = displaySeries(f, other, space, fit);
+    if (od?.proc && os) {
+      const right = false; // Matching observables share physical units; a second detector does not need a second scale.
+      traces.push(scatterTrace(st, `det:${other}`, { name: detLabel(f, other), color: pal[2], mode }, TX(os.x), TY(os.y), right ? { yaxis: 'y2' } : {}));
       const ofit = f.fit[other];
-      if (ofit && L.fit) traces.push(scatterTrace(st, `fit:${other}`, { name: `Fit · ${detLabel(f, other)}`, color: pal[3], mode: 'lines', width: 2 },
-        TX(nonNull(ofit.dense?.x || ofit.x)), TY(nonNull(ofit.dense?.y || ofit.y_fit)), right ? { yaxis: 'y2' } : {}));
+      if (ofit && L.fit && os.fitY) traces.push(scatterTrace(st, `fit:${other}`, { name: `Fit · ${detLabel(f, other)}`, color: pal[3], mode: 'lines', width: 2 },
+        TX(nonNull(ofit.dense?.x || ofit.x)), TY(os.fitY), right ? { yaxis: 'y2' } : {}));
     }
   }
   // main data
   if (L.data) {
-    const extra = {};
+    const extra = { visible: primaryStyle.data, showlegend: primaryStyle.legend, legendgroup: f.path };
     if (L.band && sem && f.errorMode === 'bars') extra.error_y = { type: 'data', array: sem, visible: true, thickness: 1, width: 2, color: hexA(pal[0], 0.6) };
     const name = f.info.detectors.length > 1 ? `Data · ${detLabel(f, det)}` : (its ? `Data · mean of ${its.count} iterations` : 'Data');
-    traces.push(scatterTrace(st, 'data', { name, color: pal[0], mode }, x, y, { customdata: x.map((_, i) => i), ...extra }));
+    const sourceIndices = transformed ? new Map(d.proc.x.map((v, i) => [v, i])) : null;
+    traces.push(scatterTrace(st, 'data', { name: primaryName, color: primaryStyle.color, mode: primaryStyle.mode, marker: primaryStyle.marker, dash: primaryStyle.dash }, x, y, { customdata: xr.map((v, i) => sourceIndices?.get(v) ?? i), ...extra }));
   }
-  if (L.smooth && d.proc.smooth && !fit?.plot_y) traces.push(scatterTrace(st, 'smooth', { name: `Smoothed (${f.proc.smooth} pt)`, color: '#222222', mode: 'lines', width: 1.6 }, x, TY(nonNull(d.proc.smooth))));
+  if (L.smooth && d.proc.smooth && (space === 'original' || (space === 'normalized' && norm))) traces.push(scatterTrace(st, 'smooth', { name: `Smoothed (${d.proc.smoothing_window ?? f.proc.smooth} pt)`, color: '#222222', mode: 'lines', width: 1.6 }, TX(nonNull(d.proc.x)), iterationY(d.proc.smooth)));
   // fit
-  if (fit && L.fit) {
-    const fx = TX(nonNull(fit.dense?.x || fit.x)), fy = TY(nonNull(fit.dense?.y || fit.y_fit));
-    const fb = nonNull(fit.dense?.band);
+  if (fit && L.fit && shown.fitY) {
+    const fx = TX(nonNull(fit.dense?.x || fit.x)), fy = TY(shown.fitY);
+    const fb = shown.band || [];
     if (L.conf && fit.dense?.band && fb.length === fx.length && fb.every(Number.isFinite)) {
       const s = seriesStyle(st, 'conf', { name: 'Fit ±1σ', color: pal[1] });
       traces.push({ type: 'scatter', x: [...fx, ...[...fx].reverse()], y: [...fy.map((v, i) => v + fb[i]), ...fy.map((v, i) => v - fb[i]).reverse()],
         fill: 'toself', fillcolor: hexA(s.color, 0.18), line: { width: 0 }, name: s.name, hoverinfo: 'skip', showlegend: s.legend, visible: s.visible === false ? 'legendonly' : true, meta: { key: 'conf' } });
     }
-    traces.push(scatterTrace(st, 'fit', { name: `Fit · ${fit.model}`, color: pal[1], mode: 'lines', width: Math.max(2, st.line + 0.4) }, fx, fy, { hovertemplate: 'fit %{x:.6g}, %{y:.6g}<extra></extra>' }));
+    traces.push(scatterTrace(st, 'fit', { name: primaryName, color: primaryStyle.color, mode: 'lines', dash: primaryStyle.fitDash, width: Math.max(2, st.line + 0.4) }, fx, fy,
+      { visible: primaryStyle.fit, showlegend: primaryStyle.legend && !primaryStyle.data, legendgroup: f.path, hovertemplate: `fit %{x:.6g} ${xd.unit}, %{y:.6g}<extra>${fit.model}</extra>` }));
     if (L.envelope && fit.envelope) {
       const s = seriesStyle(st, 'envelope', { name: 'Decay envelope', color: '#7A4FD6', dash: 'dash', width: 1.4 });
       traces.push({ type: 'scatter', mode: 'lines', x: TX(nonNull(fit.envelope.x)), y: TY(nonNull(fit.envelope.upper)), line: { color: s.color, dash: s.dash, width: s.width }, name: s.name, legendgroup: 'env', meta: { key: 'envelope' }, showlegend: s.legend });
       traces.push({ type: 'scatter', mode: 'lines', x: TX(nonNull(fit.envelope.x)), y: TY(nonNull(fit.envelope.lower)), line: { color: s.color, dash: s.dash, width: s.width }, name: s.name, legendgroup: 'env', showlegend: false, meta: { key: 'envelope' } });
     }
   }
-  // signal + reference counts on the right axis
-  if (L.sigref && !fit?.plot_y && f.mode === 'contrast' && !f.info.reference_only) {
+  // Counts have their own aligned panel, never a contrast/normalized axis or an arbitrary overlaid scale.
+  if (countsPanel) {
     const rx = TX(nonNull(d.raw.x));
-    traces.push(scatterTrace(st, 'signal', { name: 'Signal', color: '#0E8A7E', mode: 'lines', width: 1.1 }, rx, nonNull(d.raw.signal), { yaxis: 'y2' }));
-    traces.push(scatterTrace(st, 'reference', { name: 'Reference', color: '#B5307A', mode: 'lines', width: 1.1 }, rx, nonNull(d.raw.reference), { yaxis: 'y2' }));
+    traces.push(scatterTrace(st, 'signal', { name: 'Signal (selected mean)', color: '#eb6834', mode: 'lines', width: 1.1 }, rx, nonNull(d.raw.signal), { yaxis: 'y2' }));
+    traces.push(scatterTrace(st, 'reference', { name: 'Reference (selected mean)', color: '#1baf7a', mode: 'lines', width: 1.1 }, rx, nonNull(d.raw.reference), { yaxis: 'y2' }));
   }
   // pinned points
   if (f.pins.length) {
@@ -142,7 +196,7 @@ export function figure1D(f, { forExport = false } = {}) {
   // residuals
   if (showRes && L.data) {
     const rx = TX(nonNull(fit.x));
-    traces.push({ type: 'scatter', mode: 'markers', x: rx, y: TY(nonNull(fit.residuals)), xaxis: 'x', yaxis: 'y3', name: 'Residuals', showlegend: false,
+    traces.push({ type: 'scatter', mode: 'markers', x: rx, y: TY(shown.residuals || []), xaxis: 'x', yaxis: 'y3', name: 'Residuals', showlegend: false,
       marker: { size: Math.max(3, st.marker - 2), color: '#5B6474' }, hovertemplate: 'residual %{y:.4g}<extra></extra>', meta: { key: 'res' } });
   }
   // FFT of the processed data (regular sampling only)
@@ -154,38 +208,70 @@ export function figure1D(f, { forExport = false } = {}) {
 
   const deco = userDecorations(st);
   const annotations = [...deco.annotations];
-  if (L.results && fit) { const a = resultsAnnotation(st, fit, f.info); if (a) annotations.push(a); }
+  if (L.results) { const a = resultsAnnotation(st, fit, f.info); if (a) annotations.push(a); }
+  if (isNormalizedT1(fit)) annotations.push({ xref: 'paper', yref: 'paper', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom', showarrow: false,
+    text: `${space === 'original' ? 'Original units · fit mapped from normalized space' : 'Normalized 1 − data · each file uses its own normalization'} · A, y0 normalized`, font: { size: Math.max(9, st.base - 3), color: '#5B6474' }, name: 'fit-space' });
   const shapes = [...deco.shapes];
+  // ODMR peak-pick-only results (analyze.js peakPickCard): detected sample points, no model.
+  const picked = f.peakPick?.[det];
+  if (picked?.peaks?.length && L.picked !== false && !fit?.plot_y) {
+    const px = TX(picked.peaks.map((p) => p.x)), py = TY(picked.peaks.map((p) => p.y));
+    if (px) traces.push({ type: 'scatter', mode: 'markers', x: px, y: py, name: `Picked ${picked.polarity === 'dip' ? 'dips' : 'peaks'} (${picked.peaks.length})`,
+      marker: { symbol: 'x-thin', size: 13, color: '#D62728', line: { width: 2.5, color: '#D62728' } }, meta: { key: 'picked' },
+      hovertemplate: 'picked %{x:.7g}<extra></extra>' });
+  }
   if (L.peaks && fit) fit.params.filter((p) => /^(x0|center)(_\d+)?$/.test(p.name)).forEach((p) =>
-    shapes.push({ type: 'line', xref: 'x', yref: 'paper', x0: p.value, x1: p.value, y0: domainMain[0], y1: 1, line: { color: '#E06A1B', width: 1, dash: 'dot' } }));
+    shapes.push({ type: 'line', xref: 'x', yref: 'paper', x0: TX([p.value])[0], x1: TX([p.value])[0], y0: domainMain[0], y1: 1, line: { color: '#E06A1B', width: 1, dash: 'dot' } }));
   if (f.measure && f.measure.length === 2) {
     const [a, b] = f.measure;
     shapes.push({ type: 'line', x0: a.x, y0: a.y, x1: b.x, y1: b.y, line: { color: '#C0392B', width: 1.5, dash: 'dot' } });
   }
   const range = fit ? TX([fit.x?.[0], fit.x?.[fit.x.length - 1]]).sort((a, b) => a - b) : null;
-  const hasRight = traces.some((t) => t.yaxis === 'y2');
+  const hasCounts = countsPanel;
   const layout = baseLayout(st, {
-    xaxis: { ...axisLayout(st, 'x', xTitle(f), { range: f.xrange }), domain: [0, hasRight ? 0.92 : 1], anchor: 'y' },
-    yaxis: { ...axisLayout(st, 'y', yTitle(f), { range: f.yrange }), domain: domainMain, ...(f.mode !== 'contrast' && !fit?.plot_y ? { exponentformat: 'SI' } : {}) },
+    xaxis: { ...axisLayout(st, 'x', xTitle(f), { range: f.xrange }), domain: [0, 1], anchor: countsPanel ? 'y2' : 'y' },
+    yaxis: { ...axisLayout(st, 'y', yTitle(f), { range: f.yrange }), domain: domainMain, ...(f.mode !== 'contrast' && !transformed ? { exponentformat: 'SI' } : {}) },
     legend: legendLayout(st),
     showlegend: L.legend,
     annotations, shapes,
-    uirevision: f.path + det + f.mode,
+    uirevision: f.path + det + f.mode + space + xd.unit + !!st.x.log,
   });
-  if (hasRight) layout.yaxis2 = { ...axisLayout(st, 'y2', f.compareDetectors && f.mode !== 'contrast' ? `${detLabel(f, f.info.detectors.find((k) => k !== det))}` : `Counts${f.info.unit ? ` [${f.info.unit}]` : ''}`), overlaying: 'y', side: 'right', anchor: 'x', exponentformat: 'SI' };
+  if (isNormalizedT1(fit)) layout.margin.t = Math.max(layout.margin.t, 38);
+  if (rightSeries.length) {
+    // Independent right-hand axis for series the user moved there (Series panel); the left axis stops mirroring ticks.
+    layout.yaxis9 = { ...axisLayout(st, 'yRight', `${yTitle(f)} · right: ${rightSeries.join(', ')}`, { range: f.yRightRange }), overlaying: 'y', side: 'right', anchor: 'x', ...(st.yRight?.ticks?.length ? {} : { tickmode: 'auto', nticks: 8 }),
+      showgrid: false, mirror: false, ...(f.mode !== 'contrast' && !transformed ? { exponentformat: 'SI' } : {}) };
+    layout.yaxis.mirror = false;
+    layout.margin.r = Math.max(layout.margin.r || 0, 78);
+  }
+  if (countsPanel) layout.yaxis2 = { ...axisLayout(st, 'y2', `Signal / Reference<br>[${f.info.unit || 'recorded units'}]`), domain: bottom ? [0.31, 0.51] : [0, 0.27], anchor: 'x', exponentformat: 'SI' };
+  if (fit?.provenance?.fit_target === 'smoothed') {
+    annotations.push({ xref: 'paper', yref: 'paper', x: 1, y: 1.02, xanchor: 'right', yanchor: 'bottom', showarrow: false,
+      text: `SMOOTHED FIT · ${fit.provenance.smoothing_window} pt · errors underestimated`, font: { size: Math.max(9, st.base - 3), color: '#5B6474' } });
+    layout.margin.t = Math.max(layout.margin.t, 55);
+  }
+  if (hasSteps && (L.iter || L.meanSd || L.iterFits)) annotations.push({ xref: 'paper', yref: 'paper', x: 0, y: 1.02, showarrow: false, xanchor: 'left', yanchor: 'bottom', text: 'Iteration layers hidden: transformed-axis statistics are not propagated.', font: { size: 10, color: '#5B6474' } });
   if (bottom) {
     if (fftInfo) {
       layout.xaxis2 = { ...axisLayout(st, 'x2', `Frequency [${fftInfo.unit}]`), anchor: 'y3', domain: [0, 1] };
       layout.yaxis3 = { ...axisLayout(st, 'y3', '|FFT|'), domain: [0, 0.2], anchor: 'x2' };
       layout.xaxis.title.text = layout.xaxis.title.text; // keep
     } else {
-      layout.yaxis3 = { ...axisLayout(st, 'y3', 'Resid.'), domain: [0, 0.2], anchor: 'x', zeroline: true, zerolinecolor: '#C9CED6' };
+      layout.yaxis3 = { ...axisLayout(st, 'y3', space === 'normalized' ? 'Resid.<br>[a.u.]' : space === 'fit' ? `Resid. · ${fit.plot_y_label || 'fit space'}` : `Resid.<br>[${f.mode === 'contrast' ? '1' : f.info.unit || 'a.u.'}]`), domain: [0, 0.2], anchor: 'x', zeroline: true, zerolinecolor: '#C9CED6' };
       layout.xaxis.anchor = 'y3';
       layout.yaxis.anchor = 'x';
     }
   }
-  const xbreakBlocked = bottom ? 'residual panel or FFT' : hasRight ? 'right axis (second detector / signal+reference)' : '';
-  applyInset(f, st, traces, layout, shapes, annotations, domainMain, hasRight ? 0.92 : 1);
+  const xbreakBlocked = bottom ? 'residual panel or FFT' : hasCounts ? 'signal/reference counts panel' : '';
+  const fileOrder = comparisonFiles(f).map((o) => o.path), explicitOrder = st.seriesOrder || [];
+  const rank = (t) => {
+    const key = t.meta?.key;
+    if (explicitOrder.includes(key)) return explicitOrder.indexOf(key);
+    const path = key === 'data' || key === 'fit' ? f.path : key?.replace(/^ovfit:|^ov:/, '');
+    return explicitOrder.length + (fileOrder.includes(path) ? fileOrder.indexOf(path) * 2 + (key === 'fit' || key?.startsWith('ovfit:') ? 1 : 0) : fileOrder.length * 2);
+  };
+  traces.sort((a, b) => rank(a) - rank(b));
+  applyInset(f, st, traces, layout, shapes, annotations, domainMain, 1);
   applyXBreak(f, st, traces, layout, shapes, annotations, domainMain, xbreakBlocked);
   if (forExport) layout.uirevision = undefined;
   return { data: traces, layout, range, xbreakBlocked, fftPeak: fftInfo ? { f: fftInfo.peak, unit: fftInfo.unit } : null };
@@ -193,7 +279,7 @@ export function figure1D(f, { forExport = false } = {}) {
 
 // ---- presentation extras: inset zoom (xaxis4/yaxis4) and broken x axis (xaxis5) ----
 const mainAx = (t) => (!t.xaxis || t.xaxis === 'x') && (!t.yaxis || t.yaxis === 'y');
-const NO_INSET = new Set(['band', 'conf', 'meanSd', 'iter', 'pins', 'res', 'fft']);
+const NO_INSET = new Set(['band', 'conf', 'meanSd', 'iter', 'iterFits', 'pins', 'res', 'fft']);
 
 function applyInset(f, st, traces, layout, shapes, annotations, dom, xEnd) {
   const ins = f.style?.inset;

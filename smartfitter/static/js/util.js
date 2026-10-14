@@ -117,9 +117,20 @@ export const num = (v) => { if (v === '' || v === null || v === undefined) retur
 export function toast(msg, kind = '', ms = 3800) {
   let box = document.querySelector('.toasts');
   if (!box) { box = h('div', { class: 'toasts' }); document.body.appendChild(box); }
+  // Repeats of a visible message refresh it (with a ×n count) instead of stacking; at most 3 non-error notices show.
+  const same = [...box.children].find((c) => c.dataset.msg === String(msg) && c.dataset.kind === kind);
+  if (same) {
+    same.dataset.count = String(Number(same.dataset.count || 1) + 1);
+    same.textContent = `${msg} ×${same.dataset.count}`;
+    clearTimeout(same._timer); same._timer = setTimeout(() => same.remove(), kind === 'err' ? Math.max(ms, 8000) : ms);
+    return;
+  }
   const t = h('div', { class: `toast ${kind}` }, msg);
+  t.dataset.msg = String(msg); t.dataset.kind = kind;
   box.appendChild(t);
-  setTimeout(() => t.remove(), kind === 'err' ? Math.max(ms, 8000) : ms);
+  const calm = [...box.children].filter((c) => c.dataset.kind !== 'err');
+  while (calm.length > 3) calm.shift().remove();
+  t._timer = setTimeout(() => t.remove(), kind === 'err' ? Math.max(ms, 8000) : ms);
 }
 
 export function modal(content, { onClose, className = '' } = {}) {
@@ -169,11 +180,13 @@ export function input(value, onCommit, props = {}) {
 }
 
 export function check(label, value, onChange, props = {}) {
-  return h('label', { class: 'ck', title: props.title }, h('input', { type: 'checkbox', checked: value, disabled: props.disabled, onchange: (e) => onChange(e.target.checked) }), label);
+  return h('label', { class: 'ck', title: props.title }, h('input', { type: 'checkbox', checked: value, disabled: props.disabled, 'aria-label': props['aria-label'], onchange: (e) => onChange(e.target.checked) }), label);
 }
 
 export function field(label, control, props = {}) {
-  return h('label', { class: 'f', ...props }, h('span', { class: 'lbl' }, label), control);
+  const single = control.matches('input,select,textarea');
+  if (control.matches('select') && !control.getAttribute('aria-label')) control.setAttribute('aria-label', label);
+  return h(single ? 'label' : 'div', { class: 'f', ...(single ? {} : { role: 'group', 'aria-label': label }), ...props }, h('span', { class: 'lbl' }, label), control);
 }
 
 export const TAG_COLORS = {

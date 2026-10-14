@@ -1,6 +1,6 @@
 // Application shell: top bar, library, routing, keyboard shortcuts, drag & drop, folder watching.
 import { call, onBusy } from './api.js';
-import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel } from './state.js';
+import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay } from './state.js';
 import { h, mount, icon, toast, modal, contextMenu, fmt, fmtTime, fmtDate, basename, dirname, tag, debounce } from './util.js';
 import { renderAnalyze, renderInspector, runFit, saveResults, copyFigure, resetView, ALT_TABS, kindOf } from './analyze.js';
 import { renderCompare } from './compare.js';
@@ -8,6 +8,7 @@ import { renderFigure } from './figure.js';
 import { renderBatch } from './batch.js';
 import { renderDay } from './day.js';
 import { renderStack } from './stack.js';
+import { renderAutoFind } from './autofind.js';
 
 const app = document.getElementById('app');
 const els = {};
@@ -17,6 +18,7 @@ async function boot() {
   const info = await call('app_info');
   S.version = info.version; S.desktop = info.desktop; S.settings = info.settings;
   S.home = info.home;
+  Object.assign(S.library, { sort: 'date', type: 'all', ...S.settings.library_nav });
   S.library.folder = S.settings.recent_folders?.[0] || null;
   buildShell();
   if (S.library.folder) await openFolder(S.library.folder, { remember: false }).catch(() => { S.library.folder = null; });
@@ -31,7 +33,7 @@ function buildShell() {
   els.lib = h('aside', { class: 'library' });
   els.main = h('main', { class: 'main' });
   els.insp = h('aside', { class: 'inspector' });
-  els.inspHandle = h('div', { class: 'resize-handle insp-resize hidden', title: 'Drag to resize · double-click to reset', onmousedown: (e) => startResize(e, 'inspector'), ondblclick: () => setPanelWidth('inspector', 350, true) });
+  els.inspHandle = h('div', { class: 'resize-handle insp-resize hidden', title: 'Drag to resize · double-click to reset', onmousedown: (e) => startResize(e, 'inspector'), ondblclick: () => setPanelWidth('inspector', window.innerWidth < 1500 ? 300 : 350, true) });
   els.full = h('div', { style: 'flex:1;display:flex;min-width:0;min-height:0' });
   els.status = h('footer', { class: 'status' });
   mount(app, els.top, h('div', { class: 'body' }, els.lib, els.main, els.inspHandle, els.insp, els.full), els.status);
@@ -59,6 +61,7 @@ function render() {
     else if (v === 'batch') renderBatch(els.full);
     else if (v === 'day') renderDay(els.full);
     else if (v === 'stack') renderStack(els.full);
+    else if (v === 'autofind') renderAutoFind(els.full);
     applyPanelWidths();
     renderStatus(0, '');
   });
@@ -78,7 +81,7 @@ const SHORTCUTS = [['Open files', 'Ctrl O'], ['Add files', 'Ctrl Shift O'], ['Se
 
 // ------------------------------------------------------------------ top bar
 function renderTop() {
-  const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['day', 'Day'], ['stack', 'Stacks'], ['batch', 'Batch']];
+  const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['day', 'Day'], ['stack', 'Stacks'], ['autofind', 'AutoFind'], ['batch', 'Batch']];
   mount(els.top,
     h('div', { class: 'brand', title: 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 20, '#5AA9F0'), h('span', { class: 'brand-name' }, 'SmartFitter')),
     h('nav', { class: 'nav', 'aria-label': 'Workspaces' }, nav.map(([k, l]) => h('button', { class: S.view === k || (k === 'analyze' && S.view === 'home' && active()) ? 'on' : '', onclick: () => { S.view = k; emit(); } }, l))),
@@ -107,6 +110,12 @@ function renderStatus(n, label) {
 // ------------------------------------------------------------------ library
 export async function openFolder(path, { remember = true } = {}) {
   const listing = await call('list_dir', { path }, { label: 'Reading folder' });
+  const old = S.library.folder;
+  if (old !== listing.path) {
+    if (old) libScrolls[old] = libScroll;
+    libScroll = libScrolls[listing.path] || 0;
+    libSelected.clear(); libAnchor = null; libFocus = null;
+  }
   S.library.folder = listing.path;
   S.library.listing = listing;
   const seen = S.library.seen[listing.path] || {};
@@ -139,13 +148,16 @@ function fileMatches(p, info) {
   if (chip === '2d' && info.dim !== 'scan2d') return false;
   if (chip === 'tt' && info.type !== 'TimeTrace') return false;
   if (chip === 'fitted' && !(S.files[p] && Object.keys(S.files[p].fit).length)) return false;
+  if (lib.type && lib.type !== 'all' && info.type !== lib.type) return false;
   const words = lib.filter.toLowerCase().split(/\s+/).filter(Boolean);
-  const hay = `${basename(p)} ${dirname(p)} ${info.type || ''} ${info.tag || ''} ${info.dim || ''} ${info.detectors > 1 ? 'dual detector2' : ''}`.toLowerCase();
+  const meta = lib.listing?.files.find((r) => r.path === p);
+  const date = meta ? new Date(meta.mtime * 1000).toLocaleDateString('sv-SE') : '';
+  const hay = `${basename(p)} ${dirname(p)} ${info.type || ''} ${info.tag || ''} ${info.dim || ''} ${date} ${meta ? fmtDate(meta.mtime) : ''} ${(Array.isArray(info.detectors) ? info.detectors.length : info.detectors) > 1 ? 'dual detector2' : ''}`.toLowerCase();
   return words.every((w) => hay.includes(w));
 }
 
 function fileRow(p, meta) {
-  const info = S.library.peeks[p] || {};
+  const info = S.files[p]?.info || S.library.peeks[p] || {};
   const f = S.files[p];
   const isPrimary = S.primary === p && S.view === 'analyze';
   const prim = active();
@@ -155,20 +167,39 @@ function fileRow(p, meta) {
   if (meta?.mtime) sub.push(fmtTime(meta.mtime));
   if (info.grid) sub.push(`${info.grid[1]} × ${info.grid[0]}`);
   else if (info.points) sub.push(`${info.points} pts`);
-  if (info.detectors > 1) sub.push('2 detectors');
+  if ((Array.isArray(info.detectors) ? info.detectors.length : info.detectors) > 1) sub.push('2 detectors');
   if (info.iterations && info.iterations !== '/') sub.push(`${info.iterations} it`);
   if (f && f.fit[f.detector]) sub.push(`fit R² ${fmt(f.fit[f.detector].r2, 3)}`);
   if (info.error) sub.push('unreadable');
   return h('div', {
-    class: `frow ${isPrimary ? 'sel primary' : ''} ${newer ? 'newfile' : ''}`, title: info.error ? `${p}\n${info.error}` : p, 'data-path': p,
-    onclick: (e) => { if (e.target.type === 'checkbox') return; openPath(p); },
+    class: `frow ${isPrimary ? 'sel primary' : ''} ${libSelected.has(p) ? 'multi-sel' : ''} ${newer ? 'newfile' : ''}`, title: info.error ? `${p}\n${info.error}` : `${p}\nClick to open · Ctrl/Shift-click to select for comparison`, 'data-path': p, tabindex: 0,
+    onfocus: () => { libFocus = p; },
+    // Drag onto the plot (compare), the Compare set or the Figure composer; a multi-selection drags together.
+    draggable: 'true',
+    ondragstart: (e) => {
+      const paths = libSelected.has(p) && libSelected.size > 1 ? [...libSelected] : [p];
+      e.dataTransfer.setData(SF_PATHS, JSON.stringify(paths));
+      e.dataTransfer.setData('text/plain', paths.join('\n'));
+      e.dataTransfer.effectAllowed = 'copy';
+    },
+    onkeydown: libraryKeys,
+    onclick: (e) => {
+      if (e.target.closest('label,button,input')) return;
+      libFocus = p;
+      if (e.ctrlKey || e.metaKey || e.shiftKey) { selectLibraryFile(p, e); return; }
+      libSelected.clear(); libAnchor = p; openPath(p);
+    },
     oncontextmenu: (e) => { e.preventDefault(); fileMenu(e, p); },
   },
-  canOverlay ? h('input', { type: 'checkbox', checked: S.overlays.includes(p), title: 'Overlay on the current plot', 'aria-label': `Overlay ${basename(p)}`,
-    onchange: async (e) => { if (e.target.checked) { await openFile(p, { primary: false }); S.overlays = [...S.overlays, p]; } else S.overlays = S.overlays.filter((q) => q !== p); emit(); } }) : null,
   tag(info.tag),
   h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip' }, basename(p).replace(/\.mat$/i, '')),
-    h('div', { class: 'sub ellip' }, isPrimary ? `Primary · ${sub.join(' · ')}` : sub.join(' · '))));
+    h('div', { class: 'sub ellip' }, [isPrimary ? 'Primary' : f ? 'Open' : '', S.overlays.includes(p) ? 'Compared' : '', newer ? 'New' : '', ...sub].filter(Boolean).join(' · '))),
+  canOverlay ? h('label', { class: 'lib-compare', title: 'Compare on the current Analyze plot without replacing its primary file', onclick: (e) => e.stopPropagation() },
+    h('input', { type: 'checkbox', checked: S.overlays.includes(p), 'aria-label': `Overlay ${basename(p)}`,
+      onchange: async (e) => {
+        try { if (e.target.checked) await addOverlay(p); else removeOverlay(p); }
+        catch (err) { e.target.checked = false; toast(`Cannot compare: ${err.message}`, 'err'); }
+      } }), 'Compare') : null);
 }
 
 function fileMenu(e, p) {
@@ -179,6 +210,7 @@ function fileMenu(e, p) {
     { label: 'Show in folder', run: () => call('reveal', { path: p }) },
     { label: 'Copy path', run: () => navigator.clipboard.writeText(p).then(() => toast('Path copied')) },
     S.files[p] ? { label: 'Close file', run: () => closeFile(p) } : null,
+    Object.keys(S.files).length > 1 ? { label: 'Close all open files', run: closeAllFiles } : null,
   ]);
 }
 
@@ -191,58 +223,162 @@ function closeFile(p) {
   emit();
 }
 
+function closeAllFiles() {
+  const n = Object.keys(S.files).length;
+  if (!n) return;
+  const fitted = Object.values(S.files).filter((f) => Object.keys(f.fit).length || S.compare.results?.[f.path]).length;
+  const go = () => {
+    S.files = {}; S.overlays = []; S.compare.set = []; S.compare.results = {}; S.compare.global = null; S.library.extra = []; S.primary = null;
+    emit(); toast(`Closed ${n} file${n === 1 ? '' : 's'}.`);
+  };
+  if (!fitted) return go();
+  const m = modal(h('div', { style: 'padding:18px 20px;display:flex;flex-direction:column;gap:14px;max-width:420px' },
+    h('div', {}, `Close all ${n} open file${n === 1 ? '' : 's'}? ${fitted} ${fitted === 1 ? 'has' : 'have'} fit results that will be discarded unless you saved them (Ctrl+S) or saved a session (Ctrl+Shift+S).`),
+    h('div', { class: 'row', style: 'justify-content:flex-end;gap:8px' },
+      h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'),
+      h('button', { class: 'btn primary', onclick: () => { m.close(); go(); } }, 'Close all'))));
+}
+
+// The library list is rebuilt on every render; remember its scroll so clicking a file doesn't jump to the top.
+let libScroll = 0;
+const libScrolls = {}, libSelected = new Set();
+let libAnchor = null, libFocus = null;
+const saveLibraryPrefs = debounce(() => {
+  const { filter, chip, sort, type } = S.library;
+  S.settings.library_nav = { filter, chip, sort, type };
+  call('settings_set', { patch: { library_nav: S.settings.library_nav } }, { quiet: true }).catch(() => {});
+}, 200);
+
+function selectLibraryFile(p, e) {
+  const paths = [...els.libList.querySelectorAll('.frow')].map((r) => r.dataset.path);
+  if (e.shiftKey && paths.includes(libAnchor)) {
+    const a = paths.indexOf(libAnchor), b = paths.indexOf(p);
+    if (!e.ctrlKey && !e.metaKey) libSelected.clear();
+    paths.slice(Math.min(a, b), Math.max(a, b) + 1).forEach((q) => libSelected.add(q));
+  } else { libSelected.has(p) ? libSelected.delete(p) : libSelected.add(p); libAnchor = p; }
+  renderLibrary();
+}
+function libraryKeys(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.target.type === 'checkbox') return;
+  const rows = [...els.libList.querySelectorAll('.frow')];
+  const i = rows.findIndex((r) => r.dataset.path === libFocus);
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const r = rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (r) { r.focus(); r.scrollIntoView({ block: 'nearest' }); }
+  } else if (e.key === 'Enter' && libFocus) openPath(libFocus);
+  else if (e.key === 'Backspace' && S.library.listing?.parent) openFolder(S.library.listing.parent);
+  else if (e.key === 'Escape') { libSelected.clear(); renderLibrary(); }
+  else return;
+  e.preventDefault(); e.stopPropagation();
+}
+function breadcrumbs(path) {
+  const p = path.replace(/\//g, '\\');
+  const root = p.match(/^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\?)/)?.[0] || '';
+  const parts = p.slice(root.length).split('\\').filter(Boolean);
+  let current = root;
+  return h('div', { class: 'breadcrumbs', title: path, 'aria-label': 'Folder path' },
+    root ? h('button', { onclick: () => openFolder(root), title: root }, root.replace(/\\$/, '')) : null,
+    parts.map((name) => {
+      current = `${current.replace(/\\$/, '')}\\${name}`;
+      const target = current;
+      return [h('span', { class: 'dim' }, '›'), h('button', { title: target, onclick: () => openFolder(target) }, name)];
+    }));
+}
+
 function renderLibrary() {
+  const focused = els.lib.contains(document.activeElement) ? document.activeElement : null;
+  const focusId = focused?.id, focusPath = focused?.closest('.frow')?.dataset.path;
+  const cursor = focused?.tagName === 'INPUT' && focused.type === 'text' ? [focused.selectionStart, focused.selectionEnd] : null;
+  const folderTop = els.lib.querySelector('.lib-folders-list')?.scrollTop || 0;
   const lib = S.library;
   if (S.libCollapsed || !['analyze', 'home'].includes(S.view)) {
     els.lib.className = 'library rail';
     mount(els.lib, h('button', { class: 'ibtn', title: 'Show library', 'aria-label': 'Show library', onclick: () => { S.libCollapsed = false; if (!['analyze', 'home'].includes(S.view)) S.view = 'analyze'; emit(); } }, icon('folder', 18)),
-      Object.keys(S.files).slice(0, 14).map((p) => h('button', { class: 'ibtn', title: basename(p), style: S.primary === p ? 'background:var(--sel)' : '', onclick: () => openPath(p) }, tag((lib.peeks[p] || S.files[p]?.info || {}).tag))));
+      Object.keys(S.files).slice(0, 14).map((p) => h('button', { class: 'ibtn', title: `${basename(p)}
+Click to open · drag onto the Compare set, Figure panels or the plot`, style: S.primary === p ? 'background:var(--sel)' : '', draggable: 'true', ondragstart: (e) => { e.dataTransfer.setData(SF_PATHS, JSON.stringify([p])); e.dataTransfer.effectAllowed = 'copy'; }, onclick: () => openPath(p) }, tag((lib.peeks[p] || S.files[p]?.info || {}).tag), h('span', { class: 'rail-id' }, railId(p)))));
     return;
   }
   els.lib.className = 'library';
   const listing = lib.listing;
-  const chips = [['all', 'All'], ['1d', '1D'], ['2d', '2D'], ['tt', 'Time trace'], ['fitted', 'Fitted']];
-  const filterEl = h('input', { class: 'field', id: 'lib-filter', placeholder: 'Filter: name, type, detector  (Ctrl K)', value: lib.filter, 'aria-label': 'Filter files' });
-  filterEl.addEventListener('input', debounce(() => { lib.filter = filterEl.value; renderLibList(); }, 120));
+  const chips = [['all', 'All'], ['1d', '1D'], ['2d', '2D'], ['tt', 'Trace'], ['fitted', 'Fitted']];
+  const filterEl = h('input', { class: 'field', type: 'text', id: 'lib-filter', placeholder: 'Search name, type, YYYY-MM-DD (Ctrl K)', value: lib.filter, 'aria-label': 'Filter files' });
+  const refreshFilter = debounce(renderLibList, 120);
+  filterEl.addEventListener('input', () => { lib.filter = filterEl.value; saveLibraryPrefs(); refreshFilter(); });
   filterEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { const first = els.libList.querySelector('.frow'); if (first) first.click(); }
-    if (e.key === 'Escape') { lib.filter = ''; filterEl.value = ''; renderLibList(); filterEl.blur(); }
+    if (e.key === 'Escape') { lib.filter = ''; filterEl.value = ''; saveLibraryPrefs(); renderLibList(); filterEl.blur(); }
+    if (!e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      const rows = els.libList.querySelectorAll('.frow');
+      const row = e.key === 'ArrowDown' ? rows[0] : rows[rows.length - 1];
+      row?.focus(); row?.scrollIntoView({ block: 'nearest' }); e.preventDefault();
+    }
     e.stopPropagation();
   });
   els.libList = h('div', { class: 'lib-list' });
+  els.libList.addEventListener('scroll', () => { if (els.libList.clientHeight > 0) { libScroll = els.libList.scrollTop; if (lib.folder) libScrolls[lib.folder] = libScroll; } });
+  const types = [...new Set([...Object.values(lib.peeks), ...Object.values(S.files).map((f) => f.info)].map((i) => i.type).filter(Boolean))].sort();
+  if (lib.type !== 'all' && lib.type && !types.includes(lib.type)) types.push(lib.type);
   mount(els.lib,
     h('div', { class: 'lib-head' },
-      h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Library'), h('span', { class: 'sp' }),
+      h('div', { class: 'row', style: 'gap:3px' }, h('span', { class: 'lbl' }, 'Library'), h('span', { class: 'sp' }),
+        h('button', { class: 'btn sm', title: 'Parent folder (Backspace when the file list has focus)', disabled: !listing?.parent, onclick: () => openFolder(listing.parent) }, icon('up', 12), 'Up'),
+        h('button', { class: 'btn sm', title: 'Recent and favorite folders', onclick: folderMenu }, 'Recent'),
         h('button', { class: 'ibtn', title: 'Add files (Ctrl+Shift+O)', onclick: () => openFilesDialog(true) }, icon('plus', 15)),
         h('button', { class: 'ibtn', title: 'Choose folder', onclick: chooseFolder }, icon('folder', 15)),
         h('button', { class: 'ibtn', title: 'Collapse library', onclick: () => { S.libCollapsed = true; emit(); } }, icon('chevL', 15))),
-      listing ? h('div', { class: 'folder-pill', title: `${listing.path}\nClick for recent folders`, onclick: folderMenu },
-        icon('folder', 14, '#A2AAB7'),
-        h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'ellip' }, listing.name),
-          h('div', { style: 'font-size:11px;color:var(--text3)' }, lib.watching ? h('span', { style: 'color:var(--ok)' }, '● Watching · new files appear live') : `${listing.files.length} .mat file${listing.files.length === 1 ? '' : 's'}`)),
+      listing ? breadcrumbs(listing.path) : null,
+      // Folder tools on one slim line (the breadcrumb above already names the folder).
+      listing ? h('div', { class: 'row lib-foldertools' },
+        h('span', { class: 'dim ellip', style: 'flex:1;font-size:11.5px', title: listing.path }, lib.watching ? h('span', { style: 'color:var(--ok)' }, '● watching · new files appear live') : `${listing.files.length} .mat file${listing.files.length === 1 ? '' : 's'}`),
         h('button', { class: 'ibtn', title: isFavorite(listing.path) ? 'Remove from favorite folders' : 'Add to favorite folders', 'aria-label': 'Toggle favorite folder', style: isFavorite(listing.path) ? 'color:#F5C451' : '', onclick: (e) => { e.stopPropagation(); toggleFavorite(listing.path); } }, isFavorite(listing.path) ? '★' : '☆'),
         h('button', { class: `btn sm ${lib.watching ? 'primary' : ''}`, title: 'Watch this folder for new and updated files', onclick: (e) => { e.stopPropagation(); lib.watching = !lib.watching; toast(lib.watching ? 'Watching for new files and checkpoint updates.' : 'Stopped watching.'); emit(); } }, lib.watching ? 'Watching' : 'Watch'))
         : h('button', { class: 'btn block', onclick: chooseFolder }, 'Choose a data folder'),
       filterEl,
-      h('div', { class: 'row wrap', style: 'gap:6px' }, chips.map(([k, l]) => h('button', { class: `chip sm ${lib.chip === k ? 'on' : ''}`, onclick: () => { lib.chip = k; renderLibrary(); } }, l)))),
+      h('div', { class: 'g2' },
+        h('select', { class: 'field', id: 'lib-type', title: 'Filter by experiment type', 'aria-label': 'Filter experiment type', onchange: (e) => { lib.type = e.target.value; saveLibraryPrefs(); renderLibList(); } },
+          [['all', 'All types'], ...types.map((t) => [t, t])].map(([v, text]) => h('option', { value: v, selected: lib.type === v }, text))),
+        h('select', { class: 'field', id: 'lib-sort', title: 'Sort / group files', 'aria-label': 'Sort files', onchange: (e) => { lib.sort = e.target.value; saveLibraryPrefs(); renderLibList(); } },
+          [['date', 'Newest first'], ['name', 'Name A–Z'], ['type', 'By type']].map(([v, text]) => h('option', { value: v, selected: lib.sort === v }, text)))),
+      h('div', { class: 'row wrap', style: 'gap:6px' }, chips.map(([k, l]) => h('button', { class: `chip sm ${lib.chip === k ? 'on' : ''}`, onclick: () => { lib.chip = k; saveLibraryPrefs(); renderLibrary(); } }, l)),
+        h('span', { class: 'sp' }),
+        Object.keys(S.files).length ? h('button', { class: 'btn sm', title: 'Close every open file (nothing on disk is deleted)', onclick: closeAllFiles }, `Close all (${Object.keys(S.files).length})`) : null)),
+    listing?.folders.length ? h('details', { class: 'lib-folders', open: lib.foldersOpen !== false, ontoggle: (e) => { lib.foldersOpen = e.target.open; } },
+      h('summary', { class: 'lbl' }, `Subfolders (${listing.folders.length})`),
+      h('div', { class: 'lib-folders-list' }, listing.folders.map((d) => h('button', { class: 'subfolder', title: d.path, onclick: () => openFolder(d.path) }, icon('folder', 13), h('span', { class: 'ellip' }, d.name))))) : null,
+    // Selection bar only when something is selected (Ctrl/Shift-click hint lives in the row tooltips).
+    libSelected.size ? h('div', { class: 'lib-selection row wrap' },
+      h('span', { class: 'note', style: 'flex:1' }, `${libSelected.size} selected`),
+      libSelected.size ? h('button', { class: 'btn sm', disabled: !active() || kindOf(active()) !== '1d', onclick: async () => {
+        for (const p of libSelected) { try { await addOverlay(p); } catch (e) { toast(`Cannot compare: ${e.message}`, 'err'); } }
+      } }, 'Compare selected') : null,
+      h('button', { class: 'ibtn', title: 'Clear selected files', onclick: () => { libSelected.clear(); renderLibrary(); } }, '✕')) : null,
     els.libList,
     h('div', { style: 'border-top:1px solid var(--line);padding:8px 12px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;font-size:12px;color:var(--text2)' },
       h('button', { class: 'btn sm', title: 'Save session (Ctrl+Shift+S)', onclick: () => saveSessionAs() }, 'Save session'), h('button', { class: 'btn sm', onclick: openSessionDialog }, 'Open session'), h('span', { class: 'sp' }),
       h('label', { class: 'ck', style: 'font-size:11px', title: 'Re-run the fit automatically when a watched open file is updated' },
         h('input', { type: 'checkbox', checked: S.settings.auto_refit !== false, onchange: (e) => { S.settings.auto_refit = e.target.checked; call('settings_set', { patch: { auto_refit: e.target.checked } }, { quiet: true }).catch(() => {}); } }),
         'Refit on update')),
-    h('div', { class: 'resize-handle lib-resize', title: 'Drag to resize · double-click to reset', onmousedown: (e) => startResize(e, 'library'), ondblclick: () => setPanelWidth('library', 280, true) }));
+    h('div', { class: 'resize-handle lib-resize', title: 'Drag to resize · double-click to reset', onmousedown: (e) => startResize(e, 'library'), ondblclick: () => setPanelWidth('library', window.innerWidth < 1500 ? 280 : 340, true) }));
   applyPanelWidths();
   renderLibList();
+  const crumbs = els.lib.querySelector('.breadcrumbs');
+  if (crumbs) crumbs.scrollLeft = crumbs.scrollWidth;
+  const folderList = els.lib.querySelector('.lib-folders-list');
+  if (folderList) folderList.scrollTop = folderTop;
+  const restoreFocus = focusId ? document.getElementById(focusId) : focusPath ? els.libList.querySelector(`.frow[data-path="${CSS.escape(focusPath)}"]`) : null;
+  if (restoreFocus) { restoreFocus.focus({ preventScroll: true }); if (cursor) restoreFocus.setSelectionRange(...cursor); }
 }
 
 // ------------------------------------------------------------------ resizable panels
-const PANEL_LIMITS = { library: [200, 480, 280], inspector: [300, 560, 350] };
+const PANEL_LIMITS = { library: [280, 600, 340], inspector: [300, 560, 350] };
 function panelWidth(name) {
   const [lo, hi, def] = PANEL_LIMITS[name];
   const w = Number(S.settings.panel_widths?.[name]);
-  return Number.isFinite(w) && w > 0 ? Math.min(hi, Math.max(lo, w)) : def;
+  // Unsaved widths follow the screen: laptop-size windows give the plot the room (a dragged width is always kept).
+  return Number.isFinite(w) && w > 0 ? Math.min(hi, Math.max(lo, w)) : (window.innerWidth < 1500 ? lo : def);
 }
+// Unsaved (responsive) panel widths follow the window as it is resized, not only on the next unrelated render.
+window.addEventListener('resize', debounce(() => applyPanelWidths(), 120));
 function applyPanelWidths() {
   const lib = els.lib, insp = els.insp;
   if (lib && !lib.classList.contains('rail')) { const w = `${panelWidth('library')}px`; lib.style.width = w; lib.style.flexBasis = w; }
@@ -303,29 +439,31 @@ function renderLibList() {
   const listing = lib.listing;
   const out = [];
   const openPaths = Object.keys(S.files).filter((p) => !listing || dirname(p).toLowerCase() !== listing.path.toLowerCase());
-  const extra = [...new Set([...openPaths, ...lib.extra])].filter((p) => fileMatches(p, lib.peeks[p] || S.files[p]?.info || {}));
-  if (extra.length) {
-    out.push(h('div', { class: 'group-lbl lbl' }, 'Open elsewhere'));
-    extra.forEach((p) => { if (!lib.peeks[p]) requestPeeks([p]); out.push(fileRow(p, null)); });
-  }
+  const listed = new Set((listing?.files || []).map((f) => f.path));
+  const extra = [...new Set([...openPaths, ...lib.extra])].filter((p) => !listed.has(p) && fileMatches(p, lib.peeks[p] || S.files[p]?.info || {}));
   if (listing) {
-    if (listing.parent || listing.folders.length) {
-      out.push(h('div', { class: 'group-lbl' }, h('span', { class: 'lbl' }, 'Folders')));
-      if (listing.parent) out.push(h('div', { class: 'subfolder', onclick: () => openFolder(listing.parent) }, icon('up', 13), '..'));
-      listing.folders.forEach((d) => out.push(h('div', { class: 'subfolder', title: d.path, onclick: () => openFolder(d.path) }, icon('folder', 13), h('span', { class: 'ellip' }, d.name))));
-    }
-    const files = [...listing.files].sort((a, b) => b.mtime - a.mtime).filter((f) => fileMatches(f.path, lib.peeks[f.path] || {}));
+    const nameSort = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true });
+    const files = [...listing.files].sort((a, b) => lib.sort === 'name' ? nameSort(a, b) : lib.sort === 'type'
+      ? (lib.peeks[a.path]?.type || '').localeCompare(lib.peeks[b.path]?.type || '') || nameSort(a, b) : b.mtime - a.mtime || nameSort(a, b))
+      .filter((f) => fileMatches(f.path, S.files[f.path]?.info || lib.peeks[f.path] || {}));
     let lastDay = '';
     out.push(h('div', { class: 'group-lbl' }, h('span', { class: 'lbl' }, `${listing.name}`), h('span', { class: 'dim', style: 'font-size:11px' }, `${files.length}/${listing.files.length}`)));
     files.forEach((f) => {
-      const day = fmtDate(f.mtime);
-      if (day !== lastDay) { out.push(h('div', { class: 'lbl', style: 'padding:8px 8px 2px;font-size:10px' }, day)); lastDay = day; }
+      const group = lib.sort === 'type' ? lib.peeks[f.path]?.type || 'Scanning…' : lib.sort === 'name' ? '' : fmtDate(f.mtime);
+      if (group && group !== lastDay) { out.push(h('div', { class: 'lbl', style: 'padding:8px 8px 2px;font-size:10px' }, group)); lastDay = group; }
       out.push(fileRow(f.path, f));
     });
     if (!listing.files.length) out.push(h('div', { class: 'note', style: 'padding:8px' }, 'No .mat files in this folder. Open a subfolder above.'));
   }
+  if (extra.length) {
+    out.push(h('div', { class: 'group-lbl lbl' }, `Open elsewhere (${extra.length})`));
+    extra.forEach((p) => { if (!lib.peeks[p]) requestPeeks([p]); out.push(fileRow(p, null)); });
+  }
   if (!out.length) out.push(h('div', { class: 'note', style: 'padding:10px' }, 'Choose a data folder, drop .mat files on the window, or press Ctrl+O.'));
+  const top = libScroll, focusPath = list.contains(document.activeElement) ? document.activeElement.closest('.frow')?.dataset.path : null;
   mount(list, out);
+  list.scrollTop = top;
+  if (focusPath) list.querySelector(`.frow[data-path="${CSS.escape(focusPath)}"]`)?.focus({ preventScroll: true });
 }
 
 // ------------------------------------------------------------------ opening
@@ -360,7 +498,7 @@ async function chooseFolder() {
 export async function saveSession(path) { await call('save_session', { path, doc: sessionDoc() }, { label: 'Saving session' }); toast(`Session saved: ${basename(path)}`, 'ok'); }
 async function saveSessionAs() {
   const f = active();
-  const p = await call('dialog', { kind: 'save', title: 'Save analysis session', filename: `${f ? basename(f.path).replace(/\.mat$/i, '') : 'analysis'}.sfsession.json`, directory: f ? dirname(f.path) : '' });
+  const p = await call('dialog', { kind: 'save', title: 'Save analysis session', filename: `${f ? f.info.name.replace(/\.mat$/i, '').replace(/[<>:"/\\|?*]/g, '_') : 'analysis'}.sfsession.json`, directory: f ? dirname(f.combinedRecipe?.runs?.[0]?.path || f.path) : '' });
   if (p) saveSession(p.endsWith('.json') ? p : `${p}.sfsession.json`);
 }
 async function openSessionDialog() {
@@ -409,8 +547,9 @@ function commands() {
     ['Save results', 'Ctrl S', () => f && saveResults(f)], ['Save session…', 'Ctrl Shift S', saveSessionAs], ['Open session…', 'Ctrl Alt O', openSessionDialog],
     ['Copy figure', 'Ctrl Shift C', () => f && copyFigure(f)], ['Reset plot view', 'Ctrl Home', () => f && resetView(f)], ['Edit plot', '', () => { S.editor.open = true; emit(); }],
     ['Go to Analyze', '', () => { S.view = 'analyze'; emit(); }], ['Go to Compare', '', () => { S.view = 'compare'; emit(); }], ['Go to Figure composer', '', () => { S.view = 'figure'; emit(); }], ['Go to Batch', '', () => { S.view = 'batch'; emit(); }],
-    ['Go to Day view', '', () => { S.view = 'day'; emit(); }], ['Go to Stacks', '', () => { S.view = 'stack'; emit(); }],
+    ['Go to Day view', '', () => { S.view = 'day'; emit(); }], ['Go to Stacks', '', () => { S.view = 'stack'; emit(); }], ['Go to AutoFind', '', () => { S.view = 'autofind'; emit(); }],
     ['Add current plot to Figure', '', () => import('./figure.js').then((m) => m.addCurrentPlot())],
+    ['Close all open files', '', closeAllFiles],
     ['Toggle library', '', () => { S.libCollapsed = !S.libCollapsed; emit(); }],
     ['Watch current folder', '', () => { S.library.watching = !S.library.watching; emit(); }],
     ['Show file in folder', '', () => f && call('reveal', { path: f.path })],
@@ -521,28 +660,79 @@ document.addEventListener('keydown', (e) => {
 let dragDepth = 0;
 const dropOverlay = h('div', { class: 'drop-overlay hidden' }, 'Drop .mat files or a folder to open');
 document.body.append(dropOverlay);
-window.addEventListener('dragenter', (e) => { if (e.dataTransfer?.types?.includes('Files')) { dragDepth++; dropOverlay.classList.remove('hidden'); } });
-window.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) dropOverlay.classList.add('hidden'); });
-window.addEventListener('dragover', (e) => e.preventDefault());
-window.addEventListener('drop', async (e) => {
+// Drops are routed by what is under the cursor ([data-drop] zones): the Analyze plot compares, the Compare set adds,
+// the Figure panel list adds panels; anywhere else opens. Library rows drag their path(s) as SF_PATHS.
+export const SF_PATHS = 'application/x-sf-paths';
+const DROP_LABEL = { compare: 'Drop to compare on this plot', compareset: 'Drop to add to the Compare set', figure: 'Drop to add figure panels' };
+let dropHot = null;
+const dropZone = (e) => document.elementFromPoint(e.clientX, e.clientY)?.closest?.('[data-drop]') || null;
+function markDrop(zone) {
+  if (dropHot && dropHot !== zone) dropHot.classList.remove('drop-hot');
+  dropHot = zone;
+  if (zone) { zone.classList.add('drop-hot'); zone.dataset.dropLabel = DROP_LABEL[zone.dataset.drop] || 'Drop here'; }
+}
+const isInternal = (e) => e.dataTransfer?.types?.includes(SF_PATHS);
+window.addEventListener('dragenter', (e) => { if (!isInternal(e) && e.dataTransfer?.types?.includes('Files')) { dragDepth++; dropOverlay.classList.remove('hidden'); } });
+window.addEventListener('dragleave', (e) => {
+  if (!isInternal(e)) { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) dropOverlay.classList.add('hidden'); }
+  if (!e.relatedTarget) markDrop(null);
+});
+window.addEventListener('dragover', (e) => {
+  if (e.dataTransfer?.types?.includes('application/x-sf-series')) return; // Series rows reorder themselves
   e.preventDefault();
+  const zone = dropZone(e);
+  markDrop(zone);
+  if (!isInternal(e)) dropOverlay.textContent = zone ? DROP_LABEL[zone.dataset.drop] : 'Drop .mat files or a folder to open';
+});
+window.addEventListener('dragend', () => { markDrop(null); dragDepth = 0; dropOverlay.classList.add('hidden'); });
+window.addEventListener('drop', async (e) => {
+  if (e.dataTransfer?.types?.includes('application/x-sf-series')) return;
+  e.preventDefault();
+  const zone = dropZone(e)?.dataset.drop || null;
+  markDrop(null);
   dragDepth = 0; dropOverlay.classList.add('hidden');
-  const files = [...(e.dataTransfer?.files || [])];
   const paths = [];
-  for (const file of files) {
-    const full = file.pywebviewFullPath || file.path;
-    if (full) paths.push(full);
-    else if (/\.mat$/i.test(file.name)) {
-      const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
-      paths.push(await call('save_upload', { name: file.name, data }, { label: 'Receiving file' }));
+  if (isInternal(e)) {
+    try { paths.push(...JSON.parse(e.dataTransfer.getData(SF_PATHS))); } catch (err) { /* malformed drag */ }
+  } else {
+    const dropped = [...(e.dataTransfer?.files || [])];
+    // Desktop window: real paths come from the Python-side drop listener (Api.drop_paths), not temporary copies.
+    const real = S.desktop && dropped.length ? await call('drop_paths', { names: dropped.map((x) => x.name) }, { quiet: true }).catch(() => []) : [];
+    for (const [k, file] of dropped.entries()) {
+      const full = real?.[k] || file.pywebviewFullPath || file.path;
+      if (full) paths.push(full);
+      else if (/\.mat$/i.test(file.name)) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+        paths.push(await call('save_upload', { name: file.name, data }, { label: 'Receiving file' }));
+      }
     }
   }
   if (!paths.length) return;
-  for (const [i, p] of paths.entries()) {
-    if (!/\.\w+$/.test(p)) { await openFolder(p); S.view = 'analyze'; continue; }
-    if (i === 0) await openPath(p);
-    else { await openFile(p, { primary: false }); if (!S.library.extra.includes(p)) S.library.extra.push(p); requestPeeks([p]); }
+  // A folder is anything that is not a data/session file (folder names may contain dots).
+  const isData = (p) => /\.(mat|json)$/i.test(p);
+  for (const p of paths.filter((q) => !isData(q))) {
+    try { await openFolder(p); S.view = 'analyze'; } catch (err) { toast(`Cannot open ${basename(p)}: ${err.message}`, 'err'); }
   }
+  const files = paths.filter(isData);
+  if (!files.length) return emit();
+  try {
+    if (zone === 'compare' && active()) {
+      for (const p of files) await addOverlay(p);
+      toast(`Comparing ${files.length} file${files.length === 1 ? '' : 's'} on this plot.`, 'ok');
+    } else if (zone === 'compareset') {
+      for (const p of files) { await openFile(p, { primary: false }); if (!S.compare.set.includes(p)) S.compare.set.push(p); }
+    } else if (zone === 'figure') {
+      const prev = S.primary, { addCurrentPlot } = await import('./figure.js');
+      try { for (const p of files) { await openFile(p, { primary: false }); S.primary = p; await addCurrentPlot({ quiet: true, overlays: [] }); } }
+      finally { S.primary = prev; }
+      toast(`Added ${files.length} figure panel${files.length === 1 ? '' : 's'}.`, 'ok');
+    } else {
+      for (const [i, p] of files.entries()) {
+        if (i === 0) await openPath(p);
+        else { await openFile(p, { primary: false }); if (!S.library.extra.includes(p)) S.library.extra.push(p); requestPeeks([p]); }
+      }
+    }
+  } catch (err) { /* toast shown by api */ }
   emit();
 });
 
@@ -586,3 +776,12 @@ async function watchTick() {
 }
 
 boot();
+
+// Short visible identity for rail badges: the distinguishing tail of the file name (e.g. a time stamp), since
+// several open files of one type would otherwise be identical badges.
+function railId(p) {
+  const name = basename(p).replace(/\.mat$/i, '').replace(/__?checkpoint\d*$/i, '·cp');
+  const parts = name.split(/[_\s-]+/).filter(Boolean);
+  const tail = parts[parts.length - 1] || name;
+  return (tail.length > 7 ? tail.slice(-7) : tail);
+}

@@ -19,6 +19,7 @@ const ST = {
 const els = {};
 
 const peekOf = (p) => S.library.peeks[p] || S.files[p]?.info || null;
+const detectorCount = (info) => Array.isArray(info?.detectors) ? info.detectors.length : (info?.detectors || 1);
 const is2d = (p) => peekOf(p)?.dim === 'scan2d';
 const isXY = (p) => {
   const info = peekOf(p);
@@ -60,7 +61,7 @@ async function trackZ() {
   if (!ST.stack || ST.built !== selKey()) await buildStack();
   const dets = [ST.det];
   const other = ST.det === 'detector1' ? 'detector2' : 'detector1';
-  if (ST.both && ST.sel.every((p) => (peekOf(p)?.detectors || 1) > 1)) dets.push(other);
+  if (ST.both && ST.sel.every((p) => detectorCount(peekOf(p)) > 1)) dets.push(other);
   ST.traj = await call('stack_trajectory', { paths: ST.sel, detectors: dets, mode: 'contrast', opts: { ...baseOpts(), max_jump_fwhm: ST.maxJump } }, { label: 'Tracking spot through z' });
 }
 
@@ -237,6 +238,14 @@ function drawDrift() {
   const D = ST.drift;
   if (!D) return;
   const good = (D.drift || []).filter((d) => d.drift);
+  if (!good.length) {
+    // No usable points: say why instead of drawing empty axes that look like a failed load.
+    const el = plot('drift'); Plotly.purge(el);
+    el.replaceChildren(h('div', { class: 'empty', style: 'padding:24px' }, (D.drift || []).length
+      ? 'No drift points: no spot could be matched across the selected maps (see Skipped / Warnings).'
+      : 'Run "Drift across maps" with two or more 2D maps of the same region.'));
+    return;
+  }
   const traces = [];
   for (const k of keysOf()) {
     const c = KEY_COLOR[k] || '#444';
@@ -248,6 +257,7 @@ function drawDrift() {
       traces.push({ type: 'scatter', mode: 'lines', x: [lo, hi], y: [f.intercept + f.slope * lo, f.intercept + f.slope * hi], line: { color: c, dash: 'dash', width: 1.4 }, name: `${k} fit: ${fmtPm(f.slope, f.slope_se)} / min`, hoverinfo: 'skip' });
     }
   }
+  plot('drift').querySelector(':scope > .empty')?.remove();
   Plotly.react(plot('drift'), traces, LAYOUT({ xaxis: { ...AX, title: { standoff: 10, text: 'time since first map (min; from filename MMDD_HHMM or file mtime)' } }, yaxis: { ...AX, title: { standoff: 10, text: `cumulative displacement (${UNITS})` } } }), CFG);
 }
 
@@ -265,7 +275,7 @@ export function renderStack(root) {
   if (missing && ST.peekTries < 12) { ST.peekTries++; setTimeout(() => { if (S.view === 'stack') emit(); }, 900); } else if (!missing) ST.peekTries = 0;
 
   const stale = ST.stack && ST.built !== selKey();
-  const nDet = Math.max(1, ...sel.map((p) => peekOf(p)?.detectors || 1));
+  const nDet = Math.max(1, ...sel.map((p) => detectorCount(peekOf(p))));
   const busy = !!ST.busy;
 
   const toggle = (p, on) => { ST.sel = on ? [...new Set([...ST.sel, p])] : ST.sel.filter((q) => q !== p); emit(); };
@@ -279,7 +289,7 @@ export function renderStack(root) {
       return h('label', { class: 'frow', style: 'cursor:default', title: p },
         h('input', { type: 'checkbox', checked: ST.sel.includes(p), onchange: (e) => toggle(p, e.target.checked) }), tag(info.tag),
         h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip' }, basename(p).replace(/\.mat$/i, '')),
-          h('div', { class: 'sub ellip' }, [info.axes ? info.axes.join('–') : '', info.grid ? `${info.grid[1]} × ${info.grid[0]}` : '', info.detectors > 1 ? '2 detectors' : ''].filter(Boolean).join(' · '))));
+          h('div', { class: 'sub ellip' }, [info.axes ? info.axes.join('–') : '', info.grid ? `${info.grid[1]} × ${info.grid[0]}` : '', detectorCount(info) > 1 ? '2 detectors' : ''].filter(Boolean).join(' · '))));
     }) : h('div', { class: 'note' }, S.library.listing ? 'No 2D maps found in the current library folder (file scan may still be running).' : 'Choose a data folder in Analyze first.')),
     h('div', { style: 'display:flex;flex-direction:column;gap:8px' },
       field('Detector', select(Array.from({ length: Math.max(2, nDet) }, (_, i) => [`detector${i + 1}`, `Detector ${i + 1}`]), ST.det, (v) => { ST.det = v; emit(); })),

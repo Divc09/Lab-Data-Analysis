@@ -91,7 +91,7 @@ details[open] > summary::before { content: '▾ '; }
 .new { color: var(--ok); font-size: 10.5px; font-weight: 600; letter-spacing: .04em; }
 
 /* library */
-.library { flex: 0 0 280px; width: 280px; border-right: 1px solid var(--line); background: var(--bar); display: flex; flex-direction: column; min-height: 0; }
+.library { flex: 0 0 340px; width: 340px; border-right: 1px solid var(--line); background: var(--bar); display: flex; flex-direction: column; min-height: 0; }
 .library.rail { flex-basis: 52px; width: 52px; align-items: center; padding-top: 10px; gap: 6px; }
 .lib-head { padding: 12px 12px 8px; display: flex; flex-direction: column; gap: 8px; }
 .lib-list { flex: 1; overflow: auto; padding: 0 6px 8px; }
@@ -110,6 +110,21 @@ details[open] > summary::before { content: '▾ '; }
 .subfolder { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; color: var(--text2); font-size: 12.5px; }
 .subfolder:hover { background: var(--hover); color: var(--text); }
 .watch-dot { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); display: inline-block; }
+.breadcrumbs { display: flex; align-items: center; gap: 4px; overflow-x: auto; flex: none; padding-bottom: 3px; }
+.breadcrumbs button { border: 0; padding: 2px 3px; background: transparent; color: var(--text2); cursor: pointer; white-space: nowrap; font-size: 11.5px; }
+.breadcrumbs button:last-child { color: var(--text); font-weight: 500; }
+.breadcrumbs button:hover { background: var(--sel); border-radius: 3px; }
+.lib-folders { flex: none; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 6px 12px; }
+.lib-folders-list { max-height: 112px; overflow-y: auto; padding-top: 4px; }
+.lib-folders .subfolder { border: 0; background: transparent; width: 100%; text-align: left; }
+.lib-selection { padding: 6px 12px; flex: none; min-height: 30px; }
+.lib-compare { display: flex; align-items: center; gap: 2px; flex: none; font-size: 10.5px; color: var(--text2); cursor: pointer; }
+.frow.multi-sel { box-shadow: inset 3px 0 var(--accent); background: var(--sel); }
+.frow:focus-visible, .breadcrumbs button:focus-visible, .subfolder:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.compare-picker { padding: 16px; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+.compare-picker-list { overflow: auto; min-height: 80px; max-height: 42vh; border: 1px solid var(--line); border-radius: 7px; }
+.compare-candidate { display: flex; align-items: center; gap: 10px; padding: 9px 10px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.compare-candidate:hover { background: var(--hover); }
 
 /* main + inspector */
 .main { flex: 1 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; min-height: 0; overflow: auto; }
@@ -119,12 +134,15 @@ details[open] > summary::before { content: '▾ '; }
 .tabs button:hover { color: var(--text); }
 .tabs button.on { color: #fff; border-bottom-color: var(--accent); }
 .insp-body { flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
-.filehead h1 { margin: 0; font-size: 17px; font-weight: 600; word-break: break-all; }
-.metaline { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; font-size: 12px; color: var(--text2); align-items: center; }
+.filebar { display: flex; align-items: center; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; flex: none; }
+.filehead { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 320px; }
+.filehead h1 { margin: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 60px; flex: 0 0 auto; max-width: 70%; }
+.metaline { display: flex; gap: 6px; flex-wrap: nowrap; overflow: hidden; white-space: nowrap; min-width: 0; flex: 1 1 0; font-size: 12px; color: var(--text2); align-items: center; }
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .plotcard { flex: 1; min-height: 380px; background: #fff; border-radius: 10px; position: relative; overflow: hidden; }
 .plotcard .plot { position: absolute; inset: 6px; }
-.readout { display: flex; align-items: center; gap: 16px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 12.5px; flex-wrap: wrap; flex: none; min-height: 36px; }
+.readout { display: flex; align-items: center; gap: 14px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 12.5px; flex-wrap: wrap; flex: none; min-height: 32px; }
+.readout > .hint-line { flex: 1 1 0; min-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mapbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); flex: none; }
 .cm { width: 52px; height: 14px; border-radius: 3px; border: 2px solid transparent; cursor: pointer; padding: 0; }
 .cm.on { border-color: #fff; }
@@ -196,3 +214,72 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* Overlay images are measured cells: never smooth them when scaled. */
 .plot image { image-rendering: pixelated; image-rendering: crisp-edges; }
+
+/* File-level comparison controls stay visible without taking over the figure. */
+.series-panel { flex: none; max-height: 235px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel); }
+.series-panel > summary { font-weight: 600; cursor: pointer; }
+.file-series { border-top: 1px solid var(--line); padding: 5px 0; }
+.file-series-row { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.file-series-row > input:not([type=color]):not([type=checkbox]) { flex: 1 1 130px; }
+.file-series-row > .btn.sm { min-width: 26px; justify-content: center; }
+.file-series-row > input { min-width: 0; height: 28px; }
+.file-series-row input[type=color] { width: 28px; padding: 0; }
+.file-series-row .ck { white-space: nowrap; }
+.series-detail > summary, .comparison-table > summary { cursor: pointer; color: var(--text2); font-size: 11.5px; padding-top: 4px; }
+.series-options { display: flex; flex-direction: column; gap: 8px; padding: 8px; max-width: 660px; }
+.series-panel .tbl .txt { max-width: 220px; overflow-wrap: anywhere; }
+.plot-inline-edit { box-shadow: 0 4px 18px rgba(0,0,0,.3); }
+.plot .xtitle, .plot .ytitle, .plot .y2title, .plot .gtitle { pointer-events: all; cursor: text; }
+.popover { max-height: 80vh; overflow: auto; }
+
+/* Iteration analysis stays in the inspector or a roomy, optional results dialog. */
+.iteration-selection { display: flex; flex-direction: column; gap: 7px; margin: 8px 0; }
+.iteration-checks { display: grid; grid-template-columns: repeat(auto-fill,minmax(55px,1fr)); gap: 5px; max-height: 190px; overflow: auto; }
+.iteration-checks .ck { padding: 3px 5px; border: 1px solid var(--line); border-radius: 4px; }
+.iteration-card > summary { cursor: pointer; font-weight: 600; }
+.iteration-source-list { max-height: 130px; overflow: auto; font-size: 11px; overflow-wrap: anywhere; }
+.iteration-results-modal { width: min(1120px,94vw); max-width: 94vw; }
+.iteration-results, .combine-dialog { display: flex; flex-direction: column; gap: 10px; }
+.iteration-chart { height: 300px; flex: none; background: white; border-radius: 6px; }
+.iteration-table-wrap { overflow: auto; max-height: 260px; }
+.iteration-table-wrap td, .iteration-table-wrap th { white-space: nowrap; }
+.iteration-provenance { flex: none; padding: 0 5px; }
+.combine-modal { width: min(760px,94vw); max-width: 94vw; }
+.combine-list { display: flex; flex-direction: column; gap: 7px; max-height: 38vh; overflow: auto; }
+.combine-list summary { cursor: pointer; font-size: 12px; margin-top: 6px; }
+@media(max-height:800px) { .iteration-chart { height: 240px; } .iteration-table-wrap { max-height: 180px; } }
+
+/* UX pass 2026-10-14: compact toolbar chips, smooth state changes */
+.toolbar .chip { height: 26px; padding: 0 8px; gap: 4px; font-size: 12px; }
+.toolbar { row-gap: 6px; }
+.btn, .chip, .seg button, .ibtn { transition: background-color .12s ease, color .12s ease, border-color .12s ease, box-shadow .12s ease; }
+.btn:active:not(:disabled), .chip:active:not(:disabled) { transform: translateY(0.5px); }
+.plotcard { transition: box-shadow .15s ease; }
+.lib-foldertools { gap: 4px; min-height: 26px; }
+.lib-head .chip.sm { padding: 0 8px; }
+/* drag & drop targets */
+[data-drop] { position: relative; }
+.drop-hot { outline: 2px dashed var(--accent); outline-offset: -4px; }
+.drop-hot::after { content: attr(data-drop-label); position: absolute; left: 50%; top: 12px; transform: translateX(-50%); background: var(--accent); color: #fff; padding: 4px 10px; border-radius: 12px; font-size: 12px; pointer-events: none; z-index: 5; white-space: nowrap; }
+.frow[draggable=true] { cursor: grab; }
+.frow[draggable=true]:active { cursor: grabbing; }
+.drag-grip { cursor: grab; color: var(--text3); padding: 0 2px; user-select: none; letter-spacing: -2px; font-size: 13px; }
+.drag-grip:hover { color: var(--text); }
+.file-series.drop-row { box-shadow: inset 0 2px 0 var(--accent); }
+/* Short screens: keep the plot AND its open Series controls on screen together (plot shrinks first, panel scrolls). */
+.main:has(.series-panel[open]) .plotcard { min-height: clamp(240px, 38vh, 380px); }
+.main:has(.series-panel[open]) .series-panel { max-height: min(235px, 24vh); }
+@media (max-height: 820px) { .main { gap: 8px; } }
+/* Laptop widths for every workspace's own side panels (Analyze's panels carry inline user/responsive widths). */
+@media (max-width: 1499px) {
+  .library:not(.rail):not([style*="width"]) { flex-basis: 280px; width: 280px; }
+  .inspector:not([style*="width"]) { flex-basis: 300px; width: 300px; }
+}
+.library.rail .ibtn { height: auto; min-height: 30px; flex-direction: column; gap: 1px; padding: 3px 2px; width: 46px; }
+.rail-id { font-size: 9.5px; color: var(--text3); line-height: 1; max-width: 44px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Day summary: two-line rows instead of a squeezed 6-column table */
+.day-sum { display: flex; flex-direction: column; gap: 2px; }
+.day-sum-row { padding: 5px 6px; border-radius: 5px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.day-sum-row:hover { background: var(--hover, rgba(127,127,127,.12)); }
+.day-sum-row .sub { font-size: 11px; color: var(--text); opacity: .7; }
+.day-sum-row .pill { flex: none; }

@@ -5,6 +5,8 @@ import { h, mount, seg, select, input, field, fmt, fmtPm, toast, modal, basename
 import { PALETTES, baseStyle, friendlyAxis, MODE_LABEL } from './plotstyle.js';
 import { copyText, renderImage, copyImage } from './export.js';
 import { resultLines } from './plotstyle.js';
+import { isNormalizedT1, t1Normalization, toOriginal } from './fitdisplay.js';
+import { displayUnit, unitScale, displayValue, parameterUnit, prettyUnit } from './unitdisplay.js';
 
 let overlayEl, trendEl, alignNoteEl;
 const C = () => S.compare;
@@ -82,13 +84,24 @@ export function renderCompare(root) {
   alignNoteEl = h('div', { class: 'note' });
   const set = c.set.filter((p) => S.files[p]);
   if (c.global && c.global.key !== gfKey()) c.global = null; // the set (or visibility) changed
-  c.gf = c.gf || { model: 'RabiCosine', shared: ['f'] };
-  overlayEl = overlayEl || h('div', { class: 'plot' });
-  trendEl = trendEl || h('div', { class: 'plot' });
+  // Global-fit model follows the set's experiment type until the user picks one (was always RabiCosine).
+  const GF_FOR_TYPE = { T1: 'T1Exp', SpinEcho: 'SpinEcho', DynamicDecoupling: 'SpinEcho', DEERDecay: 'SpinEcho', Ramsey: 'RamseySimple', Rabi: 'RabiCosine', DEERDuration: 'RabiCosine',
+    ODMR: 'ODMR', DEERFrequency: 'ODMR', LineScan: 'GaussianPeaks', TimeTrace: 'TimeTraceDecay' };
+  const setType = c.set.map((p) => S.files[p]?.info?.type).find(Boolean);
+  if (!c.gf || (!c.gf.userSet && GF_FOR_TYPE[setType] && c.gf.model !== GF_FOR_TYPE[setType])) {
+    const model = GF_FOR_TYPE[setType] || 'RabiCosine';
+    c.gf = { model, shared: [GF_DEFAULT_SHARED[model]] };
+  }
+  // Plots are drawn as soon as they are mounted, before layout; Plotly's `responsive` only follows window resizes, so a
+  // ResizeObserver refits them to their cards (they were stuck at a default ~350 px width).
+  const fitToCard = (el) => { new ResizeObserver(() => { if (el.data && el.clientWidth > 40 && el.clientHeight > 40) Plotly.Plots.resize(el); }).observe(el); return el; };
+  overlayEl = overlayEl || fitToCard(h('div', { class: 'plot' }));
+  trendEl = trendEl || fitToCard(h('div', { class: 'plot' }));
   const fitted = set.filter((p) => c.results[p]);
   const keys = [...new Set(fitted.flatMap((p) => Object.keys(trendValues(p))))];
-  if (!c.param || !keys.includes(c.param)) c.param = keys.find((k) => /center_1|pi_time_ns$|T2_ns|T1_ns|T2_star_ns|center_freq|tau_s/.test(k)) || keys[0] || '';
-  const left = h('aside', { class: 'library', style: 'padding:12px;gap:10px' },
+  // prefer fitted parameters (they carry errors) over derived metrics such as T1_ns
+  if (!c.param || !keys.includes(c.param)) c.param = keys.find((k) => /^(T1|T2|T2_star|tau|x0|center_1|tau_s)$/.test(k)) || keys.find((k) => /center_1|pi_time_ns$|T2_ns|T1_ns|T2_star_ns|center_freq|tau_s/.test(k)) || keys[0] || '';
+  const left = h('aside', { class: 'library', style: 'padding:12px;gap:10px', 'data-drop': 'compareset' },
     h('div', { class: 'row' }, h('span', { class: 'lbl' }, `Compare set · ${set.length} files`), h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: addFromLibrary }, 'Add files')),
     h('div', { class: 'note' }, 'Tick to draw in the overlay; every fitted file feeds the trend. Files keep their own detector and observable.'),
     h('div', { style: 'flex:1;overflow:auto;display:flex;flex-direction:column;gap:2px' }, set.map((p, i) => {
@@ -100,10 +113,16 @@ export function renderCompare(root) {
         h('input', { type: 'checkbox', checked: !c.hidden.includes(p), onchange: (e) => { c.hidden = e.target.checked ? c.hidden.filter((q) => q !== p) : [...c.hidden, p]; emit(); } }),
         h('span', { style: `width:12px;height:12px;border-radius:3px;flex:none;background:${c.hidden.includes(p) ? '#3A4250' : colorFor(i)}` }),
         h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip', title: p }, basename(p).replace(/\.mat$/i, '')),
-          h('div', { class: 'sub ellip' }, r ? `${c.param}: ${tv ? fmtPm(tv.v, tv.e) : '–'} · R² ${fmt(r.r2, 3)}${r.status !== 'PASS' ? ' · ' + r.status : ''}${shTxt}` : `${detLabel(f, f.detector)} · ${MODE_LABEL[f.mode]}${shTxt}`)),
+          h('div', { class: 'sub ellip' }, r ? `${c.param}: ${tv ? displayValue(tv.v, tv.e, trendNativeUnit([p], c.param)).withUnit : '–'} · R² ${fmt(r.r2, 3)}${r.status !== 'PASS' ? ' · ' + r.status : ''}${shTxt}` : `${detLabel(f, f.detector)} · ${MODE_LABEL[f.mode]}${shTxt}`)),
         h('button', { class: 'ibtn', title: 'Remove', onclick: (e) => { e.preventDefault(); c.set = c.set.filter((q) => q !== p); emit(); } }, '×'));
     })),
-    set.length ? null : h('div', { class: 'note' }, 'Add files here, or right-click files in the Library and choose "Add to Compare set". Batch results can also be sent here.'));
+    set.length ? null : (() => {
+      // One click from what is already open in Analyze (1D files only; maps compare in Analyze's RGB overlay).
+      const open = Object.keys(S.files).filter((p) => S.files[p]?.info?.dim !== 'scan2d');
+      return h('div', { style: 'display:flex;flex-direction:column;gap:8px' },
+        open.length ? h('button', { class: 'btn primary', onclick: () => { c.set = [...new Set([...c.set, ...open])]; emit(); } }, `Add the ${open.length} open file${open.length === 1 ? '' : 's'}`) : null,
+        h('div', { class: 'note' }, 'Or use Add files, right-click files in the Library ("Add to Compare set"), or send Batch results here.'));
+    })());
 
   const main = h('main', { class: 'main' },
     h('div', { class: 'row wrap' }, h('h1', { style: 'margin:0;font-size:17px;font-weight:600;margin-right:auto' }, 'Overlay'),
@@ -121,7 +140,11 @@ export function renderCompare(root) {
       h('button', { class: 'btn', onclick: () => renderImage({ data: trendEl.data, layout: trendEl.layout }, { width_in: 6, height_in: 3.6, dpi: 300 }).then(copyImage) }, 'Copy')),
     h('section', { class: 'plotcard', style: 'flex:1;min-height:240px' }, trendEl));
 
-  const pts = fitted.map((p, i) => ({ p, x: xValue(p, set.indexOf(p)), ...(trendValues(p)[c.param] || {}) })).filter((q) => Number.isFinite(q.x) && Number.isFinite(q.v));
+  // Trend values in display units (e.g. T1 in µs/ms, not raw ns); plot, table, regression and CSV all use them.
+  const rawPts = fitted.map((p, i) => ({ p, x: xValue(p, set.indexOf(p)), ...(trendValues(p)[c.param] || {}) })).filter((q) => Number.isFinite(q.x) && Number.isFinite(q.v));
+  const tdu = displayUnit(Math.max(0, ...rawPts.map((q) => Math.abs(q.v))), trendNativeUnit(fitted, c.param));
+  c.trendUnit = prettyUnit(tdu.unit);
+  const pts = rawPts.map((q) => ({ ...q, v: q.v * tdu.scale, e: Number.isFinite(q.e) ? q.e * tdu.scale : q.e }));
   const sel = c.sel ? pts.filter((q) => c.sel.includes(q.p)) : pts;
   const reg = sel.length >= 2 ? linreg(sel.map((q) => q.x), sel.map((q) => q.v)) : null;
   const perUnit = c.against === 'time' ? 60000 : 1;
@@ -135,8 +158,8 @@ export function renderCompare(root) {
       h('button', { class: 'btn primary block', disabled: !set.length || c.fitting, onclick: fitAll }, c.fitting ? `Fitting ${c.fitting}` : `Fit all ${set.length} files`)),
     globalCard(),
     h('div', { class: 'card pad' }, h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, 'Trend table'), h('span', { class: 'sp' }), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => copyText(trendTable(pts), 'Trend table copied') }, 'Copy'), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => saveCsv(pts) }, 'Save CSV')),
-      pts.length ? h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, h('th', {}, 'File'), h('th', {}, c.param), h('th', {}, '±')),
-        pts.map((q) => h('tr', { class: `click ${c.sel?.includes(q.p) ? 'sel' : ''}`, onclick: () => toggleSel(q.p, pts) }, h('td', { class: 'txt ellip', style: 'max-width:140px', title: q.p }, c.against === 'time' ? fmtTime(q.x / 1000) : basename(q.p).slice(0, 18)), h('td', {}, fmt(q.v, 6)), h('td', {}, q.e ? fmt(q.e, 2) : '–'))))
+      pts.length ? h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, h('th', {}, 'File'), h('th', {}, trendLabel()), h('th', {}, '±')),
+        pts.map((q) => h('tr', { class: `click ${c.sel?.includes(q.p) ? 'sel' : ''}`, onclick: () => toggleSel(q.p, pts) }, h('td', { class: 'txt ellip', style: 'max-width:140px', title: q.p }, c.against === 'time' ? fmtTime(q.x / 1000) : basename(q.p).slice(0, 18)), ...(() => { const [v, e] = displayValue(q.v, q.e, '').text.split(' ± '); return [h('td', {}, v), h('td', {}, e ?? '–')]; })())))
         : h('div', { class: 'note' }, 'Run Fit all to fill the table.')),
     reg ? h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:6px' }, h('span', { style: 'font-weight:600' }, `Linear trend · ${sel.length} points`),
       h('div', { class: 'mono', style: 'font-size:18px' }, `${fmt(reg.slope * perUnit, 4)}`, h('small', { class: 'muted', style: 'font-size:12px' }, ` ${c.param} per ${c.against === 'time' ? 'min' : 'unit'}`)),
@@ -153,11 +176,11 @@ function globalCard() {
   const keyParams = () => res.param_names.filter((n) => !res.shared_names.includes(n)).slice(0, 3);
   return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
     h('span', { style: 'font-weight:600' }, 'Global fit'),
-    field('Model', select(Object.keys(GF_MODELS), g.model, (v) => { g.model = v; g.shared = [GF_DEFAULT_SHARED[v]]; c.global = null; emit(); })),
+    field('Model', select(Object.keys(GF_MODELS), g.model, (v) => { g.model = v; g.userSet = true; g.shared = [GF_DEFAULT_SHARED[v]]; c.global = null; emit(); })),
     h('div', { class: 'lbl' }, 'Shared parameters'),
     h('div', { class: 'row wrap', style: 'gap:10px' }, names.map((n) => h('label', { class: 'row', style: 'gap:4px;cursor:pointer' },
       h('input', { type: 'checkbox', checked: g.shared.includes(n), onchange: (e) => { g.shared = e.target.checked ? [...g.shared, n] : g.shared.filter((q) => q !== n); } }), h('span', { class: 'mono' }, n)))),
-    h('div', { class: 'note' }, 'Fits all visible files at once; shared parameters take one common value. Linear least squares (SEM-weighted when available), so errors are approximate.'),
+    h('div', { class: 'note' }, 'Fits all visible files at once; shared parameters take one common value. Nonlinear least squares (SEM-weighted when available); uncertainty estimates are approximate.'),
     h('button', { class: 'btn primary block', disabled: nvis < 2 || c.gfBusy, onclick: runGlobal }, c.gfBusy ? 'Fitting…' : `Run global fit on ${nvis} files`),
     res ? h('div', { style: 'display:flex;flex-direction:column;gap:6px' },
       res.shared_names.length ? h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Shared'), h('th', {}, 'Value'), h('th', {}, '±')),
@@ -199,10 +222,20 @@ function toggleSel(p, pts) {
   emit();
 }
 
+// Native unit of a trend key: a fit parameter's unit, or a metric's suffix (T1_ns -> ns, center_freq_GHz -> GHz).
+function trendNativeUnit(paths, key) {
+  for (const p of paths) {
+    const q = C().results[p]?.params?.find((x) => x.name === key);
+    if (q && S.files[p]) return parameterUnit(q, S.files[p].info);
+  }
+  return (/_(ns|us|ms|s|GHz|MHz|kHz|Hz)$/.exec(key) || [])[1] || '';
+}
+const trendLabel = () => `${C().param}${C().trendUnit ? ` [${C().trendUnit}]` : ''}`;
+
 function trendTable(pts, sep = '\t') {
   const c = C();
   const esc = (v) => (sep === ',' && /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v);
-  return [['File', c.against === 'time' ? 'Time' : 'x', c.param, 'error'].join(sep), ...pts.map((q) => [basename(q.p), c.against === 'time' ? new Date(q.x).toLocaleString() : q.x, q.v, q.e ?? ''].map(esc).join(sep))].join('\n');
+  return [['File', c.against === 'time' ? 'Time' : 'x', trendLabel(), 'error'].join(sep), ...pts.map((q) => [basename(q.p), c.against === 'time' ? new Date(q.x).toLocaleString() : q.x, q.v, q.e ?? ''].map(esc).join(sep))].join('\n');
 }
 
 async function saveCsv(pts) {
@@ -218,51 +251,65 @@ function drawOverlay(set) {
   const data = [];
   const layout = { separators: '.', margin: { l: 64, r: 16, t: 14, b: 50 }, font: { family: 'Arial', size: 12, color: '#1D2330' }, showlegend: true, legend: { x: 0.99, xanchor: 'right', y: 0.99, bgcolor: 'rgba(255,255,255,.9)', bordercolor: '#D9DDE4', borderwidth: 1 }, hovermode: 'closest' };
   let xLabel = '';
-  const unaligned = [];
+  const unaligned = [], unmapped = [], yLabels = new Set();
   const n = vis.length;
   const cols = Math.ceil(Math.sqrt(n)) || 1, rows = Math.ceil(n / cols) || 1;
+  // One shared display unit for x (auto ns -> µs -> ms like Analyze); each file converts from its own native unit.
+  const first = vis.map((p) => S.files[p]).find((f) => f?.data[f.detector]?.proc);
+  const nativeU = first?.info.x_unit || '';
+  const toNative = (f) => unitScale(f.info.x_unit || '', nativeU) ?? 1;
+  let mag = 0;
+  for (const p of vis) { const f = S.files[p], xs = f?.data[f.detector]?.proc?.x || []; for (const v of xs) if (Number.isFinite(v)) mag = Math.max(mag, Math.abs(v * toNative(f))); }
+  const du = displayUnit(mag, nativeU);
+  const X = (f, arr, sh) => arr.map((v) => (v === null ? NaN : (v + sh) * toNative(f) * du.scale));
   vis.forEach((p) => {
     const i = set.indexOf(p);
     const f = S.files[p];
     const d = f.data[f.detector];
     if (!d?.proc) return;
-    const xBase = friendlyAxis(f.info.x_label);
+    const yLabel = f.mode === 'contrast' ? 'Contrast [dimensionless]' : `${MODE_LABEL[f.mode] || f.mode || 'Signal'}${f.info.unit ? ` [${f.info.unit}]` : ''}`;
+    yLabels.add(yLabel);
+    const xBase = friendlyAxis(f.info.x_label, du.unit, f.info.type);
     xLabel = c.align === 'peak' ? `Δ${xBase} from peak` : c.align === 'fit' ? `Δ${xBase} from fit center` : xBase;
     let sh = alignShift(p);
     if (sh === null) { unaligned.push(basename(p).replace(/\.mat$/i, '')); sh = 0; }
-    const x = d.proc.x.map((v) => (v === null ? NaN : v + sh));
+    const x = X(f, d.proc.x, sh);
     const yRaw = d.proc.y.map((v) => (v === null ? NaN : v));
-    const np_ = normParams(x, yRaw, c.norm);
+    const np_ = normParams(d.proc.x.map((v) => (v === null ? NaN : v + sh)), yRaw, c.norm); // native x: area normalization must not depend on the display unit
     let y = yRaw.map((v) => (v - np_.off) / np_.scale);
     const k = vis.indexOf(p);
     if (c.layout === 'waterfall') y = y.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
     const ax = c.layout === 'grid' && k ? String(k + 1) : '';
     data.push({ type: 'scatter', mode: 'lines+markers', x, y, name: basename(p).replace(/\.mat$/i, ''), line: { color: colorFor(i), width: 1.4 }, marker: { size: 4, color: colorFor(i) }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     const r = c.results[p];
-    if (r && (r.dense || r.y_fit)) {
+    const inverse = t1Normalization(r);
+    if (isNormalizedT1(r) && !inverse) unmapped.push(basename(p));
+    if (r && (r.dense || r.y_fit) && (!isNormalizedT1(r) || inverse)) {
       let fy = (r.dense?.y || r.y_fit).map((v) => (v === null ? NaN : v));
+      if (inverse) fy = toOriginal(fy, inverse);
       fy = fy.map((v) => (v - np_.off) / np_.scale);
       if (c.layout === 'waterfall') fy = fy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
-      data.push({ type: 'scatter', mode: 'lines', x: (r.dense?.x || r.x).map((v) => (v === null ? NaN : v + sh)), y: fy, name: 'fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dot' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
+      data.push({ type: 'scatter', mode: 'lines', x: X(f, r.dense?.x || r.x, sh), y: fy, name: 'fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dot' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
     const gd = c.global?.res.datasets.find((q) => q.path === p);
     if (gd?.curve) {
       let gy = gd.curve.y.map((v) => (v === null ? NaN : (v - np_.off) / np_.scale));
       if (c.layout === 'waterfall') gy = gy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
-      data.push({ type: 'scatter', mode: 'lines', x: gd.curve.x.map((v) => (v === null ? NaN : v + sh)), y: gy, name: 'global fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dash' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
+      data.push({ type: 'scatter', mode: 'lines', x: X(f, gd.curve.x, sh), y: gy, name: 'global fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dash' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
     if (c.layout === 'grid') {
       const col = k % cols, row = Math.floor(k / cols);
       const gx = 0.06, gy = 0.1;
       layout[`xaxis${ax}`] = { domain: [col / cols + (col ? gx / 2 : 0), (col + 1) / cols - gx / 2], anchor: `y${ax}`, showline: true, mirror: true, ticks: 'outside', title: { text: row === rows - 1 ? xLabel : '' } };
-      layout[`yaxis${ax}`] = { domain: [1 - (row + 1) / rows + gy / 2, 1 - row / rows - (row ? gy / 2 : 0)], anchor: `x${ax}`, showline: true, mirror: true, ticks: 'outside' };
+      layout[`yaxis${ax}`] = { domain: [1 - (row + 1) / rows + gy / 2, 1 - row / rows - (row ? gy / 2 : 0)], anchor: `x${ax}`, title: { text: c.norm === 'none' ? yLabel : `Normalized (${c.norm})` }, showline: true, mirror: true, ticks: 'outside' };
     }
   });
   if (c.layout !== 'grid') {
     layout.xaxis = { title: { text: xLabel }, exponentformat: 'none', showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false };
-    layout.yaxis = { title: { text: c.norm === 'none' ? 'Signal' : `Normalized (${c.norm})${c.layout === 'waterfall' ? ', offset' : ''}` }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false, exponentformat: 'SI' };
+    layout.yaxis = { title: { text: c.norm === 'none' ? ([...yLabels].join(' / ') || 'Signal') : `Normalized (${c.norm})${c.layout === 'waterfall' ? ', offset' : ''}` }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false, exponentformat: 'SI' };
   } else layout.showlegend = false;
-  alignNoteEl.textContent = unaligned.length ? `not aligned: ${unaligned.join(', ')}` : '';
+  alignNoteEl.textContent = [unaligned.length ? `not aligned: ${unaligned.join(', ')}` : '',
+    unmapped.length ? `Normalized fit hidden (no inverse metadata); refit for original units: ${unmapped.join(', ')}` : ''].filter(Boolean).join(' · ');
   Plotly.react(overlayEl, data, layout, { responsive: true, displayModeBar: false, scrollZoom: true, edits: { axisTitleText: true, legendPosition: true } });
 }
 
@@ -282,11 +329,12 @@ function drawTrend(pts, reg) {
   }
   const layout = { separators: '.', margin: { l: 70, r: 16, t: 10, b: 50 }, font: { family: 'Arial', size: 12 }, showlegend: false,
     xaxis: { title: { text: { time: 'Acquisition time', order: 'File order', name: `Value in file name${c.namePrefix ? ` (${c.namePrefix})` : ''}`, meta: c.metaKey || 'Saved parameter' }[c.against] }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', type: isTime ? 'date' : 'linear' },
-    yaxis: { title: { text: c.param }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', exponentformat: 'none' } };
+    yaxis: { title: { text: trendLabel() }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', exponentformat: 'none' } };
   Plotly.react(trendEl, data, layout, { responsive: true, displayModeBar: false, edits: { axisTitleText: true } });
+  trendEl._points = pts;
   if (!trendEl._bound) {
     trendEl._bound = true;
-    trendEl.on('plotly_click', (ev) => { const p = ev.points?.[0]?.customdata; if (p) toggleSel(p, pts.length ? pts : []); });
+    trendEl.on('plotly_click', (ev) => { const p = ev.points?.[0]?.customdata; if (p) toggleSel(p, trendEl._points || []); });
   }
 }
 

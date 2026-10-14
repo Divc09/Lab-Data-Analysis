@@ -38,7 +38,8 @@ export async function copyText(text, msg = 'Copied') {
 // Compose several rendered SVG panels into one vector SVG (Figure composer).
 export function composeSvg(panels, W, H) {
   const parts = panels.map((p) => {
-    const inner = p.svg.replace(/^<\?xml[^>]*>/, '').replace(/<svg /, `<svg x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" `);
+    const inner = p.svg.replace(/^<\?xml[^>]*>/, '').replace(/<svg\b([^>]*)>/, (_, attrs) =>
+      `<svg${attrs.replace(/\s+(?:x|y|width|height)=("[^"]*"|'[^']*')/g, '')} x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}">`);
     const label = p.label ? `<text x="${p.x + 4}" y="${p.y + 16}" font-family="Arial" font-weight="bold" font-size="${p.labelSize || 16}">${p.label}</text>` : '';
     return inner + label;
   });

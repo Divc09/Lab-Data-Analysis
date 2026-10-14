@@ -86,7 +86,28 @@ def main() -> None:
         icon = Path(__file__).with_name("static") / "icon.ico"
         api.window = webview.create_window("SmartFitter", url, width=1500, height=940, min_size=(1000, 640),
                                            background_color="#0E1014", text_select=True)
-        webview.start(gui="edgechromium", icon=str(icon) if icon.exists() else None)
+        def bind_drop(window):
+            # A Python-side listener is what makes pywebview attach real paths to dropped files; the page then asks
+            # Api.drop_paths, so dropped files open from where they live instead of as temporary copies.
+            try:
+                from webview.dom import DOMEventHandler
+
+                def on_drop(event):
+                    files = (event.get("dataTransfer") or {}).get("files") or []
+                    api.record_drop([f.get("pywebviewFullPath") for f in files])
+
+                def attach():  # DOM listeners live in the page, so re-attach after every (re)load
+                    try:
+                        window.dom.document.events.drop += DOMEventHandler(on_drop, prevent_default=False, stop_propagation=False)
+                    except Exception:
+                        pass
+
+                window.events.loaded += attach
+                attach()
+            except Exception:
+                pass  # older pywebview: uploads remain the fallback
+
+        webview.start(bind_drop, (api.window,), gui="edgechromium", icon=str(icon) if icon.exists() else None)
     except Exception as exc:  # pywebview missing or WebView2 unavailable: use Edge in app mode
         edge = _edge()
         if not edge:

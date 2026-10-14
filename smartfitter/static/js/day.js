@@ -3,6 +3,7 @@
 import { call } from './api.js';
 import { S, emit, openFile, detLabel } from './state.js';
 import { h, mount, fmt, fmtPm, fmtDate, fmtTime, toast, basename, tag, TAG_COLORS } from './util.js';
+import { displayValue } from './unitdisplay.js';
 import { resultLines } from './plotstyle.js';
 import { runFit, kindOf } from './analyze.js';
 import { addCurrentPlot } from './figure.js';
@@ -34,7 +35,15 @@ function summaryOf(row) {
   return out;
 }
 
-const qtyText = (s) => (s.qty ? `${s.qty} ${s.value === null ? '–' : fmtPm(s.value, s.err)}${s.unit ? ` ${s.unit}` : ''}` : '');
+// Readable value in an auto-scaled display unit (e.g. 160 ± 750 µs); CSV keeps native units.
+const valText = (v, e, u) => (v === null || v === undefined ? '–' : displayValue(v, e ?? null, u || '').withUnit);
+const qtyText = (s) => (s.qty ? `${s.qty} ${valText(s.value, s.err, s.unit)}` : '');
+// Compact status chip; the full status stays in the tooltip.
+function statusChip(s) {
+  const st = s.status || '';
+  const [txt, cls] = st === 'unreadable' ? ['Error', 'FAIL'] : st.startsWith('2D map') ? ['Map', ''] : st === 'plot-only' ? ['Plot', ''] : st === 'not fitted' ? ['Unfit', ''] : [st.toUpperCase() === 'FIT' ? 'Fit' : st, st];
+  return h('span', { class: `pill ${cls}`, title: st }, txt);
+}
 
 function tableText(rows, sep = '\t') {
   const q = (v) => {
@@ -134,9 +143,9 @@ export function renderDay(root) {
       return h('section', { class: 'card', style: 'padding:10px 12px;display:flex;flex-direction:column;gap:4px;flex:none' },
         h('div', { class: 'row' }, tag(g.tag), h('span', { style: 'font-weight:600' }, g.type), h('span', { class: 'note' }, `${rows.length} file${rows.length === 1 ? '' : 's'} · ${fmtTime(g.rows[0].time)} – ${fmtTime(g.rows[g.rows.length - 1].time)}`)),
         rows.map((s) => h('div', { class: 'frow', style: `border-left:3px solid ${fg}`, title: s.path, onclick: () => openFile(s.path).catch(() => {}) },
-          h('span', { class: 'mono dim', style: 'width:48px;flex:none' }, fmtTime(s.time)),
+          h('span', { class: 'mono dim', style: 'flex:none;white-space:nowrap;min-width:64px' }, fmtTime(s.time)),
           h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip' }, s.name.replace(/\.mat$/i, '')),
-            h('div', { class: 'sub' }, s.lines.length ? s.lines.map((l) => `${l.label} ${l.value === null ? '–' : fmtPm(l.value, l.err)}${l.unit ? ` ${l.unit}` : ''}`).join(' · ') : s.status)),
+            h('div', { class: 'sub' }, s.lines.length ? s.lines.map((l) => `${l.label} ${valText(l.value, l.err, l.unit)}`).join(' · ') : s.status)),
           s.r2 !== null ? h('span', { class: 'mono dim' }, `R² ${fmt(s.r2, 3)}`) : null,
           s.value !== null ? h('span', { class: `pill ${s.status}` }, s.status) : null)));
     }) : h('div', { class: 'card pad note' }, 'No files yet. Open a data folder from the Analyze view; this view lists what that folder contains.'));
@@ -146,10 +155,9 @@ export function renderDay(root) {
     h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Summary'), h('span', { class: 'sp' }),
       h('button', { class: 'btn sm', disabled: !rows.length, onclick: () => copyText(tableText(rows), 'Day summary copied') }, 'Copy'),
       h('button', { class: 'btn sm', disabled: !rows.length, onclick: () => saveCsv(rows).catch(() => {}) }, 'Save CSV')),
-    rows.length ? h('table', { class: 'tbl' }, h('tr', {}, ['Time', 'File', 'Type', 'Quantity', 'R²', 'Status'].map((t) => h('th', {}, t))),
-      rows.map((s) => h('tr', { class: 'click', title: s.path, onclick: () => openFile(s.path).catch(() => {}) },
-        h('td', {}, fmtTime(s.time)), h('td', { class: 'txt ellip', style: 'max-width:96px' }, s.name.replace(/\.mat$/i, '')), h('td', { class: 'txt' }, s.tag || s.type),
-        h('td', { class: 'txt' }, qtyText(s)), h('td', {}, s.r2 === null ? '' : fmt(s.r2, 3)), h('td', { class: 'txt' }, s.status))))
+    rows.length ? h('div', { class: 'day-sum' }, rows.map((s) => h('div', { class: 'day-sum-row', title: `${s.path}\n${s.status}`, onclick: () => openFile(s.path).catch(() => {}) },
+      h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'mono dim' }, fmtTime(s.time)), h('span', { class: 'fname ellip', style: 'flex:1;min-width:0' }, s.name.replace(/\.mat$/i, '')), statusChip(s)),
+      h('div', { class: 'sub ellip' }, `${s.tag || s.type}${s.qty ? ` · ${qtyText(s)}` : ''}${s.r2 === null ? '' : ` · R² ${fmt(s.r2, 3)}`}`))))
       : h('div', { class: 'note' }, 'Nothing to summarize yet.')));
 
   mount(root, left, main, right);

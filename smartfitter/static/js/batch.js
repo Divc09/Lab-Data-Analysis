@@ -1,7 +1,8 @@
 // Batch workspace: wraps nvfit.pro_batch with live progress and a filterable results table.
 import { call } from './api.js';
-import { S, emit, openFile } from './state.js';
-import { h, mount, seg, select, input, field, check, toast, fmt, num, basename } from './util.js';
+import { S, emit, openFile, loadData } from './state.js';
+import { runFit } from './analyze.js';
+import { h, mount, seg, select, input, field, check, toast, fmt, num, basename, clone } from './util.js';
 import { copyText } from './export.js';
 
 let timer = null;
@@ -68,21 +69,51 @@ export function renderBatch(root) {
         : h('div', { class: 'empty', style: 'padding:40px' }, running ? 'Running…' : 'Results appear here as a table with one row per file and detector.')),
     st?.log?.length ? h('details', { class: 'card pad' }, h('summary', {}, `Log (${st.log.length} lines)`), h('pre', { class: 'mono', style: 'font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap' }, st.log.slice(-300).join('\n'))) : null,
     h('div', { class: 'row wrap' },
-      h('button', { class: 'btn', disabled: !rows.some((r) => r.status === 'PASS' || r.status === 'WARN'), onclick: async () => {
-        for (const r of rows.filter((x) => x.status === 'PASS' || x.status === 'WARN')) { const p = pathOf(r); try { await openFile(p, { primary: false }); if (!S.compare.set.includes(p)) S.compare.set.push(p); } catch (e) { /* skip */ } }
-        S.view = 'compare'; emit();
-      } }, 'Send fitted rows to Compare'),
+      h('button', { class: 'btn', disabled: !rows.some((r) => r.status === 'PASS' || r.status === 'WARN'), title: 'Open the passing rows in Compare and refit each file/detector with this batch run\'s settings (batch summaries hold metrics, not curves)', onclick: sendToCompare }, 'Send fitted rows to Compare'),
       h('button', { class: 'btn', disabled: !o.output_dir, onclick: () => call('open_path', { path: o.output_dir }) }, 'Open results folder'),
       h('button', { class: 'btn', disabled: !rows.length, onclick: () => call('open_path', { path: `${o.output_dir}\\batch_summary.csv` }) }, 'Open summary CSV'),
-      h('button', { class: 'btn', disabled: !o.output_dir, onclick: async () => { B.rows = await call('batch_summary', { output_dir: o.output_dir }); B.ranInput = o.input_dir; emit(); } }, 'Load previous results'),
+      h('button', { class: 'btn', disabled: !o.output_dir, onclick: async () => { B.rows = await call('batch_summary', { output_dir: o.output_dir }); B.ranInput = o.input_dir; if (B.ranOpts?.output_dir !== o.output_dir) B.ranOpts = null; emit(); } }, 'Load previous results'),
       h('button', { class: 'btn', disabled: running || !o.output_dir || !rows.some((r) => r.status === 'FAIL'), onclick: rerunFailed }, 'Re-run failed')));
   mount(root, left, main);
+
+  // Batch summaries carry metrics (T1_ns, R², ...) but no curves, so Compare refits each row with the batch run's own
+  // settings (observable, bin, smoothing, model, multistart, robust, ODMR multi-peak) through the normal workspace fit.
+  async function sendToCompare() {
+    const ok = rows.filter((x) => x.status === 'PASS' || x.status === 'WARN');
+    const run = B.ranOpts || o;
+    // Compare stores one result per file path, so a second detector row for the same
+    // file would silently replace the first result and overstate the sent count.
+    const seen = new Set();
+    let fitted = 0, failed = 0, skippedDetectors = 0;
+    for (const r of ok) {
+      const p = pathOf(r);
+      if (seen.has(p)) { skippedDetectors++; continue; }
+      try {
+        const f = await openFile(p, { primary: false });
+        const mode = f.info.observables.includes(run.mode) ? run.mode : f.mode;
+        if (f.mode !== mode || f.proc.bin !== run.bin || f.proc.smooth !== run.smooth) { f.mode = mode; Object.assign(f.proc, { bin: run.bin, smooth: run.smooth }); await loadData(f); }
+        Object.assign(f.fitSpec, { model: run.model || 'Auto', multistart: run.multistart, odmr_multi: !!run.odmr_multi, apply_both: false });
+        if (r.detector_id && f.info.detectors.includes(r.detector_id)) f.detector = r.detector_id;
+        const previousFits = f.fitHistory.length;
+        await runFit(f, { robust: !!run.robust, recordUndo: false });
+        if (f.fitHistory.length > previousFits && f.fit[f.detector]) {
+          seen.add(p);
+          if (!S.compare.set.includes(p)) S.compare.set.push(p);
+          S.compare.results[p] = f.fit[f.detector];
+          fitted++;
+        } else failed++;
+      } catch (e) { failed += 1; }
+    }
+    toast(`Sent ${fitted} file(s) to Compare${failed ? `, ${failed} failed` : ''}${skippedDetectors ? `, ${skippedDetectors} additional detector row(s) skipped (Compare shows one detector per file)` : ''}.`, failed || skippedDetectors ? '' : 'ok');
+    S.view = 'compare'; emit();
+  }
 }
 
 async function start() {
   const B = S.batch;
   B.rows = [];
   B.ranInput = B.opts.input_dir;
+  B.ranOpts = clone(B.opts);
   B.job = await call('batch_start', { opts: B.opts }, { label: 'Starting batch' });
   B.status = { state: 'running', done: 0, total: 0, log: [] };
   if (timer) clearInterval(timer);

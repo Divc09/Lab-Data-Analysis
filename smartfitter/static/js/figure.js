@@ -1,6 +1,6 @@
 // Figure composer: multi-panel figures at true physical size (WYSIWYG), exported as SVG/PNG/PDF.
 import { call } from './api.js';
-import { S, emit, active } from './state.js';
+import { S, emit, active, sessionDoc } from './state.js';
 import { h, mount, icon, seg, select, input, field, check, toast, num, basename, dirname, stem, clone } from './util.js';
 import { currentFigure, kindOf } from './analyze.js';
 import { composeSvg, svgToPng, copyImage, renderImage } from './export.js';
@@ -15,14 +15,26 @@ const FONT_PT = { presentation: 14, paper: 8, dense: 9 };
 let pageEl, pageInner;
 let nextId = 1;
 
-export async function addCurrentPlot() {
+// Each panel keeps the comparison set it was added with (S.overlays is global and later belongs to other plots).
+const withOverlays = (overlays, fn) => { const saved = S.overlays; S.overlays = overlays; try { return fn(); } finally { S.overlays = saved; } };
+export async function addCurrentPlot({ quiet = false, overlays } = {}) {
   const f = active();
   if (!f) { toast('Open a plot first.'); return; }
-  const fig = currentFigure(f);
+  const own = Array.isArray(overlays) ? overlays : S.overlays.filter((q) => q !== f.path);
+  const fig = withOverlays(own, () => currentFigure(f));
   const thumb = await Plotly.toImage({ data: fig.data, layout: { ...fig.layout, width: 320, height: 210 } }, { format: 'png', width: 320, height: 210 });
-  S.figure.panels.push({ id: nextId++, path: f.path, det: f.detector, kind: kindOf(f), title: '', thumb, snapshot: clone({ data: fig.data, layout: fig.layout }) });
-  toast(`Added to Figure composer (${S.figure.panels.length} panel${S.figure.panels.length > 1 ? 's' : ''}).`, 'ok');
+  S.figure.panels.push({ id: nextId++, path: f.path, det: f.detector, kind: kindOf(f), title: '', thumb, overlays: own, snapshot: clone({ data: fig.data, layout: fig.layout }) });
+  if (!quiet) toast(`Added to Figure composer (${S.figure.panels.length} panel${S.figure.panels.length > 1 ? 's' : ''}).`, 'ok');
   emit();
+}
+
+// One panel per open file, each with its own current fit/style (the primary is restored afterwards).
+async function addOpenPlots() {
+  const prev = S.primary;
+  try {
+    for (const path of Object.keys(S.files)) { S.primary = path; await addCurrentPlot({ quiet: true, overlays: path === prev ? S.overlays.filter((q) => q !== path) : [] }); }
+    toast(`Added ${Object.keys(S.files).length} panels (${S.figure.panels.length} in the figure).`, 'ok');
+  } finally { S.primary = prev; emit(); }
 }
 
 function panelFigure(p, fontPx) {
@@ -31,7 +43,7 @@ function panelFigure(p, fontPx) {
   let fig = p.snapshot;
   if (f && f.data[p.det]) {
     const saved = f.detector; f.detector = p.det;
-    try { fig = currentFigure(f) || fig; } finally { f.detector = saved; }
+    try { fig = withOverlays(p.overlays ?? S.overlays.filter((q) => q !== p.path), () => currentFigure(f)) || fig; } finally { f.detector = saved; }
   }
   fig = clone(fig);
   const L = fig.layout;
@@ -82,14 +94,15 @@ export function renderFigure(root) {
       h('div', { style: 'min-width:0;flex:1' }, input(p.title, (v) => { p.title = v; emit(); }, { placeholder: basename(p.path).replace(/\.mat$/i, ''), style: 'height:26px' }),
         h('div', { class: 'dim ellip', style: 'font-size:11px;margin-top:2px' }, S.files[p.path] ? 'linked' : 'snapshot')),
       h('button', { class: 'ibtn', title: 'Remove panel', onclick: () => { F.panels.splice(i, 1); emit(); } }, icon('trash', 14)));
-    row.addEventListener('dragstart', () => { dragIdx = i; row.classList.add('drag'); });
+    row.addEventListener('dragstart', (e) => { dragIdx = i; row.classList.add('drag'); e.dataTransfer.setData('application/x-sf-series', String(i)); });
     row.addEventListener('dragend', () => row.classList.remove('drag'));
     row.addEventListener('dragover', (e) => e.preventDefault());
     row.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); if (dragIdx === null || dragIdx === i) return; const [m] = F.panels.splice(dragIdx, 1); F.panels.splice(i, 0, m); dragIdx = null; emit(); });
     list.append(row);
   });
-  const left = h('aside', { class: 'library', style: 'padding:12px;gap:10px' }, h('span', { class: 'lbl' }, 'Panels · drag to reorder'), list,
+  const left = h('aside', { class: 'library', style: 'padding:12px;gap:10px', 'data-drop': 'figure' }, h('span', { class: 'lbl' }, 'Panels · drag to reorder · drop files to add'), list,
     h('button', { class: 'btn block', disabled: !active(), onclick: addCurrentPlot }, 'Add the current plot'),
+    Object.keys(S.files).length > 1 ? h('button', { class: 'btn block', onclick: addOpenPlots }, `Add all ${Object.keys(S.files).length} open plots`) : null,
     F.panels.length ? h('button', { class: 'btn block', onclick: () => { F.panels = []; emit(); } }, 'Clear all') : null);
   const set = (patch) => { Object.assign(F, patch); emit(); };
   const right = h('aside', { class: 'inspector' }, h('div', { class: 'insp-body' },
@@ -146,7 +159,10 @@ async function save(data, ext, vectorSvg) {
   const target = p.toLowerCase().endsWith(`.${ext}`) ? p : `${p}.${ext}`;
   if (ext === 'svg') await call('write_text', { path: target, text: data });
   else if (ext === 'png') await call('write_data_url', { path: target, data });
-  else await call('export', { req: { output_dir: dirname(target), stem: stem(target).replace(/_fit$/, ''), images: { pdf_png: data, pdf_svg: vectorSvg }, dpi: S.figure.dpi, json: false } });
-  await call('write_text', { path: target.replace(/\.[^.]+$/, '') + '.figure.json', text: JSON.stringify({ size: geometry(), labels: S.figure.labels, panels: S.figure.panels.map((p) => ({ path: p.path, detector: p.det, title: p.title, fit: S.files[p.path]?.fit?.[p.det] ? { model: S.files[p.path].fit[p.det].model, r2: S.files[p.path].fit[p.det].r2 } : null })) }, null, 2) });
+  else await call('export', { req: { output_dir: dirname(target), stem: stem(target).replace(/_fit$/, ''), pdf_filename: basename(target), images: { pdf_png: data, pdf_svg: vectorSvg }, dpi: S.figure.dpi, json: false } });
+  // The sidecar is a full analysis session (files, processing, fits, styles, figure panels + snapshots), so opening it
+  // (Open session, or opening the .json from the Library) rebuilds the figure exactly; `figure_export` is a readable summary.
+  const summary = { size: geometry(), labels: S.figure.labels, panels: S.figure.panels.map((p) => ({ path: p.path, detector: p.det, title: p.title, fit: S.files[p.path]?.fit?.[p.det] ? { model: S.files[p.path].fit[p.det].model, r2: S.files[p.path].fit[p.det].r2 } : null })) };
+  await call('save_session', { path: target.replace(/\.[^.]+$/, '') + '.figure.json', doc: { ...sessionDoc(), figure_export: summary } }, { quiet: true });
   toast(`Saved ${basename(target)}`, 'ok');
 }

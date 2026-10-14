@@ -1,16 +1,24 @@
 // Analyze workspace: 1D experiments, time traces and 2D maps, with their inspectors.
 import { call } from './api.js';
-import { S, emit, active, commit, loadData, detLabel, defaultFitSpec } from './state.js';
+import { S, emit, active, commit, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe } from './state.js';
+import { openOverlayPicker, browseOverlays } from './overlaypicker.js';
+import { isNormalizedT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, fmtPm, fmtCounts, num, toast, clone, tag, basename, dirname, stem, contextMenu, linreg } from './util.js';
 import { figure1D, figureTT, xTitle, yTitle } from './plot1d.js';
-import { figureMaps, linecuts, CMAP_GRADIENT, visibleSpots, peakCell, displayMap, mapPanels, nearest, fitColorbars, lineLength } from './plot2d.js';
+import { figureMaps, linecuts, CMAP_GRADIENT, visibleSpots, peakCell, displayMap, mapPanels, nearest, fitColorbars, lineLength, mapRelayoutView, rememberMapRanges, mapValueLabel } from './plot2d.js';
+// Readout suffix for map values: contrast of the selected observable is dimensionless; raw sources keep their unit.
+const mapUnitSuffix = (f) => ((f.map?.source || 'value') === 'value' && f.mode === 'contrast' ? '' : f.info.unit ? ` ${f.info.unit}` : '');
 import { plotConfig, resultLines, baseStyle, MODE_LABEL, friendlyAxis } from './plotstyle.js';
 import { renderImage, copyImage, copyText } from './export.js';
-import { openSeriesEditor, editorPanel, applyPlotlyEdit } from './ploteditor.js';
+import { openSeriesEditor, editorPanel, applyPlotlyEdit, inlinePlotEditor, styleTools as styleToolsBox } from './ploteditor.js';
 import * as sci from './science.js';
+import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries } from './seriescontrol.js';
+import { xDisplay, displayValue, unitOptions, parameterUnit } from './unitdisplay.js';
+import { iterationCard, iterationFitActions, iterationProvenance, iterationCSV, openCombineDialog, fitTargetLabel } from './iterations.js';
 
+let legendTimer = null;
 let lastMapHover = null; // last heatmap cell under the mouse (for the right-click menu)
-let plotEl = null, plotBound = false, cutEl = null, plotPending = false;
+let plotEl = null, plotBound = false, cutEl = null, plotPending = false, drawToken = 0;
 const roomy = (el) => el.clientWidth >= 40 && el.clientHeight >= 40;
 let fftEl = null; // readout span showing the FFT dominant frequency
 let readoutLive = null; // span in the readout bar that hover updates in place (null when something is pinned)
@@ -45,6 +53,7 @@ export async function setMode(f, mode) {
   f.fit = f.fitByMode[mode] || {};
   f.yrange = null;
   await loadData(f);
+  await syncOverlays(f);
   emit();
 }
 
@@ -52,33 +61,66 @@ export async function setProc(f, patch, label = 'processing') {
   commit(label);
   Object.assign(f.proc, patch);
   if (Object.keys(f.fit).length) f.fitStale = true;
+  f.iterationFitsStale = true;
   await loadData(f);
   emit();
 }
 
-export async function runFit(f, { robust = false } = {}) {
+export async function runFit(f, { robust = false, recordUndo = true } = {}) {
   if (!f.info.fit_allowed && kindOf(f) === '1d' && f.fitSpec.model !== 'GaussianPeaks' && f.fitSpec.model !== 'CustomModel') {
     toast('This scan type is plot-only. Choose Gaussian peaks or a custom model in the Fit tab to fit it.');
     return;
   }
-  commit('fit');
-  const spec = clone(f.fitSpec);
+  if (recordUndo) commit('fit');
+  if (f.data[f.detector]?.iterations?.selected?.length === 0) { toast('Select at least one iteration before fitting.', 'err'); return; }
+  if (f.fitting || f.iterationFitting) return;
+  const spec = prepareFitSpec(f), proc = clone(f.proc), mode = f.mode;
+  const signature = JSON.stringify([mode, proc, spec]);
   spec.robust = robust;
-  if (spec.model === 'CustomModel') spec.custom_spec = customSpec(spec);
-  const dets = spec.apply_both || kindOf(f) === 'tt' ? f.info.detectors : [f.detector];
+  const dets = spec.apply_both || kindOf(f) === 'tt' ? [...f.info.detectors] : [f.detector];
   f.fitting = true; emit('insp');
   try {
     for (const det of dets) {
-      const res = await call('fit', { path: f.path, detector: det, mode: f.mode, proc: f.proc, spec }, { label: `Fitting ${detLabel(f, det)}` });
-      f.fit[det] = res;
-      f.fitHistory.unshift({ at: new Date().toLocaleTimeString(), det, mode: f.mode, spec, res });
+      const res = await call('fit', { path: f.path, detector: det, mode, proc, spec }, { label: `Fitting ${detLabel(f, det)}` });
+      if (f.mode === mode) f.fit[det] = res;
+      else { f.fitByMode ||= {}; (f.fitByMode[mode] ||= {})[det] = res; }
+      f.fitHistory.unshift({ at: new Date().toLocaleTimeString(), det, mode, spec, res });
       f.fitHistory = f.fitHistory.slice(0, 12);
     }
-    f.fitStale = false;
+    f.fitStale = signature !== JSON.stringify([f.mode, f.proc, prepareFitSpec(f)]);
     if (!f.layersTouched) { f.layers.fit = true; f.layers.results = kindOf(f) === '1d'; }
     const r = f.fit[f.detector];
     if (r) toast(`${r.model}: R² ${fmt(r.r2, 4)} · ${r.status}${r.elapsed_s ? ` · ${r.elapsed_s.toFixed(1)} s` : ''}`, r.status === 'PASS' ? 'ok' : '');
   } finally { f.fitting = false; emit(); }
+}
+
+// ODMR "peak-pick only" (v1 parity): detected sample positions, no model fit, no uncertainties.
+function peakPickCard(f) {
+  const opt = (f.peakPickOpts ||= { prominence: 8, smoothed: !!f.fitSpec.fit_smoothed });
+  const res = f.peakPick?.[f.detector];
+  const run = async () => {
+    const r = await call('odmr_pick_peaks', { path: f.path, detector: f.detector, mode: f.mode, proc: f.proc, polarity: f.fitSpec.odmr_polarity,
+      ranges: (f.fitSpec.odmr_ranges || []).filter((q) => q && (q[0] !== null || q[1] !== null)), smoothed: opt.smoothed, prominence: opt.prominence / 100 }, { label: 'Picking peaks' });
+    (f.peakPick ||= {})[f.detector] = { ...r, signature: JSON.stringify([f.mode, f.proc]) };
+    f.layers.picked = true; emit();
+  };
+  const unit = f.info.x_unit ? ` ${f.info.x_unit}` : '';
+  const stale = res && res.signature !== JSON.stringify([f.mode, f.proc]);
+  return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:6px' },
+    h('strong', {}, 'Peak-pick only (no fit)'),
+    h('div', { class: 'g2' }, field('Min prominence (% of range)', input(opt.prominence, (v) => { opt.prominence = Math.max(0.1, Math.min(100, num(v) || 8)); })),
+      h('div', { style: 'align-self:end' }, check(`Use smoothed data${f.data[f.detector]?.proc?.smoothing_window > 1 ? ` (${f.data[f.detector].proc.smoothing_window} pt)` : ''}`, opt.smoothed, (v) => { opt.smoothed = v; }))),
+    h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: run }, res ? 'Pick again' : 'Pick peaks'),
+      res ? h('button', { class: 'btn sm', onclick: () => copyText(res.peaks.map((p) => `${p.x}\t${p.y}`).join('\n'), 'Peak positions copied') }, 'Copy') : null,
+      res ? check('Show on plot', f.layers.picked !== false, (v) => { f.layers.picked = v; emit(); }) : null),
+    res ? h('div', { class: 'note' }, `${res.peaks.length} ${res.polarity === 'dip' ? 'dip' : 'peak'}${res.peaks.length === 1 ? '' : 's'} (${res.source}${stale ? ' · STALE: processing changed, pick again' : ''}): ${res.peaks.map((p) => fmt(p.x, 7) + unit).join(', ') || 'none above the prominence threshold'}`) : null,
+    h('div', { class: 'note', title: 'Uses the Polarity and Centers range above (best peak per range). Positions are sample points (resolution = point spacing); raise the prominence or use smoothed data if noise is picked.' }, 'Uses Polarity + Centers range above · hover for details'));
+}
+
+export function prepareFitSpec(f) {
+  const spec = clone(f.fitSpec);
+  if (spec.model === 'CustomModel') spec.custom_spec = customSpec(spec);
+  return spec;
 }
 
 function customSpec(spec) {
@@ -128,7 +170,11 @@ export function renderAnalyze(main, insp) {
   const f = active();
   if (!f) { mount(main, h('div', { class: 'empty' }, 'Open a file from the Library, or press Ctrl+O.')); mount(insp); return; }
   const k = kindOf(f);
-  mount(main, header(f), k === '2d' ? mapToolbar(f) : toolbar(f), plotSection(f), k === '2d' ? null : readout(f));
+  mount(main, header(f), k === '2d' ? mapToolbar(f) : toolbar(f),
+    k === '1d' && displayProvenance(f) ? h('div', { class: 'note', 'aria-label': 'Display provenance' }, displayProvenance(f)) : null,
+    k === '1d' && iterationNoteUseful(f) ? h('div', { class: 'note iteration-provenance', 'aria-label': 'Iteration provenance' }, iterationProvenance(f)) : null,
+    // Plot first; per-file Series controls sit below it (like a docked properties panel) so the plot never gets pushed off-screen.
+    plotSection(f), k === '2d' ? mapReadout(f) : readout(f), k === '1d' ? seriesPanel(f) : null);
   drawPlot(f);
   if (S.editor.open) { insp.className = 'drawer'; mount(insp, editorPanel(f)); }
   else { insp.className = 'inspector'; renderInspector(f, insp); }
@@ -154,19 +200,20 @@ function header(f) {
   if (i.detectors.length > 1) bits.push(`${i.detectors.length} detectors`);
   const ctlr = h('div', { class: 'row wrap' });
   if (i.dim !== 'scan2d') {
-    ctlr.append(h('label', { class: 'row' }, h('span', { class: 'lbl' }, 'Experiment'),
-      select([['', `Auto · ${i.type}`], ...['Ramsey', 'Rabi', 'SpinEcho', 'DynamicDecoupling', 'T1', 'ODMR', 'DEERFrequency', 'DEERDuration', 'DEERDecay', 'DEERPosition', 'LineScan', 'TimeTrace'].map((t) => [t, t])],
-        f.fitSpec.experiment, (v) => { commit('experiment'); f.fitSpec.experiment = v; emit(); }, { style: 'width:150px', title: 'Override the detected experiment type (changes the fit model family)' })));
+    ctlr.append(select([['', `Auto · ${i.type}`], ...['Ramsey', 'Rabi', 'SpinEcho', 'DynamicDecoupling', 'T1', 'ODMR', 'DEERFrequency', 'DEERDuration', 'DEERDecay', 'DEERPosition', 'LineScan', 'TimeTrace'].map((t) => [t, t])],
+      f.fitSpec.experiment, (v) => { commit('experiment'); f.fitSpec.experiment = v; emit(); }, { style: 'width:138px', title: 'Experiment type (override the detected type; changes the fit model family)', 'aria-label': 'Experiment type' }));
   }
   if (i.detectors.length > 1) {
     ctlr.append(seg(i.detectors.map((d) => [d, detLabel(f, d)]), f.detector, (d) => { commit('detector'); f.detector = d; emit(); }));
   }
   ctlr.append(seg(['contrast', 'signal', 'reference', 'difference'].map((m) => [m, MODE_LABEL[m], i.observables.includes(m) ? '' : 'Not recorded in this file']), f.mode,
     (m) => setMode(f, m), { disabled: ['contrast', 'signal', 'reference', 'difference'].filter((m) => !i.observables.includes(m)) }));
-  return h('div', { class: 'row wrap', style: 'justify-content:space-between;align-items:flex-start;gap:12px;flex:none' },
-    h('div', { class: 'filehead', style: 'min-width:0' },
-      h('h1', { title: f.path }, i.name),
-      h('div', { class: 'metaline' }, tag(i.tag), bits.map((b, n) => [n ? h('span', { class: 'dim' }, '·') : null, b]))),
+  // One compact bar: identity + metadata on the left (full text on hover), view controls on the right.
+  const metaText = bits.map((b) => (typeof b === 'string' ? b : b.textContent)).join(' · ');
+  return h('div', { class: 'filebar' },
+    h('div', { class: 'filehead' }, tag(i.tag),
+      h('h1', { title: f.path }, i.name.replace(/\.mat$/i, '')),
+      h('div', { class: 'metaline', title: metaText }, bits.map((b, n) => [n ? h('span', { class: 'dim' }, '·') : null, b]))),
     ctlr);
 }
 
@@ -174,6 +221,30 @@ function layerChip(f, key, label, sw, opts = {}) {
   return h('button', { class: `chip ${f.layers[key] ? 'on' : ''}`, disabled: opts.disabled, title: opts.title || '',
     onclick: () => { f.layers[key] = !f.layers[key]; f.layersTouched = true; emit(); } },
   sw ? h('span', { class: 'sw', style: `background:${sw};${opts.tall ? 'height:8px' : ''}` }) : null, label);
+}
+
+// The iteration provenance line is shown only when it says something: a subset, a pooled dataset, or a smoothed fit target.
+function iterationNoteUseful(f) {
+  const it = f.data[f.detector]?.iterations;
+  if (!it || !iterationProvenance(f)) return false;
+  return it.selected.length !== it.count || !!f.info.combined || f.fit[f.detector]?.provenance?.fit_target === 'smoothed';
+}
+
+// Less-used layers live in one menu so the chip row fits on one line; the button shows how many are on.
+function moreLayers(f, fit) {
+  const items = [
+    ['meanSd', 'Iteration mean ± SD band', !f.data[f.detector]?.iterations], ['conf', 'Confidence band', !fit?.dense?.band], ['envelope', 'Rabi envelope (T2ρ)', !fit?.envelope], ['sigref', 'Signal + Ref panel', f.info.reference_only],
+    ['fft', 'FFT panel', f.info.irregular], ['peaks', 'Fitted peak markers', !fit?.params?.some((p) => /^(x0|center)/.test(p.name))],
+    ['picked', 'Picked peaks (peak-pick only)', !f.peakPick?.[f.detector]], ...(f.info.detectors.length > 1 ? [['__both', 'Both detectors', false]] : []),
+  ];
+  const isOn = (k) => (k === '__both' ? !!f.compareDetectors : k === 'picked' ? f.layers.picked !== false && !!f.peakPick?.[f.detector] : !!f.layers[k]);
+  const on = items.filter(([k, , off]) => !off && isOn(k)).length;
+  return h('button', { class: `chip ${on ? 'on' : ''}`, title: 'Confidence band, Rabi envelope, Signal + Ref panel, FFT, peak markers, both detectors',
+    onclick: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      contextMenu(r.left, r.bottom + 4, items.map(([k, label, off]) => ({ label: `${isOn(k) && !off ? '✓ ' : '   '}${label}${off ? ' (n/a)' : ''}`,
+        run: () => { if (off) return; if (k === '__both') f.compareDetectors = !f.compareDetectors; else if (k === 'picked') f.layers.picked = !isOn('picked'); else { f.layers[k] = !f.layers[k]; f.layersTouched = true; } emit(); } })));
+    } }, `More layers${on ? ` · ${on}` : ''} ▾`);
 }
 
 function toolbar(f) {
@@ -197,18 +268,24 @@ function toolbar(f) {
       layerChip(f, 'band', f.errorMode === 'bars' ? '± SEM bars' : '± SEM', '#3D5E8C', { tall: true, disabled: !d?.proc?.sem, title: d?.proc?.sem ? 'Standard error of the mean across iterations' : 'No per-point uncertainty in this file' }),
       layerChip(f, 'res', 'Residuals', null, { disabled: !fit }), layerChip(f, 'smooth', 'Smoothed', '#222'),
       h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, disabled: !its, title: its ? 'Show individual iterations (choose which in Process)' : 'No per-iteration data',
-        onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its ? (f.iterSel?.length || its.count) : '–')),
-      layerChip(f, 'meanSd', 'Mean ± SD', null, { disabled: !its }),
-      layerChip(f, 'conf', 'Confidence', '#F08A3C', { tall: true, disabled: !fit?.dense?.band, title: fit?.dense?.band ? 'Fit confidence band' : 'No confidence band for this fit' }),
-      layerChip(f, 'envelope', 'Envelope', '#7A4FD6', { disabled: !fit?.envelope, title: 'Rabi decay envelope (T2ρ)' }),
-      layerChip(f, 'sigref', 'Signal + Ref (right axis)', null, { disabled: f.mode !== 'contrast' || f.info.reference_only }),
-      layerChip(f, 'fft', 'FFT', null, { disabled: f.info.irregular }),
-      layerChip(f, 'peaks', 'Peak markers', null, { disabled: !fit?.params?.some((p) => /^(x0|center)/.test(p.name)) }),
-      f.info.detectors.length > 1 ? h('button', { class: `chip ${f.compareDetectors ? 'on' : ''}`, onclick: async () => { f.compareDetectors = !f.compareDetectors; emit(); } }, 'Both detectors') : null,
-      layerChip(f, 'legend', 'Legend'), layerChip(f, 'results', 'Results box', null, { disabled: !fit }));
+        onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its ? its.selected.length : '–')),
+      layerChip(f, 'legend', 'Legend'), layerChip(f, 'results', 'Results box', null, { disabled: !fit }),
+      moreLayers(f, fit));
   }
-  const tools = h('div', { class: 'row', style: 'gap:2px' },
-    seg([['both', 'Line + points'], ['pts', 'Points'], ['line', 'Line']], f.styleMode, (v) => { f.styleMode = v; emit(); }),
+  const tools = h('div', { class: 'row wrap', style: 'gap:2px' },
+    !tt ? h('button', { class: 'btn', title: 'Overlay other files on this plot (independent data/fit/style per file)', onclick: () => openOverlayPicker(f) }, `Compare…${S.overlays.length ? ` (${S.overlays.length})` : ''}`) : null,
+    !tt ? h('button', { class: 'btn', title: 'Choose iterations, fit each iteration, or pool runs', onclick: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      contextMenu(r.left, r.bottom + 4, [
+        { label: 'Choose iterations for mean + fit…', run: () => { f.tab = 'proc'; emit('insp'); } },
+        d?.iterations ? { label: 'Fit each selected iteration', run: () => import('./iterations.js').then((m) => m.runIterationFits(f)) } : null,
+        { label: 'Combine runs (pool iterations)…', run: () => openCombineDialog(f) }]);
+    } }, `Iterations${d?.iterations ? ` ${d.iterations.selected.length}/${d.iterations.count}` : ''} ▾`) : null,
+    !tt && isNormalizedT1(fit) ? t1DisplayControl(f) : null,
+    !tt ? h('label', { class: 'row', style: 'gap:4px', title: 'X-axis display unit (display only; fits stay in native units)' }, h('span', { class: 'dim' }, 'X'),
+      select(unitOptions(f.info.x_unit), f.display.xunit || 'auto', (xunit) => { commit('x display units'); f.display.xunit = xunit; emit(); }, { style: 'width:78px', 'aria-label': 'X unit' })) : null,
+    tt ? seg([['both', 'Line + points'], ['pts', 'Points'], ['line', 'Line']], f.styleMode, (v) => { f.styleMode = v; emit(); })
+      : select([['both', 'Line + points'], ['pts', 'Points'], ['line', 'Line']], f.styleMode, (v) => { f.styleMode = v; emit(); }, { style: 'width:108px', title: 'Data drawing style', 'aria-label': 'Data drawing style' }),
     h('span', { class: 'sep' }),
     h('button', { class: 'ibtn', title: 'Reset view (Ctrl+Home)', onclick: () => resetView(f) }, icon('home')),
     h('button', { class: `ibtn ${f.tool === 'zoom' || !f.tool ? 'on' : ''}`, title: 'Box zoom (scroll also zooms)', onclick: () => setTool(f, 'zoom') }, icon('zoom')),
@@ -220,8 +297,13 @@ function toolbar(f) {
       : h('button', { class: 'ibtn', title: 'Exclude points: drag a box around them (one-shot)', onclick: () => setTool(f, 'select') }, icon('edit'))),
     h('button', { class: `ibtn ${f.tool === 'measure' ? 'on' : ''}`, title: 'Measure: click two points', onclick: () => { setTool(f, f.tool === 'measure' ? 'zoom' : 'measure'); f.measure = []; } }, icon('measure')),
     h('span', { class: 'sep' }),
-    h('button', { class: 'btn', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), S.editor.open ? 'Close editor' : 'Edit plot'),
-    h('button', { class: 'btn', title: 'Copy figure (Ctrl+Shift+C)', onclick: () => copyFigure(f) }, icon('copy', 14), 'Copy', h('span', { class: 'kbd' }, 'Ctrl Shift C')));
+    h('button', { class: 'btn', title: 'Open the plot editor (series, legend, axes, text, style). Tip: double-click titles/legend on the plot to edit in place.', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), S.editor.open ? 'Close editor' : 'Edit plot'),
+    !tt ? h('button', { class: 'btn sm', title: 'Jump to an editor section', 'aria-label': 'Editor sections', onclick: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      contextMenu(r.left, r.bottom + 4, [['series', 'Series'], ['legend', 'Legend'], ['axes', 'Axes & ticks'], ['text', 'Annotations & results'], ['inset', 'Inset & breaks'], ['style', 'Layout & style']]
+        .map(([tab, label]) => ({ label, run: () => { S.editor.open = true; S.editor.tab = tab; emit(); } })));
+    } }, '▾') : null,
+    h('button', { class: 'ibtn', title: 'Copy figure to the clipboard (Ctrl+Shift+C)', 'aria-label': 'Copy figure', onclick: () => copyFigure(f) }, icon('copy', 15)));
   return h('div', { class: 'toolbar', style: 'flex:none' }, chips, tools);
 }
 
@@ -232,7 +314,7 @@ function setTool(f, tool) {
 }
 
 function plotSection(f) {
-  const card = h('section', { class: 'plotcard', 'aria-label': 'Plot' }, plotDiv());
+  const card = h('section', { class: 'plotcard', 'aria-label': 'Plot', 'data-drop': kindOf(f) === '1d' ? 'compare' : null }, plotDiv());
   if (f.fitStale) card.append(h('div', { style: 'position:absolute;right:12px;bottom:10px;z-index:2', class: 'row' },
     h('span', { class: 'pill WARN' }, 'Fit is from earlier settings'), h('button', { class: 'btn sm', onclick: () => runFit(f) }, 'Refit')));
   if (f.data[f.detector]?.baseline_note) card.append(h('div', { style: 'position:absolute;left:12px;bottom:8px;z-index:2;color:#4A5262;font-size:11.5px' }, f.data[f.detector].baseline_note));
@@ -258,12 +340,23 @@ function drawPlot(f) {
   if (!fig) return;
   if (fftEl?.isConnected) { const pk = fig.fftPeak; fftEl.textContent = f.layers.fft && pk && Number.isFinite(pk.f) ? `FFT peak ≈ ${fmt(pk.f, 5)} ${pk.unit || ''}` : ''; }
   fig.layout.dragmode = f.ttPick && k === 'tt' ? 'select' : f.tool === 'pan' ? 'pan' : f.tool === 'select' ? 'select' : 'zoom';
-  requestAnimationFrame(() => {
-    if (!roomy(el)) { plotPending = true; return; }
-    Plotly.react(el, fig.data, fig.layout, plotConfig({ edits: { ...plotConfig().edits, titleText: !!f.style.title } }));
+  // Only the newest request draws. If the box is not laid out yet, retry each frame: the plot div is reused, so the
+  // ResizeObserver alone never fires when it settles at its previous size (the next file then stayed undrawn/stale).
+  const token = ++drawToken;
+  let tries = 0;
+  const attempt = () => {
+    if (token !== drawToken) return;
+    if (!roomy(el)) {
+      if (++tries < 90) requestAnimationFrame(attempt); else plotPending = true;
+      return;
+    }
+    plotPending = false;
+    // The 1D double-click editor owns text; native single-click editing steals its second click.
+    Plotly.react(el, fig.data, fig.layout, plotConfig({ edits: { ...plotConfig().edits, titleText: k !== '1d' && !!f.style.title, axisTitleText: k !== '1d', legendText: k !== '1d' } }));
     bindPlot(el);
-    if (k === '2d') { fitColorbars(el); drawCuts(f); }
-  });
+    if (k === '2d') { fitColorbars(el).then(() => rememberMapRanges(el)); drawCuts(f); }
+  };
+  requestAnimationFrame(attempt);
 }
 
 function drawCuts(f) {
@@ -284,7 +377,7 @@ function drawCuts(f) {
     margin: { l: 56, r: 12, t: 30, b: 46 }, font: { family: 'Arial', size: 11 }, showlegend: true, legend: { orientation: 'h', y: -0.25, font: { size: 10 } },
     title: { text: (cuts[0].h || cuts[0].v).label, font: { size: 12 } },
     xaxis: { title: { text: cuts[0].xTitle ? cuts[0].xTitle : cuts[0].h ? friendlyAxis(f.map.swap ? f.data[f.detector].map.y_label : f.data[f.detector].map.x_label) : '' }, showline: true, mirror: true, ticks: 'outside', domain: [0, 1], anchor: 'y' },
-    yaxis: { showline: true, mirror: true, ticks: 'outside', domain: both ? [0.58, 1] : [0, 1], exponentformat: 'SI', title: { text: norm ? 'Normalized to max' : (f.info.unit || '') } },
+    yaxis: { showline: true, mirror: true, ticks: 'outside', domain: both ? [0.58, 1] : [0, 1], exponentformat: 'SI', title: { text: norm ? 'Normalized to max' : mapValueLabel(f) } },
     separators: '.',
   };
   if (both) { layout.xaxis2 = { showline: true, mirror: true, ticks: 'outside', anchor: 'y2' }; layout.yaxis2 = { showline: true, mirror: true, ticks: 'outside', domain: [0, 0.4], exponentformat: 'SI' }; }
@@ -294,21 +387,35 @@ function drawCuts(f) {
 function bindPlot(el) {
   if (plotBound) return;
   plotBound = true;
+  inlinePlotEditor(el, active, () => clearTimeout(legendTimer));
+  let mapClickTimer = null;
+  const cancelMapClick = () => { if (mapClickTimer !== null) { clearTimeout(mapClickTimer); mapClickTimer = null; } };
   el.on('plotly_click', (ev) => {
     const f = active();
     if (!f || !ev.points?.length) return;
     const p = ev.points[0];
     if (kindOf(f) === '2d') {
       if (p.data.type !== 'heatmap') return;
-      if (f.map.linecut === 'line') {
-        // Display coordinates (after swap); a third click starts a new line.
-        const L = f.map.line;
-        f.map.line = L && L.length === 1 ? [L[0], [p.x, p.y]] : [[p.x, p.y]];
-        emit(); return;
-      }
-      f.map.cursor = [p.x, p.y];
-      if (f.map.linecut === 'none') f.map.linecut = 'h';
-      emit(); return;
+      // Plotly emits a click before it recognizes a double-click reset. Defer the
+      // cursor action so a reset cannot unexpectedly open the linecut panel.
+      cancelMapClick();
+      if (ev.event?.detail >= 2) return;
+      const path = f.path, detector = f.detector, linecut = f.map.linecut, point = [p.x, p.y];
+      mapClickTimer = setTimeout(() => {
+        mapClickTimer = null;
+        const current = active();
+        if (!current || current.path !== path || current.detector !== detector || kindOf(current) !== '2d' || current.map.linecut !== linecut) return;
+        if (linecut === 'line') {
+          // Display coordinates (after swap); a third click starts a new line.
+          const L = current.map.line;
+          current.map.line = L && L.length === 1 ? [L[0], point] : [point];
+        } else {
+          current.map.cursor = point;
+          if (linecut === 'none') current.map.linecut = 'h';
+        }
+        emit();
+      }, 350);
+      return;
     }
     if (f.tool === 'measure') {
       f.measure = [...(f.measure || []), { x: p.x, y: p.y }].slice(-2);
@@ -340,7 +447,7 @@ function bindPlot(el) {
           const m = f.data[det]?.map;
           if (!m) continue;
           const d = displayMap(m, f.map.swap, f.map.source || 'value');
-          parts.push(`${detLabel(f, det)} ${fmt(d.z[nearest(d.y, p.y)]?.[nearest(d.x, p.x)], 6)}${f.info.unit ? ' ' + f.info.unit : ''}`);
+          parts.push(`${detLabel(f, det)} ${fmt(d.z[nearest(d.y, p.y)]?.[nearest(d.x, p.x)], 6)}${mapUnitSuffix(f)}`);
         }
         const d0 = displayMap(f.data[f.detector].map, f.map.swap);
         text = [`${friendlyAxis(d0.xl).split(' [')[0]} ${fmt(p.x, 6)}`, `${friendlyAxis(d0.yl).split(' [')[0]} ${fmt(p.y, 6)}`, ...parts].join(' · ');
@@ -357,33 +464,46 @@ function bindPlot(el) {
     hoverEv = null;
     if (readoutLive?.isConnected) { readoutLive.textContent = readoutLive.dataset.def; readoutLive.classList.remove('mono'); }
   });
+  el.on('plotly_doubleclick', cancelMapClick);
   el.on('plotly_relayout', (ev) => {
     const f = active();
     if (!f) return;
     if (applyPlotlyEdit(f, ev)) return;
     if (kindOf(f) === '2d') {
-      if (ev['xaxis.range[0]'] !== undefined) f.map.bounds = { x: [ev['xaxis.range[0]'], ev['xaxis.range[1]']], y: [ev['yaxis.range[0]'] ?? f.map.bounds?.y?.[0], ev['yaxis.range[1]'] ?? f.map.bounds?.y?.[1]] };
-      if (ev['xaxis.autorange']) f.map.bounds = null;
+      // Zoom/pan/reset on any panel -> one shared view (linked panels follow on re-render; one-axis zooms made uniform).
+      const view = mapRelayoutView(el, ev);
+      if (view) { f.map.bounds = view.reset ? null : { x: view.x, y: view.y }; emit(); }
       return;
     }
-    if (ev['xaxis.range[0]'] !== undefined) f.xrange = [ev['xaxis.range[0]'], ev['xaxis.range[1]']];
-    if (ev['yaxis.range[0]'] !== undefined) f.yrange = [ev['yaxis.range[0]'], ev['yaxis.range[1]']];
+    const ranges = Object.keys(ev).some((key) => /^(x|y)axis\.(range|autorange)/.test(key));
+    if (ranges) commit('plot range');
+    if (ev['xaxis.range[0]'] !== undefined) f.xrange = [ev['xaxis.range[0]'], ev['xaxis.range[1]']].map((v) => f.style.x?.log ? 10 ** v : v);
+    if (ev['yaxis.range[0]'] !== undefined) f.yrange = [ev['yaxis.range[0]'], ev['yaxis.range[1]']].map((v) => f.style.y?.log ? 10 ** v : v);
     if (ev['xaxis.autorange']) f.xrange = null;
     if (ev['yaxis.autorange']) f.yrange = null;
+    // Keep saved manual bounds in step with direct zoom/reset, including exports.
+    for (const ax of ['x', 'y']) if (f.style[ax] && Object.keys(ev).some((k) => k.startsWith(`${ax}axis.range`) || k === `${ax}axis.autorange`)) {
+      if (f.style[ax].min != null || f.style[ax].max != null) { f.style[ax].min = f[`${ax}range`]?.[0] ?? null; f.style[ax].max = f[`${ax}range`]?.[1] ?? null; }
+    }
   });
   el.on('plotly_restyle', (ev) => { const f = active(); if (f) applyPlotlyEdit(f, ev, el, 'restyle'); });
   el.on('plotly_legendclick', (ev) => {
     const f = active(); if (!f) return true;
     const key = ev.data[ev.curveNumber]?.meta?.key;
     if (!key) return true;
-    if (ev.event?.detail >= 2 || ev.event?.altKey) { openSeriesEditor(f, key, ev.event.clientX, ev.event.clientY); return false; }
-    f.style.series = f.style.series || {};
-    const cur = f.style.series[key]?.visible;
-    f.style.series[key] = { ...(f.style.series[key] || {}), visible: cur === false ? true : false };
-    emit();
+    clearTimeout(legendTimer);
+    if (ev.event?.altKey) { openSeriesEditor(f, key, ev.event.clientX, ev.event.clientY); return false; }
+    if (ev.event?.detail >= 2) return false;
+    legendTimer = setTimeout(() => {
+      commit('legend visibility'); f.style.series = f.style.series || {};
+      const cur = f.style.series[key]?.visible;
+      f.style.series[key] = { ...(f.style.series[key] || {}), visible: cur === false ? true : false };
+      emit();
+    }, 350);
     return false;
   });
   el.on('plotly_legenddoubleclick', (ev) => {
+    clearTimeout(legendTimer);
     const f = active(); if (!f) return false;
     const key = ev.data[ev.curveNumber]?.meta?.key;
     if (key) openSeriesEditor(f, key, ev.event?.clientX || 400, ev.event?.clientY || 200);
@@ -415,6 +535,7 @@ function bindPlot(el) {
   el.addEventListener('dblclick', (e) => {
     const f = active();
     if (!f) return;
+    if (kindOf(f) === '2d') cancelMapClick();
     const t = e.target.closest('.scatterlayer .trace, .legendtext, .legendtoggle');
     if (t && e.target.closest('.legend')) return; // handled by legend events
   });
@@ -456,15 +577,17 @@ function dataTable(f) {
     const fit = f.fit[det];
     const tag = dets.length > 1 ? ` · ${detLabel(f, det)}` : '';
     const x = d.proc.x || [];
-    cols.push(x); head.push(`x${tag} (${xt})`);
-    cols.push(d.proc.y || []); head.push(`y${tag} (${tt ? `${detLabel(f, det)}${f.info.unit ? ` [${f.info.unit}]` : ''}` : yTitle(f)})`);
+    cols.push(tt ? x : xDisplay(f, comparisonFiles(f)).transform(x)); head.push(`x${tag} (${xt})`);
+    cols.push(d.proc.y || []); head.push(`y${tag} (${tt ? `${detLabel(f, det)}${f.info.unit ? ` [${f.info.unit}]` : ''}` : `${MODE_LABEL[f.mode]} [${f.mode === 'contrast' ? 'dimensionless' : f.info.unit || 'a.u.'}] · processed, not normalized · ${iterationProvenance(f)}`})`);
     if (d.proc.sem) { cols.push(d.proc.sem); head.push(`sem${tag}`); }
-    if (d.proc.smooth) { cols.push(d.proc.smooth); head.push(`smoothed${tag}`); }
+    if (d.proc.smooth) { cols.push(d.proc.smooth); head.push(`smoothed${tag} (${d.proc.smoothing_window ?? f.proc.smooth} pt)`); }
     if (fit?.x && fit.y_fit) {
       const same = fit.x.length === x.length && fit.x.every((v, i) => Math.abs(v - x[i]) <= 1e-9 * Math.max(1, Math.abs(v)));
       const fy = x.map((xv, i) => { const j = same ? i : fit.x.findIndex((v) => Math.abs(v - xv) <= 1e-9 * Math.max(1, Math.abs(v))); return j >= 0 ? fit.y_fit[j] : null; });
-      cols.push(fy); head.push(`fit${tag}`);
-      cols.push(x.map((_, i) => (fy[i] === null || d.proc.y?.[i] === null ? null : d.proc.y[i] - fy[i]))); head.push(`residual${tag}`);
+      const aligned = (values) => x.map((xv) => { const j = fit.x.findIndex((v) => Math.abs(v - xv) <= 1e-9 * Math.max(1, Math.abs(v))); return j >= 0 ? values?.[j] : null; });
+      cols.push(fy); head.push(`fit${tag} (${fit.plot_y_label || f.mode} · ${fitTargetLabel(fit)})`);
+      cols.push(aligned(fit.plot_y)); head.push(`fit_target_y${tag} (${fit.plot_y_label || f.mode})`);
+      cols.push(aligned(fit.residuals)); head.push(`residual${tag} (stored fit-space target − fit)`);
     }
   }
   const n = Math.max(0, ...cols.map((c) => c.length));
@@ -500,7 +623,8 @@ function readout(f) {
     return row;
   }
   if (!f.pins.length) {
-    const hint = h('span', { class: 'dim' }, kindOf(f) === 'tt' ? 'Click a sample to inspect its timing. Set windows A/B in the Stats tab.' : 'Click a point to pin it · Ctrl-click adds more · Esc clears · double-click a legend entry to style it · right-click for more');
+    const hint = h('span', { class: 'dim hint-line', title: kindOf(f) === 'tt' ? '' : 'Click a point to pin it · Ctrl-click adds more · Esc clears · double-click a legend label, title or axis title to rename it · Alt-click a legend entry (or Series → Style & legend) to change its appearance · drag the legend/results box to move it · right-click for more' },
+      kindOf(f) === 'tt' ? 'Click a sample to inspect its timing. Set windows A/B in the Stats tab.' : 'Click to pin a point · double-click any text to edit · right-click for more');
     hint.dataset.def = hint.textContent; readoutLive = hint;
     fftEl = f.layers.fft ? h('span', { class: 'mono' }) : null;
     row.append(hint, fftEl, h('span', { class: 'sp' }), h('button', { class: 'btn sm', title: 'Copy the processed data (and fit, residual) as a tab-separated table', onclick: () => copyData(f) }, 'Copy data'));
@@ -519,7 +643,7 @@ function readout(f) {
   } else {
     const sem = d?.proc?.sem?.[p.i];
     if (sem) row.append(h('span', { class: 'mono dim' }, `± ${fmt(sem, 3)} SEM`));
-    if (fit) { const j = fit.x.findIndex((v) => Math.abs(v - p.x) < 1e-9 * Math.max(1, Math.abs(v))); if (j >= 0) row.append(h('span', { class: 'mono dim' }, `fit ${fmt(fit.y_fit[j], 6)}`)); }
+    if (fit) { const nativeX = xDisplay(f, comparisonFiles(f)).inverse(p.x); const j = fit.x.findIndex((v) => Math.abs(v - nativeX) < 1e-9 * Math.max(1, Math.abs(v))); if (j >= 0) row.append(h('span', { class: 'mono dim' }, `fit ${fmt(fit.y_fit[j], 6)}`)); }
     if (f.pins.length > 1) { const q = f.pins[f.pins.length - 2]; row.append(h('span', { class: 'mono dim' }, `Δx ${fmt(p.x - q.x, 6)} · Δy ${fmt(p.y - q.y, 5)}`)); }
     row.append(h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: () => excludePins(f) }, `Exclude ${f.pins.length > 1 ? f.pins.length + ' points' : 'point'}`));
   }
@@ -535,30 +659,33 @@ function mapToolbar(f) {
   const set = (patch) => { Object.assign(M, patch); emit(); };
   const cms = ['viridis', 'magma', 'cividis', 'parula', 'gray'];
   const layouts = [['single', 'Single'], ...(f.info.detectors.length > 1 ? [['side', 'Side by side']] : []), ['overlay', 'RGB overlay'], ['maps+overlay', 'Maps + overlay']];
-  return h('div', { style: 'display:flex;flex-direction:column;gap:8px;flex:none' },
-    h('div', { class: 'row wrap', style: 'justify-content:space-between' },
+  // Everyday controls on one row; the less-changed display settings collapse behind a summary of their current values.
+  const summary = `${M.cmap} · ${M.plo}–${M.phi}% · ${M.scale} · ${M.geometry === 'square' ? 'square' : 'physical'} pixels${M.swap ? ' · swapped' : ''}`;
+  return h('div', { style: 'display:flex;flex-direction:column;gap:6px;flex:none' },
+    h('div', { class: 'row wrap', style: 'gap:6px' },
       seg(layouts, M.layout, async (v) => { M.prevLayout = M.layout; M.layout = v; if (v.includes('overlay')) await ensureOverlay(f); emit(); }),
-      h('div', { class: 'row', style: 'gap:2px' },
-        h('button', { class: 'ibtn', title: 'Reset view (Ctrl+Home)', onclick: () => resetView(f) }, icon('home')),
-        h('button', { class: `ibtn ${f.tool !== 'pan' ? 'on' : ''}`, title: 'Box zoom', onclick: () => setTool(f, 'zoom') }, icon('zoom')),
-        h('button', { class: `ibtn ${f.tool === 'pan' ? 'on' : ''}`, title: 'Pan', onclick: () => setTool(f, 'pan') }, icon('pan')),
-        h('span', { class: 'sep' }),
-        h('button', { class: 'btn', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), 'Edit plot'),
-        h('button', { class: 'btn', onclick: () => copyFigure(f) }, icon('copy', 14), 'Copy', h('span', { class: 'kbd' }, 'Ctrl Shift C')))),
+      h('label', { class: 'row', style: 'gap:4px', title: 'Colormap' }, h('span', { class: 'cm on', style: `background:linear-gradient(90deg,${CMAP_GRADIENT[M.cmap] || CMAP_GRADIENT.viridis});width:34px` }),
+        select(['viridis', 'parula', 'cividis', 'magma', 'inferno', 'plasma', 'turbo', 'coolwarm', 'RdBu', 'gray'], M.cmap, (v) => set({ cmap: v }), { style: 'width:92px;height:28px', 'aria-label': 'Colormap' })),
+      seg([['none', 'No cut'], ['h', 'Horiz.'], ['v', 'Vert.'], ['cross', 'Both'], ['line', 'Line']], M.linecut, (v) => { if (v !== 'none' && v !== 'line' && !M.cursor) M.cursor = peakCell(f, f.detector); set({ linecut: v }); }),
+      h('button', { class: 'btn sm', title: 'Put the cursor (and linecuts) on the brightest cell', onclick: () => { M.cursor = peakCell(f, f.detector); if (M.linecut === 'none') M.linecut = 'h'; emit(); } }, 'Cut at peak'),
+      h('button', { class: 'btn sm', title: 'Put the cursor (and linecuts) on the darkest cell', onclick: () => { M.cursor = peakCell(f, f.detector, true); if (M.linecut === 'none') M.linecut = 'h'; emit(); } }, 'Cut at dip'),
+      h('span', { class: 'sp' }),
+      h('button', { class: 'ibtn', title: 'Reset view (Ctrl+Home)', onclick: () => resetView(f) }, icon('home')),
+      h('button', { class: `ibtn ${f.tool !== 'pan' ? 'on' : ''}`, title: 'Box zoom', onclick: () => setTool(f, 'zoom') }, icon('zoom')),
+      h('button', { class: `ibtn ${f.tool === 'pan' ? 'on' : ''}`, title: 'Pan', onclick: () => setTool(f, 'pan') }, icon('pan')),
+      h('button', { class: 'btn', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), 'Edit plot'),
+      h('button', { class: 'btn', title: 'Copy figure (Ctrl+Shift+C)', onclick: () => copyFigure(f) }, icon('copy', 14), 'Copy')),
+    h('details', { class: 'map-display', open: !!M.displayOpen, ontoggle: (e) => { M.displayOpen = e.target.open; } },
+      h('summary', { title: 'Colour range, shared colour scale, pixel geometry, axis swap' }, `Display · ${summary}`),
     h('div', { class: 'mapbar' },
       h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'lbl' }, 'Colormap'),
-        cms.map((c) => h('button', { class: `cm ${M.cmap === c ? 'on' : ''}`, title: c, 'aria-label': c, style: `background:linear-gradient(90deg,${CMAP_GRADIENT[c]})`, onclick: () => set({ cmap: c }) })),
-        select(['viridis', 'parula', 'cividis', 'magma', 'inferno', 'plasma', 'turbo', 'coolwarm', 'RdBu', 'gray'], M.cmap, (v) => set({ cmap: v }), { style: 'width:96px;height:26px' })),
+        cms.map((c) => h('button', { class: `cm ${M.cmap === c ? 'on' : ''}`, title: c, 'aria-label': c, style: `background:linear-gradient(90deg,${CMAP_GRADIENT[c]})`, onclick: () => set({ cmap: c }) }))),
       h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'lbl' }, 'Range'),
         input(M.plo, (v) => set({ plo: num(v) ?? 1, limits: 'robust' }), { style: 'width:52px;height:26px', title: 'Low percentile' }), h('span', { class: 'dim' }, 'to'),
         input(M.phi, (v) => set({ phi: num(v) ?? 99.5, limits: 'robust' }), { style: 'width:58px;height:26px', title: 'High percentile' }), h('span', { class: 'dim' }, '%')),
       seg([['independent', 'Independent'], ['shared', 'Shared']], M.scale, (v) => set({ scale: v })),
       seg([['physical', 'Physical pixels'], ['square', 'Square']], M.geometry, (v) => { set({ geometry: v }); call('settings_set', { patch: { pixel_geometry: v } }, { quiet: true }); }),
-      h('button', { class: `btn ${M.swap ? '' : ''}`, onclick: () => { commit('swap axes'); M.swap = !M.swap; M.bounds = null; M.cursor = M.cursor ? [M.cursor[1], M.cursor[0]] : null; if (M.line) M.line = M.line.map((q) => [q[1], q[0]]); if (overlayCache[f.path]) ensureOverlay(f).then(emit); emit(); } }, `Swap ${swapLabel(f)}`),
-      seg([['none', 'No cut'], ['h', 'Horizontal'], ['v', 'Vertical'], ['cross', 'Both'], ['line', 'Line']], M.linecut, (v) => { if (v !== 'none' && v !== 'line' && !M.cursor) M.cursor = peakCell(f, f.detector); set({ linecut: v }); }),
-      h('button', { class: 'btn sm', onclick: () => { M.cursor = peakCell(f, f.detector); if (M.linecut === 'none') M.linecut = 'h'; emit(); } }, 'Cut at peak'),
-      h('button', { class: 'btn sm', onclick: () => { M.cursor = peakCell(f, f.detector, true); if (M.linecut === 'none') M.linecut = 'h'; emit(); } }, 'Cut at dip')),
-    mapReadout(f));
+      h('button', { class: `btn ${M.swap ? '' : ''}`, onclick: () => { commit('swap axes'); M.swap = !M.swap; M.bounds = null; M.cursor = M.cursor ? [M.cursor[1], M.cursor[0]] : null; if (M.line) M.line = M.line.map((q) => [q[1], q[0]]); if (overlayCache[f.path]) ensureOverlay(f).then(emit); emit(); } }, `Swap ${swapLabel(f)}`))));
 }
 
 const swapLabel = (f) => { const m = f.data[f.detector]?.map; return m ? `${friendlyAxis(m.x_label).split(' [')[0]} / ${friendlyAxis(m.y_label).split(' [')[0]}` : 'axes'; };
@@ -578,7 +705,7 @@ function mapReadout(f) {
     return row;
   }
   if (!f.map.cursor) {
-    const hint = h('span', { class: 'dim' }, 'Click the map to pin a cell and draw linecuts · scroll to zoom · drag to box-zoom · Ctrl+Home resets');
+    const hint = h('span', { class: 'dim hint-line', title: 'Click the map to pin a cell and draw linecuts · scroll to zoom · drag to box-zoom · double-click or Ctrl+Home resets' }, 'Click to pin a cell + linecuts · drag to zoom · double-click resets');
     hint.dataset.def = hint.textContent; readoutLive = hint;
     row.append(hint); return row;
   }
@@ -586,7 +713,7 @@ function mapReadout(f) {
   const d = displayMap(m, f.map.swap);
   row.append(h('span', { class: 'muted' }, 'Cursor'), h('span', { class: 'mono' }, `${friendlyAxis(d.xl).split(' [')[0]} ${f.map.cursor[0]}`), h('span', { class: 'mono' }, `${friendlyAxis(d.yl).split(' [')[0]} ${f.map.cursor[1]}`));
   (cuts || f.info.detectors.map((det) => ({ det, label: detLabel(f, det), value: (() => { const dd = displayMap(f.data[det].map, f.map.swap); return dd.z[nearest(dd.y, f.map.cursor[1])][nearest(dd.x, f.map.cursor[0])]; })() })))
-    .forEach((c) => row.append(h('span', { class: 'mono' }, `${c.label} ${fmt(c.value, 6)}${f.info.unit ? ' ' + f.info.unit : ''}`)));
+    .forEach((c) => row.append(h('span', { class: 'mono' }, `${c.label} ${fmt(c.value, 6)}${mapUnitSuffix(f)}`)));
   row.append(h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: () => { f.map.cursor = null; f.map.line = null; f.map.linecut = 'none'; emit(); } }, 'Clear'));
   return row;
 }
@@ -623,6 +750,48 @@ export function renderInspector(f, insp) {
   mount(insp, h('div', { class: 'tabs', role: 'tablist' }, tabs.map(([t, l]) => h('button', { class: f.tab === t ? 'on' : '', role: 'tab', onclick: () => { f.tab = t; emit('insp'); } }, l))), body);
 }
 
+function t1DisplayControl(f) {
+  const fit = f.fit[f.detector], n = t1Normalization(fit);
+  return seg([['original', 'Original units'], ['normalized', 'Normalized 1 − data']], displaySpace(f), (v) => {
+    commit('T1 display units'); f.display = { ...f.display, t1: v }; f.yrange = null;
+    if (f.style.y) { f.style.y.min = null; f.style.y.max = null; }
+    emit();
+  }, { disabled: n ? [] : ['original'] });
+}
+
+function overlaysCard(f) {
+  const paths = S.overlays.filter((p) => p !== f.path);
+  const rows = [f.path, ...paths].filter((p) => S.files[p]).map((p) => {
+    const o = S.files[p], det = o.info.detectors.includes(f.detector) ? f.detector : o.detector;
+    const r = o.fit[det], t1 = r?.params.find((q) => q.name === 'T1');
+    return { o, det, r, t1 };
+  });
+  return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
+    h('div', { class: 'row wrap' }, h('span', { class: 'lbl' }, `Overlays (${paths.length})`), h('span', { class: 'sp' }),
+      h('button', { class: 'btn sm', onclick: () => openOverlayPicker(f) }, 'Compare with…'), h('button', { class: 'btn sm', onclick: () => browseOverlays(f) }, 'Browse…')),
+    h('div', { class: 'note', title: 'Same observable and detector where available; otherwise the file’s active detector. Each normalized file uses its own lo/span. Data-derived normalization is marked in the legend. Maps and time traces use the Compare workspace.' }, 'Same observable/detector; each file keeps its own normalization (hover for details).'),
+    paths.map((p) => h('div', { class: 'row', title: p }, h('span', { class: 'ellip', style: 'flex:1' }, basename(p)),
+      h('button', { class: 'btn sm', onclick: () => { commit('remove comparison'); removeOverlay(p); } }, 'Remove'))),
+    paths.length ? check('Show compared fits (dashed, same colour)', f.display?.overlayFits !== false, (v) => { commit('compared fits visibility'); f.display = { ...f.display, overlayFits: v }; emit(); }) : null,
+    paths.length ? h('div', { class: 'row wrap' }, h('button', { class: 'btn sm', onclick: () => { commit('clear comparisons'); S.overlays = []; emit(); } }, 'Clear all'),
+      h('button', { class: 'btn sm', disabled: f.compareFitting, title: 'Copies the current fit settings and range. Each file keeps its own processing; existing fit results are replaced. Does not change the primary file.', onclick: async () => {
+        commit('fit compared files'); f.compareFitting = true; emit('insp');
+        try {
+          for (const p of paths) {
+            const o = S.files[p]; if (!o) continue;
+            try {
+              await fitSeries(f, o, { recordUndo: false });
+            } catch (e) { toast(`Fit skipped for ${basename(p)}: ${e.message}`, 'err'); }
+          }
+        } finally { f.compareFitting = false; emit(); }
+      } }, f.compareFitting ? 'Fitting…' : 'Fit compared files')) : null,
+    rows.some((r) => r.t1) ? h('table', { class: 'tbl', 'aria-label': 'T1 comparison results' },
+      h('tr', {}, h('th', {}, 'File / detector'), h('th', {}, 'T1 ± error'), h('th', {}, 'Unit')),
+      rows.map(({ o, det, r, t1 }) => h('tr', { title: `${o.path}\n${r?.selection || 'Not fit'}${o.fitStale ? '\nFit is from earlier settings' : ''}` },
+        h('td', { class: 'txt', style: 'max-width:145px;overflow-wrap:anywhere' }, `${o.info.name} · ${detLabel(o, det)}`),
+        h('td', {}, t1 ? displayValue(t1.value, t1.error, t1.unit || o.info.x_unit || 'ns', filePresentation(f, o)).text : 'Not fit'), h('td', {}, t1 ? displayValue(t1.value, t1.error, t1.unit || o.info.x_unit || 'ns', filePresentation(f, o)).unit : '—')))) : null);
+}
+
 // ---- ODMR display controls (rendering lives in plot1d.js; stored in f.display = { invert, xscale, xoffset })
 function displayControls(f) {
   f.display = f.display || { invert: false, xscale: 1, xoffset: 0 };
@@ -631,7 +800,7 @@ function displayControls(f) {
   return h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Display'),
     seg([[false, 'Peaks'], [true, 'Dips (invert)']], !!D.invert, (v) => upd({ invert: v })),
     h('div', { class: 'g2' }, field('Axis scale (×)', input(D.xscale ?? 1, (v) => upd({ xscale: num(v) || 1 }), { title: 'Displayed x = scale · x + offset' })),
-      field('Axis offset', input(D.xoffset ?? 0, (v) => upd({ xoffset: num(v) ?? 0 })))),
+      field(`Axis offset (native ${f.info.x_unit || 'axis units'})`, input(D.xoffset ?? 0, (v) => upd({ xoffset: num(v) ?? 0 })))),
     h('div', { class: 'note' }, 'Display only: the fit and exported numbers stay in the file\'s own units.'));
 }
 
@@ -648,11 +817,22 @@ const MODEL_HELP = {
   'Constant-frequency damped cosine': 'Classic damped cosine; useful as a reference.',
 };
 
+export function openFitSettingsDialog(o) {
+  const body = h('div', { style: 'overflow:auto;padding:14px' });
+  const shade = h('div', { class: 'modal-back', role: 'dialog', 'aria-label': `Fit settings ${o.info.name}` });
+  let off;
+  const close = () => { off?.(); document.removeEventListener('keydown', esc, true); shade.remove(); };
+  const esc = (e) => { if (e.key === 'Escape') close(); };
+  shade.append(h('div', { class: 'modal' }, h('div', { class: 'row', style: 'padding:12px' }, h('strong', {}, `Own settings · ${o.info.name}`), h('span', { class: 'sp' }), h('button', { class: 'btn sm primary', onclick: close }, 'Done')), body));
+  const draw = () => mount(body, fitTab(o));
+  off = subscribe(draw); draw(); document.body.append(shade); document.addEventListener('keydown', esc, true);
+}
+
 function fitTab(f) {
   const s = f.fitSpec;
   const fam = family(f);
   const fit = f.fit[f.detector];
-  const set = (patch, label = 'fit settings') => { commit(label); Object.assign(s, patch); emit('insp'); };
+  const set = (patch, label = 'fit settings') => { commit(label); Object.assign(s, patch); f.fitStale = !!Object.keys(f.fit).length; f.iterationFitsStale = true; emit('insp'); };
   const out = h('div', { style: 'display:flex;flex-direction:column;gap:12px' });
   const generic = [['Auto', `Auto · ${fam}`], ['GaussianPeaks', 'Gaussian peaks'], ['CustomModel', 'Custom expression']];
   if (kindOf(f) === 'tt') generic.splice(0, 1, ['Auto', 'TimeTraceDecay · background + A·exp(−t/τ)']);
@@ -670,6 +850,7 @@ function fitTab(f) {
       check('Multi-Lorentzian when several peaks are found', s.odmr_multi, (v) => set({ odmr_multi: v })),
       h('div', { class: 'g2' }, field('Centers from', input(s.odmr_ranges[0]?.[0] ?? '', (v) => set({ odmr_ranges: [[num(v), s.odmr_ranges[0]?.[1] ?? null]] }), { placeholder: 'any' })),
         field('to', input(s.odmr_ranges[0]?.[1] ?? '', (v) => set({ odmr_ranges: [[s.odmr_ranges[0]?.[0] ?? null, num(v)]] }), { placeholder: 'any' }))));
+      out.append(peakPickCard(f));
     } else if (fam === 'T1') {
       out.append(field('Preprocess', seg([['Auto', 'Auto'], ['Direct T1', 'Direct'], ['Normalize then 1-data', 'Normalize, 1 − data']], s.t1_prep, (v) => set({ t1_prep: v }))),
         field('Shape', seg([['Regular exponential', 'Exponential'], ['Stretched exponential', 'Stretched']], s.t1_family, (v) => set({ t1_family: v }))));
@@ -691,15 +872,16 @@ function fitTab(f) {
   }
   // range
   const fr = f.data[f.detector]?.proc?.x || [];
-  out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Fit range${f.info.type === 'TimeTrace' ? ' (s)' : ''}`),
-    h('div', { class: 'row' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(Math.min(...fr.filter(Number.isFinite)), 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
+  const splitAt = out.children.length; // everything appended from here on is secondary (moved below the results)
+  out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Fit range (native ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'})`),
+    h('div', { class: 'row wrap', style: 'gap:4px' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(Math.min(...fr.filter(Number.isFinite)), 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
       input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { placeholder: fr.length ? fmt(Math.max(...fr.filter(Number.isFinite)), 5) : 'max', style: 'width:90px' }),
-      h('button', { class: 'btn sm', title: 'Use the current zoomed x range', onclick: () => set({ range_min: f.xrange?.[0] ?? null, range_max: f.xrange?.[1] ?? null }) }, 'Use view'),
+      h('button', { class: 'btn sm', title: 'Use the current zoomed x range', onclick: () => { const r = f.xrange?.map(f.info.type === 'TimeTrace' ? (v) => v * (f.tt.unit === 'min' ? 60 : 1) : xDisplay(f, comparisonFiles(f)).inverse).sort((a, b) => a - b); set({ range_min: r?.[0] ?? null, range_max: r?.[1] ?? null }); } }, 'Use view'),
       h('button', { class: 'btn sm', onclick: () => set({ range_min: null, range_max: null }) }, 'All'),
       h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const xs = fr.filter(Number.isFinite); const lo = Math.min(...xs), hi = Math.max(...xs); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
-      h('button', { class: 'btn sm', title: 'Clear the range so the experiment profile chooses it', onclick: () => set({ range_min: null, range_max: null }) }, 'Profile default'))));
+      h('button', { class: 'btn sm', title: 'Profile default: clear the range so the experiment profile chooses it', onclick: () => set({ range_min: null, range_max: null }) }, 'Profile'))));
   // options
-  const opts = h('details', { class: 'card pad' }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
+  const opts = h('details', { class: 'card pad', open: !!f.display.fitOptions, ontoggle: (e) => { f.display.fitOptions = e.target.open; } }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
     h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
       h('div', { class: 'g2' }, field('Multistart', input(s.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }))),
         fam === 'Rabi' ? field('Delay / dead time (ns)', input(s.dead_time_ns || '', (v) => set({ dead_time_ns: num(v) || 0 }), { placeholder: 'fit' })) : h('span')),
@@ -707,14 +889,17 @@ function fitTab(f) {
         check('Lock to π / π/2 times', s.pi_lock, (v) => set({ pi_lock: v })),
         s.pi_lock ? h('div', { class: 'g2' }, field('π (ns)', input(s.pi_ns, (v) => set({ pi_ns: num(v) }))), field('π/2 (ns)', input(s.pi2_ns, (v) => set({ pi2_ns: num(v) })))) : null] : null,
       sci.semAllCheck(f, set),
-      check('Fit smoothed data', s.fit_smoothed, (v) => set({ fit_smoothed: v })),
       f.proc.steps.length ? check('Fit the transformed data', s.fit_transformed, (v) => set({ fit_transformed: v })) : null,
       f.info.detectors.length > 1 ? field('Apply to', seg([[false, 'Active detector'], [true, 'Both detectors']], s.apply_both, (v) => set({ apply_both: v }))) : null));
-  out.append(presetCard(f));
-  out.append(h('div', { class: 'row' },
+  out.append(h('div', { class: 'card pad' }, check('Fit smoothed data', s.fit_smoothed, (v) => { if (v) f.layers.smooth = true; set({ fit_smoothed: v }); emit(); }),
+    h('div', { class: 'note', title: `Window ${f.data[f.detector]?.proc?.smoothing_window || 1} points (requested ${f.proc.smooth}; change in Process). Default off. Smoothing correlates neighbouring samples, so ordinary fit uncertainties are underestimated; no corrected estimate is supplied, and SEM weighting is disabled for smoothed fits.` },
+      s.fit_smoothed ? `${f.data[f.detector]?.proc?.smoothing_window || 1}-pt window · errors underestimated (hover for details)` : `${f.data[f.detector]?.proc?.smoothing_window || 1}-pt window (Process tab) · hover for caveats`)), opts, presetCard(f));
+  out.append(h('div', { class: 'row fit-run' },
     h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: f.fitting, onclick: () => runFit(f) }, f.fitting ? h('span', { class: 'spinner' }) : null, 'Run fit', h('span', { class: 'kbd' }, 'Ctrl F')),
     h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: f.fitting, title: 'Fits subsets of the data and keeps the candidate that best describes the full trace', onclick: () => runFit(f, { robust: true }) }, 'Robust fit', h('span', { class: 'kbd' }, 'Ctrl Shift F'))));
-  if (fit) out.append(resultCard(f, fit), paramCard(f, fit), sci.bootstrapCard(f, fit, () => {
+  if (kindOf(f) === '1d') out.append(iterationFitActions(f));
+  const primaryResults = fit ? [resultCard(f, fit), paramCard(f, fit)].filter(Boolean) : [];
+  if (fit) out.append(...primaryResults, sci.bootstrapCard(f, fit, () => {
     const hs = f.fitHistory.find((e) => e.res === fit);
     const spec = clone(hs ? hs.spec : f.fitSpec); spec.robust = false;
     if (spec.model === 'CustomModel') spec.custom_spec = customSpec(spec);
@@ -722,17 +907,24 @@ function fitTab(f) {
   }));
   if (fam === 'ODMR' && kindOf(f) === '1d') out.append(sci.nvFieldCard(f, () => { const spec = clone(f.fitSpec); spec.robust = false; return spec; }));
   if (f.fitHistory.length > 1) out.append(historyCard(f));
+  // Most-used first: model choice, then Run fit and its result; range/smoothing/options/presets/iterations follow.
+  const anchor = out.children[splitAt], run = out.querySelector('.fit-run');
+  if (anchor && run) { out.insertBefore(run, anchor); primaryResults.forEach((el) => el instanceof Node && out.insertBefore(el, anchor)); }
   return out;
 }
 
 function resultCard(f, fit) {
   const lines = resultLines(fit, f.info).filter((l) => l.key !== 'r2');
-  const tiles = lines.slice(0, 6).map((l) => h('div', { class: 'metric' }, h('div', { class: 'lbl' }, l.label),
-    h('div', { class: 'val' }, l.err ? fmtPm(l.value, l.err).split(' ± ')[0] : fmt(l.value, 5), l.unit ? h('small', {}, ' ' + l.unit) : null),
-    l.err ? h('div', { class: 'sub' }, `± ${fmt(l.err, 2)}`) : (l.key === 'pi_time_ns' && fit.metrics.programmed_pi_time_ns ? h('div', { class: 'sub' }, `programmed ${fmt(fit.metrics.programmed_pi_time_ns, 4)} ns`) : l.key === 'pi_over_2_time_ns' && fit.metrics.programmed_pi_over_2_time_ns ? h('div', { class: 'sub' }, `programmed ${fmt(fit.metrics.programmed_pi_over_2_time_ns, 4)} ns`) : null)));
+  const tiles = lines.slice(0, 6).map((l) => {
+    const d = displayValue(l.value, l.err, l.unit, filePresentation(f, f)), parts = d.text.split(' ± ');
+    return h('div', { class: 'metric' }, h('div', { class: 'lbl' }, l.label),
+      h('div', { class: 'val' }, parts[0], d.unit ? h('small', {}, ' ' + d.unit) : null),
+      d.error ? h('div', { class: 'sub' }, `± ${parts[1]} ${d.unit}`) : (l.key === 'pi_time_ns' && fit.metrics.programmed_pi_time_ns ? h('div', { class: 'sub' }, `programmed ${fmt(fit.metrics.programmed_pi_time_ns, 4)} ns`) : l.key === 'pi_over_2_time_ns' && fit.metrics.programmed_pi_over_2_time_ns ? h('div', { class: 'sub' }, `programmed ${fmt(fit.metrics.programmed_pi_over_2_time_ns, 4)} ns`) : null));
+  });
   const card = h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:10px' },
     h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, `Result${f.info.detectors.length > 1 ? ' · ' + detLabel(f, f.detector) : ''}`), h('span', { class: 'sp' }), h('span', { class: `pill ${fit.status}`, title: fit.reason }, fit.status)),
-    h('div', { class: 'note' }, `${fit.model} · ${fit.selection || ''}`),
+    h('div', { class: 'note' }, `${fit.model} · ${fitTargetLabel(fit)} · ${fit.selection || ''}`),
+    fit.provenance?.uncertainty_note ? h('div', { class: 'note' }, fit.provenance.uncertainty_note) : null,
     tiles.length ? h('div', { class: 'g2' }, tiles) : null,
     h('div', { class: 'kv' }, h('span', { class: 'k' }, 'R²'), h('span', { class: 'v' }, fmt(fit.r2, 5)), h('span', { class: 'k' }, 'RMSE'), h('span', { class: 'v' }, fmt(fit.rmse, 4)),
       h('span', { class: 'k' }, 'Durbin–Watson'), h('span', { class: 'v' }, fmt(fit.dw, 3)), h('span', { class: 'k' }, 'AIC / BIC'), h('span', { class: 'v' }, `${fmt(fit.aic, 5)} / ${fmt(fit.bic, 5)}`),
@@ -748,14 +940,15 @@ function resultCard(f, fit) {
 }
 
 function slidesTable(f, fit) {
-  const rows = [['Quantity', 'Value', 'Unit']];
-  resultLines(fit, f.info).forEach((l) => rows.push([l.label, l.err ? fmtPm(l.value, l.err) : fmt(l.value, 5), l.unit || '']));
+  const rows = [['Quantity', 'Value', 'Unit'], ['Fit target', fitTargetLabel(fit), '']];
+  if (fit.provenance?.uncertainty_note) rows.push(['Uncertainty warning', fit.provenance.uncertainty_note, '']);
+  resultLines(fit, f.info).forEach((l) => { const d = displayValue(l.value, l.err, l.unit, filePresentation(f, f)); rows.push([l.label, d.text, d.unit]); });
   return rows.map((r) => r.join('\t')).join('\n');
 }
 function notebookText(f, fit) {
-  const lines = [`${f.info.name}${f.info.detectors.length > 1 ? ` (${detLabel(f, f.detector)})` : ''}`, `${fit.model}, ${MODE_LABEL[f.mode]}, R² = ${fmt(fit.r2, 4)} (${fit.status})`];
-  resultLines(fit, f.info).filter((l) => l.key !== 'r2').forEach((l) => lines.push(`  ${l.label} = ${l.err ? fmtPm(l.value, l.err) : fmt(l.value, 5)}${l.unit ? ' ' + l.unit : ''}`));
-  if (f.fitSpec.range_min !== null || f.fitSpec.range_max !== null) lines.push(`  fit range ${f.fitSpec.range_min ?? 'start'} to ${f.fitSpec.range_max ?? 'end'}`);
+  const lines = [`${f.info.name}${f.info.detectors.length > 1 ? ` (${detLabel(f, f.detector)})` : ''}`, `${fit.model}, ${MODE_LABEL[f.mode]}, R² = ${fmt(fit.r2, 4)} (${fit.status})`, fitTargetLabel(fit), fit.provenance?.uncertainty_note || ''];
+  resultLines(fit, f.info).filter((l) => l.key !== 'r2').forEach((l) => lines.push(`  ${l.label} = ${displayValue(l.value, l.err, l.unit, filePresentation(f, f)).withUnit}`));
+  if (f.fitSpec.range_min !== null || f.fitSpec.range_max !== null) lines.push(`  fit range ${f.fitSpec.range_min ?? 'start'} to ${f.fitSpec.range_max ?? 'end'} ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'} (native)`);
   lines.push(`  ${f.path}`);
   return lines.join('\n');
 }
@@ -767,10 +960,14 @@ function paramCard(f, fit) {
   card.append(h('div', { class: 'row', style: 'margin-bottom:4px' }, h('span', { style: 'font-weight:600' }, 'Parameters'), h('span', { class: 'sp' }),
     seg([['res', 'Result'], ['seed', 'Seeds & bounds']], f.pv, (v) => { f.pv = v; emit('insp'); })));
   if (f.pv === 'res') {
-    card.append(h('table', { class: 'tbl' }, fit.params.map((p) => h('tr', { title: p.desc },
-      h('td', { class: 'txt', style: 'color:var(--text2)' }, `${p.name}${p.unit && p.unit !== '-' ? ` (${p.unit})` : ''}`),
-      h('td', {}, fmt(p.value, 6)), h('td', { style: 'color:var(--text3)' }, p.error ? `± ${fmt(p.error, 2)}` : 'n/a'),
-      h('td', { style: 'width:14px;color:var(--warn)', title: p.bound_hit ? 'At a bound' : '' }, p.bound_hit ? '⚑' : '')))));
+    card.append(h('table', { class: 'tbl' }, fit.params.map((p) => {
+      const d = displayValue(p.value, p.error, parameterUnit(p, f.info), filePresentation(f, f));
+      return h('tr', { title: `${p.desc}\nNative: ${p.value} ${parameterUnit(p, f.info)}; seeds/bounds use native units.` },
+        h('td', { class: 'txt', style: 'color:var(--text2)' }, `${p.name}${d.unit && d.unit !== '-' ? ` (${d.unit})` : ''}`),
+        h('td', {}, d.text), h('td', { style: 'color:var(--text3)' }, d.error ? '' : 'n/a'),
+        h('td', { style: 'width:14px;color:var(--warn)', title: p.bound_hit ? 'At a bound' : '' }, p.bound_hit ? '⚑' : ''));
+    })));
+    if (isNormalizedT1(fit)) card.append(h('div', { class: 'note', style: 'margin-top:6px' }, 'A and y0 remain in normalized 1 − data space. Time/frequency values above are display-scaled only; fitting, seeds and bounds remain in the labelled native units.'));
     if (fit.params.some((p) => !p.error)) card.append(h('div', { class: 'note', style: 'margin-top:6px' }, 'n/a: the covariance gives no usable standard error for this parameter (degenerate or at a bound).'));
   } else {
     s.params = s.params || {};
@@ -778,7 +975,7 @@ function paramCard(f, fit) {
       fit.params.map((p) => {
         const e = s.params[p.name] || {};
         const upd = (patch) => { commit('parameter bounds'); s.params[p.name] = { ...e, ...patch }; emit('insp'); };
-        return h('tr', {}, h('td', { class: 'txt' }, p.name), h('td', {}, input(e.value ?? '', (v) => upd({ value: num(v) }), { placeholder: fmt(p.value, 4) })),
+        return h('tr', {}, h('td', { class: 'txt' }, `${p.name}${parameterUnit(p, f.info) ? ` (${parameterUnit(p, f.info)})` : ''}`), h('td', {}, input(e.value ?? '', (v) => upd({ value: num(v) }), { placeholder: fmt(p.value, 4) })),
           h('td', {}, input(e.min ?? '', (v) => upd({ min: num(v) }), { placeholder: '–' })), h('td', {}, input(e.max ?? '', (v) => upd({ max: num(v) }), { placeholder: '–' })),
           h('td', {}, h('input', { type: 'checkbox', checked: !!e.lock, 'aria-label': `Lock ${p.name}`, onchange: (ev) => upd({ lock: ev.target.checked, value: e.value ?? p.value }) })));
       })),
@@ -840,18 +1037,11 @@ function procTab(f) {
   const d = f.data[f.detector];
   const its = d?.iterations;
   const out = h('div', { style: 'display:flex;flex-direction:column;gap:14px' });
-  if (its) {
-    const sel = new Set(f.iterSel?.length ? f.iterSel : its.values.map((_, i) => i));
-    out.append(h('div', { class: 'f' }, h('div', { class: 'row' }, h('span', { class: 'lbl' }, 'Iterations shown'), h('span', { class: 'sp' }), h('span', { class: 'mono dim' }, `${sel.size} / ${its.count}`)),
-      h('div', { style: `display:grid;grid-template-columns:repeat(${Math.min(its.count, 20)},minmax(0,1fr));gap:2px` },
-        its.values.map((_, i) => h('button', { title: `Iteration ${i + 1}`, style: `height:16px;border:0;border-radius:2px;cursor:pointer;background:${sel.has(i) ? '#3A6AA8' : '#2A2F3A'}`,
-          onclick: () => { sel.has(i) ? sel.delete(i) : sel.add(i); f.iterSel = [...sel].sort((a, b) => a - b); f.layers.iter = true; emit(); } }))),
-      h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => { f.iterSel = null; emit(); } }, 'All'), h('button', { class: 'btn sm', onclick: () => { f.iterSel = [its.count - 1]; f.layers.iter = true; emit(); } }, 'Latest'),
-        h('span', { class: 'note' }, 'Iteration display only; the analysed trace is the file\'s mean of complete iterations.'))));
-  }
+  if (kindOf(f) === '1d') out.append(iterationCard(f), iterationFitActions(f),
+    h('button', { class: 'btn block', onclick: () => openCombineDialog(f) }, 'Combine runs…'));
   out.append(h('div', { class: 'g2' },
     field('Bin size', input(f.proc.bin, (v) => setProc(f, { bin: Math.max(1, Math.round(num(v) || 1)) }))),
-    field(kindOf(f) === 'tt' ? 'Smoothing (points)' : 'Smoothing window', input(f.proc.smooth, (v) => { f.proc.smooth = Math.max(1, Math.round(num(v) || 1)); f.layers.smooth = f.proc.smooth > 1; setProc(f, {}); }))));
+    field(kindOf(f) === 'tt' ? 'Smoothing (points)' : 'Smoothing window', input(f.proc.smooth, (v) => { const smooth = Math.max(1, Math.round(num(v) || 1)); f.layers.smooth = smooth > 1; setProc(f, { smooth }); }))));
   out.append(h('div', { class: 'g2' }, field('Data from', input(f.proc.roi_min ?? '', (v) => setProc(f, { roi_min: num(v) }), { placeholder: 'start' })), field('to', input(f.proc.roi_max ?? '', (v) => setProc(f, { roi_max: num(v) }), { placeholder: 'end' }))));
   const nEx = f.proc.excluded.length + f.proc.exclusion_ranges.length;
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Excluded points'),
@@ -885,8 +1075,7 @@ function procTab(f) {
     select([['', 'Add step…'], ...KINDS], '', (v) => { if (v) setProc(f, { steps: [...clone(f.proc.steps), { kind: v, params: {}, enabled: true }] }, 'add transform'); }, { style: 'width:120px;height:26px' })),
   stepRows.length ? stepRows : h('div', { class: 'note' }, 'Steps change only the analysed copy. Fits use the untransformed data unless "Fit the transformed data" is ticked in Fit › Options.')));
   if (kindOf(f) === '1d') out.append(sci.deerCard(f));
-  out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Overlays'), h('div', { class: 'note' }, 'Tick other 1D files in the Library to overlay them. Overlays follow this file\'s detector and observable.'),
-    S.overlays.filter((p) => p !== f.path).map((p) => h('div', { class: 'row' }, h('span', { class: 'ellip', style: 'flex:1' }, basename(p)), h('button', { class: 'btn sm', onclick: () => { S.overlays = S.overlays.filter((q) => q !== p); emit(); } }, 'Remove')))));
+  if (kindOf(f) === '1d') out.append(overlaysCard(f));
   return out;
 }
 
@@ -896,11 +1085,14 @@ function plotTab(f) {
   const set = (patch) => { commit('plot style'); Object.assign(st, patch); emit(); };
   const s = baseStyle(st);
   return h('div', { style: 'display:flex;flex-direction:column;gap:12px' },
+    kindOf(f) === '1d' ? overlaysCard(f) : null,
+    isNormalizedT1(f.fit[f.detector]) ? field('T1 display units', t1DisplayControl(f)) : null,
     field('Title', input(st.title || '', (v) => set({ title: v }), { placeholder: 'None (double-click the plot to edit)' })),
     h('div', { class: 'g2' }, field('X label', input(st.x?.title ?? xTitle(f), (v) => set({ x: { ...(st.x || {}), title: v } }))), field('Y label', input(st.y?.title ?? (kindOf(f) === 'tt' ? '' : yTitle(f)), (v) => set({ y: { ...(st.y || {}), title: v } })))),
     h('div', { class: 'g2' }, field('X range', input(st.x?.min != null ? `${st.x.min}, ${st.x.max}` : 'auto', (v) => { const p = v.split(/[,;\s]+/).map(num); set({ x: { ...(st.x || {}), min: p[0] ?? null, max: p[1] ?? null } }); })),
       field('Y range', input(st.y?.min != null ? `${st.y.min}, ${st.y.max}` : 'auto', (v) => { const p = v.split(/[,;\s]+/).map(num); set({ y: { ...(st.y || {}), min: p[0] ?? null, max: p[1] ?? null } }); }))),
     field('Style preset', seg([['presentation', 'Presentation'], ['paper', 'Paper'], ['dense', 'Dense']], s.preset, (v) => import('./ploteditor.js').then((m) => m.applyPreset(f, v)))),
+    styleToolsBox(f),
     field('Legend', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['lr', 'Lower right'], ['outside', 'Outside'], ['hidden', 'Hidden']], f.layers.legend ? s.legend.pos : 'hidden',
       (v) => { commit('legend'); if (v === 'hidden') f.layers.legend = false; else { f.layers.legend = true; st.legend = { ...(st.legend || {}), pos: v, x: null, y: null }; } emit(); })),
     kindOf(f) === '1d' ? field('Results box', seg([['off', 'Off'], ['compact', 'Compact'], ['pm', 'With errors']], !f.layers.results ? 'off' : (s.results.format === 'pm' ? 'pm' : 'compact'),
@@ -965,7 +1157,12 @@ export async function saveResults(f) {
   const res = await call('export', { req: {
     output_dir: dir, stem: stemName, images, dpi: st.dpi, source: f.path, detector: f.detector, mode: f.mode, processing: f.proc, fit_spec: f.fitSpec,
     fit: fit ? { ...fit, raw: undefined, dense: undefined } : null, json: e.json, csv: e.csv && !!fit, origin: e.origin, detectors_raw: e.detectors_raw, time_trace: e.time_trace,
-    spots: spotsRows, spots_csv: e.spots_csv && spotsRows?.length, plot_state: { style: f.style, layers: f.layers, sample: f.sample, display: f.display },
+    provenance: f.data[f.detector]?.provenance, iteration_fits: f.iterationFits, combined_recipe: f.combinedRecipe,
+    spots: spotsRows, spots_csv: e.spots_csv && spotsRows?.length,
+    extra_csv: k === '1d' && e.csv ? { '_comparison.csv': comparisonCSV(f), ...(f.iterationFits?.[f.detector] ? { '_iterations.csv': iterationCSV(f) } : {}) } : undefined,
+    plot_state: { style: f.style, layers: f.layers, sample: f.sample, display: f.display, xrange: f.xrange, yrange: f.yrange,
+      comparison: k === '1d' ? comparisonRows(f) : undefined,
+      series: k === '1d' ? comparisonFiles(f).map((o) => ({ path: o.path, mode: o.mode, detector: o.detector, processing: o.proc, fit_spec: o.fitSpec, fit: Object.fromEntries(Object.entries(o.fit).map(([det, r]) => [det, { ...r, raw: undefined }])) })) : undefined },
     map_comparison_csv: e.map_csv && overlayCache[f.path], map_comparison_request: k === '2d' && overlayCache[f.path] ? [{ path: f.path, detector: f.detector, mode: f.mode }, { ...(M.compareWith || { path: f.path, detector: f.info.detectors.find((x) => x !== f.detector) }), mode: f.mode }, { shared: M.overlayScale === 'shared', background: M.background, palette: M.palette }] : null,
   } }, { label: 'Saving results' });
   if (reportImgs) await call('export', { req: { output_dir: dir, stem: `${stemName}_report`, images: reportImgs, dpi: st.dpi, json: false } }, { label: 'Saving report PDF' });
@@ -989,11 +1186,11 @@ function reportPicker(f) {
 
 function reportFigure(f, fig, fit) {
   const has = (k) => !f.reportKeys || f.reportKeys.includes(k);
-  const lines = resultLines(fit, f.info).filter((l) => has(l.key)).map((l) => `${l.label} = ${l.err ? fmtPm(l.value, l.err) : fmt(l.value, 5)}${l.unit ? ' ' + l.unit : ''}`);
-  const params = fit.params.map((p) => `${p.name} = ${fmt(p.value, 5)}${p.error ? ' ± ' + fmt(p.error, 2) : ''}`);
+  const lines = resultLines(fit, f.info).filter((l) => has(l.key)).map((l) => `${l.label} = ${displayValue(l.value, l.err, l.unit, filePresentation(f, f)).withUnit}`);
+  const params = fit.params.map((p) => `${p.name} = ${displayValue(p.value, p.error, parameterUnit(p, f.info), filePresentation(f, f)).withUnit}`);
   const sam = f.sample || {};
   const sampleLine = [sam.id, sam.condition, sam.power, sam.date].filter(Boolean).join(' · ');
-  const txt = [`<b>${f.info.name}</b>`, sampleLine || null, has('model') ? `${fit.model} · ${MODE_LABEL[f.mode]}` : null, has('model') ? `Status ${fit.status}` : null, '', ...lines,
+  const txt = [`<b>${f.info.name}</b>`, sampleLine || null, fitTargetLabel(fit) || null, fit.provenance?.uncertainty_note ? 'Smoothed: ordinary errors underestimated; no correction.' : null, has('model') ? `${fit.model} · ${MODE_LABEL[f.mode]}` : null, has('model') ? `Status ${fit.status}` : null, '', ...lines,
     has('params') ? '<br><b>Parameters</b>' : null, ...(has('params') ? params : []),
     has('rmse') || has('aicbic') ? '' : null, has('rmse') ? `RMSE ${fmt(fit.rmse, 4)} · DW ${fmt(fit.dw, 3)}` : null, has('aicbic') ? `AIC ${fmt(fit.aic, 5)} · BIC ${fmt(fit.bic, 5)}` : null].filter((t) => t !== null).join('<br>');
   const layout = clone(fig.layout);

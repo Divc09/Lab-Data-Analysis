@@ -23,6 +23,16 @@ function percentile(values, p) {
   return v[lo] + (v[hi] - v[lo]) * (idx - lo);
 }
 
+// Colorbar/hover label for what the map actually shows: raw signal/reference sources are recorded counts; the
+// 'value' source is the selected observable (contrast is dimensionless, not counts/s).
+export function mapValueLabel(f) {
+  const src = f.map?.source || 'value', unit = f.info.unit || '';
+  if (src === 'signal' || src === 'reference') return `${src === 'signal' ? 'Signal' : 'Reference'}${unit ? ` [${unit}]` : ''}`;
+  if (f.mode === 'contrast') return 'Contrast [dimensionless]';
+  const name = { signal: 'Signal', reference: 'Reference', difference: 'Reference − signal' }[f.mode] || f.data[f.detector]?.map?.label || 'Value';
+  return `${name}${unit ? ` [${unit}]` : ''}`;
+}
+
 // Display arrays honoring axis swap. Returns {x, y, z, xl, yl}
 export function displayMap(m, swap, source = 'value') {
   const z0 = m.z[source] || m.z.value;
@@ -107,8 +117,8 @@ export function figureMaps(f, overlay) {
         type: 'heatmap', x: disp.x, y: disp.y, z, zmin, zmax, colorscale: cs, reversescale: !!(M.reverse ^ !!NEEDS_FLIP[M.cmap]),
         xaxis: `x${ax}`, yaxis: `y${ax}`, zsmooth: false, hoverongaps: false,
         colorbar: { x: dom[1] + 0.012, len: 0.9, thickness: 12, outlinewidth: 1, outlinecolor: '#2A2F3A', tickfont: { size: Math.round(st.base * 0.75) },
-          title: { text: f.info.unit || f.data[p.det].map.label || '', side: 'top', font: { size: Math.round(st.base * 0.72) } }, tickvals, ticktext, exponentformat: 'SI' },
-        hovertemplate: `${disp.xl} %{x:.6g}<br>${disp.yl} %{y:.6g}<br>%{z:.6g}<extra>${title}</extra>`, meta: { det: p.det },
+          title: { text: mapValueLabel(f), side: 'top', font: { size: Math.round(st.base * 0.72) } }, tickvals, ticktext, exponentformat: 'SI' },
+        hovertemplate: `${disp.xl} %{x:.6g}<br>${disp.yl} %{y:.6g}<br>%{z:.6g} · ${mapValueLabel(f)}<extra>${title}</extra>`, meta: { det: p.det },
       });
       if (M.showShapes || M.showCenters || M.showNumbers) {
         for (const s of visibleSpots(f, p.det)) {
@@ -137,13 +147,19 @@ export function figureMaps(f, overlay) {
     const dx = xs.length > 1 ? Math.abs(xs[1] - xs[0]) : 1, dy = ys.length > 1 ? Math.abs(ys[1] - ys[0]) : 1;
     // Never stretch: equal data units (physical) or equal pixel sizes (square).
     const ratio = M.geometry === 'square' ? dx / dy : 1;
-    const bounds = M.bounds || (p.kind === 'overlay' ? { x: [xs[0], xs[xs.length - 1]], y: [ys[0], ys[ys.length - 1]] } : {});
+    // Zoom linking goes through M.bounds (set from any panel's relayout), not Plotly `matches`: matching axes merges
+    // every panel into one equal-scale constraint group, and a one-axis zoom then squeezes a panel's domain to a sliver.
+    // Each panel keeps its own scaleanchor. Unlinked panels: the stored view applies to the first panel only.
+    const own = M.bounds && (i === 0 || M.link !== false) ? M.bounds : null;
+    const bounds = own || (p.kind === 'overlay' ? { x: [xs[0], xs[xs.length - 1]], y: [ys[0], ys[ys.length - 1]] } : {});
+    const okRange = (r) => Array.isArray(r) && r.length === 2 && r.every(Number.isFinite) && r[0] !== r[1];
     layout[`xaxis${ax}`] = { domain: dom, anchor: `y${ax}`, title: { text: friendlyAxis(disp.xl), standoff: 6 }, showline: true, mirror: true, linecolor: '#2A2F3A', ticks: 'outside', tickangle: 0, nticks: 4, showgrid: false, zeroline: false, constrain: 'domain',
-      range: bounds.x || undefined, autorange: bounds.x ? false : true, ...(i > 0 && M.link !== false && panels[0].kind === p.kind ? { matches: 'x' } : {}) };
-    const linked = i > 0 && M.link !== false && panels[0].kind === p.kind;
-    // A linked (matches) y axis inherits panel 1's equal-scale constraint; declaring scaleanchor too makes Plotly warn and ignore it.
-    layout[`yaxis${ax}`] = { anchor: `x${ax}`, ...(linked ? {} : { scaleanchor: `x${ax}`, scaleratio: ratio }), title: { text: i === 0 ? friendlyAxis(disp.yl) : '', standoff: 6 }, showline: true, mirror: true, linecolor: '#2A2F3A', ticks: 'outside', showgrid: false, zeroline: false, constrain: 'domain',
-      range: bounds.y || undefined, autorange: bounds.y ? false : true, ...(i > 0 && M.link !== false && panels[0].kind === p.kind ? { matches: 'y' } : {}) };
+      range: okRange(bounds.x) ? bounds.x : undefined, autorange: !okRange(bounds.x) };
+    // explicit full domain: otherwise uirevision keeps a domain the equal-scale constraint shrank on an earlier view
+    layout[`yaxis${ax}`] = { domain: [0, 1], anchor: `x${ax}`, scaleanchor: `x${ax}`, scaleratio: ratio, title: { text: i === 0 ? friendlyAxis(disp.yl) : '', standoff: 6 }, showline: true, mirror: true, linecolor: '#2A2F3A', ticks: 'outside', showgrid: false, zeroline: false, constrain: 'domain',
+      range: okRange(bounds.y) ? bounds.y : undefined, autorange: !okRange(bounds.y),
+      // linked panels share y values: label them once (otherwise panel 2's ticks collide with panel 1's colorbar)
+      ...(i > 0 && M.link !== false && panels[0].kind === p.kind ? { showticklabels: false } : {}) };
     annotations.push({ xref: `x${ax} domain`, yref: `y${ax} domain`, x: 0.5, y: 1.02, yanchor: 'bottom', text: `<b>${title}</b>`, showarrow: false, font: { size: Math.round(st.base * 0.9) } });
     if (M.cursor && p.kind === 'map') {
       const [cx, cy] = M.cursor;
@@ -220,6 +236,49 @@ export function peakCell(f, det, dip = false) {
   let best = dip ? Infinity : -Infinity, at = null;
   d.z.forEach((r, iy) => r.forEach((v, ix) => { if (Number.isFinite(v) && (dip ? v < best : v > best)) { best = v; at = [d.x[ix], d.y[iy]]; } }));
   return at;
+}
+
+// Remember each map panel's drawn ranges; mapRelayoutView needs the pre-zoom view of a one-axis zoom.
+export function rememberMapRanges(gd) {
+  const fl = gd._fullLayout;
+  if (!fl) return;
+  const out = {};
+  for (const k of Object.keys(fl)) {
+    const m = /^xaxis(\d*)$/.exec(k);
+    if (m && fl[`yaxis${m[1]}`]) out[m[1]] = { x: [...fl[k].range], y: [...fl[`yaxis${m[1]}`].range] };
+  }
+  gd._mapRanges = out;
+}
+
+// Map a plotly_relayout event from ANY map panel to a new shared view: {reset:true}, {x, y}, or null (not a zoom).
+// Equal-scale maps cannot zoom one axis: Plotly would keep the other range and squeeze the panel's domain to a sliver
+// (the "collapsed Detector 1" bug). A one-axis zoom becomes a uniform zoom by the same factor about the other axis's centre.
+export function mapRelayoutView(gd, ev) {
+  let panel = null, reset = false;
+  const r = { x: [], y: [] };
+  for (const [k, v] of Object.entries(ev || {})) {
+    const m = /^([xy])axis(\d*)\.(range|range\[0\]|range\[1\]|autorange)$/.exec(k);
+    if (!m) continue;
+    panel = panel ?? m[2];
+    if (m[2] !== panel) continue;
+    if (m[3] === 'autorange') { if (v) reset = true; continue; }
+    if (m[3] === 'range') r[m[1]] = [...v];
+    else r[m[1]][m[3] === 'range[0]' ? 0 : 1] = v;
+  }
+  if (reset) return { reset: true };
+  if (panel === null) return null;
+  const ok = (a) => a.length === 2 && a.every(Number.isFinite) && a[0] !== a[1];
+  const prev = gd._mapRanges?.[panel];
+  if (ok(r.x) && ok(r.y)) return { x: r.x, y: r.y };
+  if (!prev) return null;
+  const scaled = (newR, oldR, other) => {
+    const f = Math.abs(newR[1] - newR[0]) / Math.abs(oldR[1] - oldR[0]);
+    const c = (other[0] + other[1]) / 2, h = ((other[1] - other[0]) * f) / 2;
+    return [c - h, c + h];
+  };
+  if (ok(r.x)) return { x: r.x, y: scaled(r.x, prev.x, prev.y) };
+  if (ok(r.y)) return { x: scaled(r.y, prev.y, prev.x), y: r.y };
+  return null;
 }
 
 // Colorbars follow the drawn height of their (aspect-constrained) map.

@@ -1,5 +1,6 @@
 // Plot presentation model shared by every plot: defaults, user overrides, Plotly mapping.
 import { fmt, fmtPm } from './util.js';
+import { displayValue, parameterUnit, prettyUnit } from './unitdisplay.js';
 
 export const PALETTES = {
   lab: ['#1F5FBF', '#E06A1B', '#0E8A7E', '#B5307A', '#7A4FD6', '#6B7380', '#C9A227', '#111111'],
@@ -32,12 +33,17 @@ const AXIS_NAMES = {
   'rf frequency': 'RF frequency [GHz]', 'stage x': 'Stage X [um]', 'stage y': 'Stage Y [um]', 'stage z': 'Stage Z [um]',
 };
 // With a resolved unit (core.describe info.x_unit / axis_units) the label is "<name> [<unit>]"; without one the map above applies.
-export const friendlyAxis = (label, unit) => {
+// The acquisition names the swept time "duration"/"Pulse duration" for every pulsed sequence; only Rabi sweeps a pulse
+// length. Name it by experiment (the loaded label stays in the file and exports).
+const DURATION_NAMES = { T1: 'Wait time τ', SpinEcho: 'Evolution time τ', DynamicDecoupling: 'Evolution time τ', DEERDecay: 'Evolution time τ', Ramsey: 'Free precession τ' };
+export const friendlyAxis = (label, unit, type) => {
   const key = (label || '').trim().toLowerCase();
-  if (!unit) return AXIS_NAMES[key] || label || 'X';
-  const mapped = AXIS_NAMES[key];
+  if (DURATION_NAMES[type] && /^(pulse )?duration( \(ns\))?$/.test(key)) label = DURATION_NAMES[type] + (unit ? '' : ' [ns]');
+  const pretty = (s) => s.replace(/\[([^\]]*)\]/, (m, u) => `[${prettyUnit(u)}]`);
+  if (!unit) return pretty((DURATION_NAMES[type] && label.startsWith(DURATION_NAMES[type])) ? label : AXIS_NAMES[key] || label || 'X');
+  const mapped = DURATION_NAMES[type] && label.startsWith(DURATION_NAMES[type]) ? null : AXIS_NAMES[key];
   const base = (mapped || label || 'X').replace(/\s*[\[(][^\])]*[\])]\s*$/, '').trim() || 'X';
-  return `${base} [${unit}]`;
+  return `${base} [${prettyUnit(unit)}]`;
 };
 
 export const MODE_LABEL = { contrast: 'Contrast', signal: 'Signal', reference: 'Reference', difference: 'Difference' };
@@ -56,9 +62,11 @@ export function axisLayout(st, ax, autoTitle, { range, type } = {}) {
     exponentformat: 'power', separatethousands: false,
   };
   if (a.dtick) lay.dtick = a.dtick;
+  if (a.ticks?.length) { lay.tickmode = 'array'; lay.tickvals = a.ticks.map((t) => t.value); lay.ticktext = a.ticks.map((t) => t.text); }
+  else if (a.tick0 != null) lay.tick0 = a.tick0;
   if (a.minor) lay.minor = { ticks: st.ticks === 'none' ? '' : st.ticks, ticklen: 3, nticks: Number(a.minor) + 1, showgrid: false };
   const lo = a.min ?? range?.[0], hi = a.max ?? range?.[1];
-  if (lo !== null && lo !== undefined && hi !== null && hi !== undefined) { lay.range = a.log ? [Math.log10(lo), Math.log10(hi)] : [lo, hi]; lay.autorange = false; }
+  if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo && (!a.log || lo > 0)) { lay.range = a.log ? [Math.log10(lo), Math.log10(hi)] : [lo, hi]; lay.autorange = false; }
   else lay.autorange = true;
   return lay;
 }
@@ -71,10 +79,11 @@ export function legendLayout(st) {
     outside: { x: 1.02, y: 1, xanchor: 'left', yanchor: 'top' }, below: { x: 0.5, y: -0.18, xanchor: 'center', yanchor: 'top', orientation: 'h' },
   }[L.pos || 'ur'] || {};
   const lay = {
-    ...pos, bgcolor: 'rgba(255,255,255,0.92)', bordercolor: L.frame === false ? 'rgba(0,0,0,0)' : '#D9DDE4', borderwidth: 1,
-    font: { size: L.size || Math.round(st.base * 0.82) }, itemclick: 'toggle', itemdoubleclick: false,
+    ...pos, bgcolor: L.bg || 'rgba(255,255,255,0.92)', bordercolor: L.edge || '#D9DDE4', borderwidth: L.frame === false ? 0 : (L.borderwidth ?? 1),
+    title: L.title ? { text: L.title } : undefined,
+    font: { size: L.size || Math.round(st.base * 0.82), color: L.color || '#1D2330' }, itemclick: 'toggle', itemdoubleclick: false,
   };
-  if (L.x !== null && L.x !== undefined) { lay.x = L.x; lay.y = L.y; lay.xanchor = 'left'; lay.yanchor = 'top'; }
+  if (L.x !== null && L.x !== undefined) { lay.x = L.x; lay.y = L.y; lay.xanchor = L.xanchor || 'left'; lay.yanchor = L.yanchor || 'top'; }
   if (L.cols > 1) { lay.orientation = 'h'; lay.entrywidthmode = 'fraction'; lay.entrywidth = 1 / L.cols; }
   return lay;
 }
@@ -136,13 +145,30 @@ export function resultLines(fit, info) {
   for (const [k, lab, unit] of METRIC_LINES[fam] || []) {
     if (typeof m[k] === 'number') lines.push({ key: k, label: lab, value: m[k], err: m[`${k}_err`] ?? m[k.replace('_ns', '_ns_nominal') + '_err'], unit, defaultOff: !DEFAULT_ON.has(k) });
   }
+  if (fam === 'ODMR') for (const l of lines) if (['center_freq_units', 'fwhm_units', 'center_mean'].includes(l.key)) l.unit = info.x_unit || 'GHz';
+  if (fit.model.startsWith('T1')) {
+    const t1 = fit.params.find((p) => p.name === 'T1');
+    const line = lines.find((l) => l.key === 'T1_ns');
+    if (t1 && line) Object.assign(line, { value: t1.value, err: t1.error, unit: t1.unit || info.x_unit || 'ns' });
+    for (const p of fit.params.filter((p) => p.name === 'A' || p.name === 'y0')) lines.push({ key: `p:${p.name}`, label: `${p.name}${fit.extras?.t1_prep_mode === 'normalized_1_minus_data' ? ' (norm.)' : ''}`, value: p.value, err: p.error, unit: p.unit, defaultOff: true });
+  }
   if (fit.model === 'GaussianPeaks' || fit.model === 'TimeTraceDecay' || !lines.length) {
     for (const p of fit.params) {
-      let label = p.symbol || p.name, value = p.value, err = p.error, unit = p.unit === 'axis units' ? '' : (p.unit === '-' ? '' : p.unit);
+      let label = p.symbol || p.name, value = p.value, err = p.error, unit = p.unit === '-' ? '' : parameterUnit(p, info);
       if (p.name.startsWith('sigma_')) { label = `FWHM${p.name.slice(5)}`; value = p.value * 2.354820045; err = p.error ? p.error * 2.354820045 : null; }
       if (p.name.startsWith('amplitude_')) continue;
       lines.push({ key: `p:${p.name}`, label, value, err, unit });
     }
+  }
+  // Derived metrics often omit errors. Reuse a matching fitted parameter (and exact linear factor), never invent covariance.
+  const aliases = { T2_ns: ['T2', 1], T2_dd_ns: ['T2', 1], T2_star_ns: [fit.params.some((p) => p.name === 'T2_star') ? 'T2_star' : 'tau', 1], stretch_n: ['n', 1], center_freq_units: ['x0', 1], fwhm_units: ['w', 2], detuning_MHz: ['f', 1000] };
+  for (const l of lines) {
+    const alias = aliases[l.key], p = alias && fit.params.find((p) => p.name === alias[0]);
+    if (p && l.err == null) l.err = p.error == null ? null : p.error * alias[1];
+  }
+  if (fam === 'ODMR') for (const p of fit.params.filter((p) => /^(x0|w)_\d+$/.test(p.name))) {
+    const width = p.name.startsWith('w_');
+    lines.push({ key: `p:${p.name}`, label: width ? `FWHM ${p.name.slice(2)}` : `f0 ${p.name.slice(3)}`, value: p.value * (width ? 2 : 1), err: p.error == null ? null : p.error * (width ? 2 : 1), unit: info.x_unit || 'GHz', defaultOff: false });
   }
   lines.push({ key: 'r2', label: 'R²', value: fit.r2, unit: '', defaultOff: false });
   // A standard error many orders below the value comes from a degenerate covariance; do not show it.
@@ -153,18 +179,21 @@ export function resultLines(fit, info) {
 export function resultsAnnotation(st, fit, info, color = '#1D2330') {
   const lines = resultLines(fit, info);
   const cfg = st.results || {};
-  const shown = lines.filter((l) => (cfg.lines?.[l.key]?.plot ?? !l.defaultOff));
+  const all = [...lines, ...(cfg.static || []).map((l) => ({ ...l, static: true }))];
+  const order = cfg.order || [];
+  const shown = all.filter((l) => (cfg.lines?.[l.key]?.plot ?? !l.defaultOff)).sort((a, b) => (order.includes(a.key) ? order.indexOf(a.key) : order.length + all.indexOf(a)) - (order.includes(b.key) ? order.indexOf(b.key) : order.length + all.indexOf(b)));
   if (!shown.length) return null;
   const txt = shown.map((l) => {
-    const label = cfg.lines?.[l.key]?.label ?? l.label;
-    const val = cfg.format === 'pm' && l.err ? fmtPm(l.value, l.err) : fmt(l.value, 4);
-    return `${label} = ${val}${l.unit ? ' ' + l.unit : ''}`;
+    const line = cfg.lines?.[l.key] || {}, label = line.label ?? l.label;
+    if (l.static) return line.text ?? l.text ?? label;
+    const d = displayValue(l.value, l.err, l.unit, { format: line.format || cfg.format || 'pm', precision: line.precision || cfg.precision || 2, units: line.units || 'auto' });
+    return (line.template || '{label} = {value} {unit}').replaceAll('{label}', label).replaceAll('{value}', d.text).replaceAll('{unit}', d.unit).trim();
   }).join('<br>');
   const pos = { ul: [0.01, 0.99, 'left', 'top'], ur: [0.99, 0.99, 'right', 'top'], ll: [0.01, 0.01, 'left', 'bottom'], lr: [0.99, 0.01, 'right', 'bottom'] }[cfg.pos || 'ul'];
   return {
     xref: 'paper', yref: 'paper', x: cfg.x ?? pos[0], y: cfg.y ?? pos[1], xanchor: cfg.x != null ? 'left' : pos[2], yanchor: cfg.y != null ? 'top' : pos[3],
-    text: txt, showarrow: false, align: 'left', bgcolor: 'rgba(255,255,255,0.92)', bordercolor: '#D9DDE4', borderwidth: 1, borderpad: 6,
-    font: { family: 'IBM Plex Mono, Consolas, monospace', size: Math.round(st.base * 0.8), color }, name: 'results',
+    text: txt, showarrow: false, align: cfg.align || 'left', bgcolor: cfg.bg || 'rgba(255,255,255,0.92)', bordercolor: cfg.edge || '#D9DDE4', borderwidth: cfg.frame === false ? 0 : 1, borderpad: cfg.padding ?? 6,
+    font: { family: 'IBM Plex Mono, Consolas, monospace', size: cfg.size || Math.round(st.base * 0.8), color: cfg.color || color }, name: 'results',
   };
 }
 
