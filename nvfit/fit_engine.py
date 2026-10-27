@@ -47,7 +47,10 @@ def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
         return cov
     idx = np.flatnonzero(ok)
     js = jac[:, idx] / norms[idx]
-    _, sv, vt = np.linalg.svd(js, full_matrices=False)
+    # full_matrices so an underdetermined Jacobian (fewer rows than parameters) keeps its
+    # null directions; their singular values are zero and mark those parameters NaN below.
+    _, sv, vt = np.linalg.svd(js, full_matrices=True)
+    sv = np.concatenate([sv, np.zeros(vt.shape[0] - len(sv))])
     keep = sv > sv[0] * 1e-8
     inv_s2 = np.where(keep, 1.0 / np.where(keep, sv, 1.0) ** 2, 0.0)
     cov_s = (vt.T * inv_s2) @ vt
@@ -107,12 +110,28 @@ def fit_model_multistart(
 ) -> FitResult:
     lower_arr = np.asarray(list(lower), dtype=float)
     upper_arr = np.asarray(list(upper), dtype=float)
+    # A locked parameter arrives as lower == upper.  least_squares needs a strictly positive
+    # interval, so optimize only the free parameters and re-insert the fixed values.
+    fixed = upper_arr <= lower_arr
+    free = ~fixed
+    if not np.any(free):
+        raise ValueError("All fit parameters are locked; unlock at least one parameter to fit.")
+    fixed_vals = lower_arr.copy()
+
+    def full(p_free: np.ndarray) -> np.ndarray:
+        p = fixed_vals.copy()
+        p[free] = p_free
+        return p
+
     if weights is None:
         weights = np.ones_like(y, dtype=float)
     w_sqrt = np.sqrt(weights)
     if f_scale is None:
         y_span = float(np.percentile(y, 95) - np.percentile(y, 5))
         f_scale = max(1e-6, 0.08 * y_span)
+    if not isinstance(x_scale, str):
+        xs = np.asarray(x_scale, dtype=float)
+        x_scale = xs[free] if xs.ndim == 1 and xs.size == len(free) else x_scale
 
     best = None
     best_cost = np.inf
@@ -124,9 +143,9 @@ def fit_model_multistart(
         seed = np.clip(seed, lower_arr, upper_arr)
         try:
             res = least_squares(
-                lambda p: w_sqrt * (model_func(x, *p) - y),
-                seed,
-                bounds=(lower_arr, upper_arr),
+                lambda p: w_sqrt * (model_func(x, *full(p)) - y),
+                seed[free],
+                bounds=(lower_arr[free], upper_arr[free]),
                 loss=loss,
                 f_scale=f_scale,
                 max_nfev=max_nfev,
@@ -143,13 +162,21 @@ def fit_model_multistart(
         detail = failed_attempts[-1] if failed_attempts else "no optimizer attempts were available"
         raise RuntimeError(f"All {attempted} fit attempts failed: {detail}")
 
-    p_opt = best.x
+    p_opt = full(best.x)
     y_fit = model_func(x, *p_opt)
-    dof = len(y) - len(p_opt)
+    n_free = int(np.count_nonzero(free))
+    dof = len(y) - n_free
     # best.cost is the robust-loss sum for soft_l1 etc.; use the actual (weighted) residuals for s^2
     raw_cost = 0.5 * float(np.sum(np.square(best.fun)))
-    cov = _estimate_covariance(best.jac, raw_cost, dof=max(1, dof))
-    p_err = np.sqrt(np.maximum(np.diag(cov), 0.0))  # NaN propagates for unidentifiable parameters
+    p_err = np.zeros(len(p_opt))  # locked parameters are exact, not estimated
+    if dof >= 1:
+        cov = _estimate_covariance(best.jac, raw_cost, dof=dof)
+        p_err[free] = np.sqrt(np.maximum(np.diag(cov), 0.0))  # NaN propagates for unidentifiable parameters
+    else:
+        # no residual degrees of freedom: the data cannot estimate parameter uncertainty
+        p_err[free] = np.nan
+    hits = bound_hit_flags(p_opt, lower_arr, upper_arr)
+    hits = [bool(h and not f) for h, f in zip(hits, fixed)]
 
     message = str(best.message)
     if failed_attempts:
@@ -163,12 +190,13 @@ def fit_model_multistart(
         y_fit=y_fit,
         r2=r_squared(y, y_fit),
         rmse=rmse(y, y_fit),
-        aic=aic(y, y_fit, len(p_opt)),
-        bic=bic(y, y_fit, len(p_opt)),
+        aic=aic(y, y_fit, n_free),
+        bic=bic(y, y_fit, n_free),
         durbin_watson=durbin_watson(y - y_fit),
-        bound_hits=bound_hit_flags(p_opt, lower_arr, upper_arr),
+        bound_hits=hits,
         success=bool(best.success),
         message=message,
         selection_note=selection_note,
+        extras={"fixed_params": [n for n, f in zip(param_names, fixed) if f]} if np.any(fixed) else {},
     )
 

@@ -205,10 +205,16 @@ def global_fit(
     nsh, nfr = len(sh_idx), len(free_idx)
     lo_sh = np.array([max(b[1][i] for b in base) for i in sh_idx])
     hi_sh = np.array([min(b[2][i] for b in base) for i in sh_idx])
-    bad = lo_sh >= hi_sh  # incompatible per-dataset bounds -> use the union
-    if np.any(bad):
-        lo_sh[bad] = [min(b[1][i] for b in base) for i in np.array(sh_idx)[bad]]
-        hi_sh[bad] = [max(b[2][i] for b in base) for i in np.array(sh_idx)[bad]]
+    bad = lo_sh >= hi_sh  # no common open interval for a shared parameter
+    for pos in np.flatnonzero(bad):
+        k = sh_idx[pos]
+        if any(names[k] in bo for bo in bound_over):
+            # a requested bound is a constraint: never widen it silently
+            detail = ", ".join(f"dataset {j + 1}: [{b[1][k]:g}, {b[2][k]:g}]" for j, b in enumerate(base))
+            raise ValueError(f"Shared parameter '{names[k]}' has bounds with no common open interval across datasets ({detail}).")
+        # only automatic data-derived defaults conflict: use their union
+        lo_sh[pos] = min(b[1][k] for b in base)
+        hi_sh[pos] = max(b[2][k] for b in base)
     lower = np.concatenate([lo_sh] + [b[1][free_idx] for b in base])
     upper = np.concatenate([hi_sh] + [b[2][free_idx] for b in base])
 

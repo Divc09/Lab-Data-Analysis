@@ -162,10 +162,13 @@ def _apply_locks(
             lower[i] = lo
         if hi is not None:
             upper[i] = hi
+        if value is None or not np.isfinite(value):
+            continue
+        # a supplied value is the starting seed whether or not it is locked
+        seed[i] = value
         if is_locked:
             lower[i] = value
             upper[i] = value
-            seed[i] = value
 
 
 def _spin_echo_seed_and_bounds(exp_type: str, tspan: float) -> tuple[list[float], list[float], np.ndarray]:

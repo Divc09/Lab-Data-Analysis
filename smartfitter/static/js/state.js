@@ -157,6 +157,8 @@ export async function undo() { const e = undoStack.pop(); if (e) { await restore
 export async function redo() { const e = redoStack.pop(); if (e) { await restore(e, undoStack); toast(`Redid ${e.label || 'change'}`); } }
 export const canUndo = () => undoStack.length > 0;
 export const canRedo = () => redoStack.length > 0;
+// A replaced workspace starts a new history: undo must never restore another session's state.
+export function clearHistory() { undoStack.length = 0; redoStack.length = 0; }
 
 // ---- session documents ----
 export function sessionDoc() {
@@ -179,6 +181,7 @@ export function sessionDoc() {
 
 export async function applySession(doc) {
   const moved = doc.moved || {};
+  clearHistory();
   S.files = {};
   const remapSources = (value) => {
     if (!value || typeof value !== 'object') return;

@@ -105,6 +105,31 @@ def test_gui_overlay_preserves_geometry_and_survives_view_switches(window, tmp_p
     assert not window.test_messages
 
 
+def _assert_view_contains(axis, xlim, ylim):
+    # Equal-pixel maps keep a fixed axes box and widen one data range instead.
+    (x0, x1), (y0, y1) = sorted(axis.get_xlim()), sorted(axis.get_ylim())
+    assert x0 <= xlim[0] + 1e-9 and x1 >= xlim[1] - 1e-9
+    assert y0 <= ylim[0] + 1e-9 and y1 >= ylim[1] - 1e-9
+
+
+def test_zooming_a_detector_map_keeps_both_map_boxes_fixed(window, tmp_path):
+    path = tmp_path / "dual.mat"
+    _write_gui_dual_snapshot(path)
+    assert window._load_file(str(path))
+    window.compare_detectors_chk.setChecked(True)
+    window.map_compare_view_combo.setCurrentText("Separate maps")
+    window.canvas.draw()
+    axes = (window.ax_main, window._detector_compare_ax)
+    boxes = [axis.get_position().bounds for axis in axes]
+    window._on_scan_scroll(SimpleNamespace(inaxes=window.ax_main, xdata=1., ydata=10.5, button="up"))
+    window._scan_view_limits = ((0.9, 1.1), (9.75, 11.25))
+    window._refresh_plot_only()
+    window.canvas.draw()
+    for axis, box in zip((window.ax_main, window._detector_compare_ax), boxes):
+        np.testing.assert_allclose(axis.get_position().bounds, box)
+        _assert_view_contains(axis, (0.9, 1.1), (9.75, 11.25))
+
+
 @pytest.mark.parametrize("previous_view", ["Single map", "Separate maps", "Maps + overlay", "cross-file"])
 def test_overlay_button_restores_previous_layout_sources_zoom_and_linecut(window, tmp_path, previous_view):
     first, second = tmp_path / "first.mat", tmp_path / "second.mat"
@@ -151,8 +176,8 @@ def test_overlay_button_restores_previous_layout_sources_zoom_and_linecut(window
         np.testing.assert_array_equal(window.ax_main.collections[0].get_array(), previous_pixels)
         for axis in (window.ax_main, window._detector_compare_ax, window._map_overlay_ax):
             if axis is not None:
-                np.testing.assert_allclose(axis.get_xlim(), (0.25, 1.75))
-                np.testing.assert_allclose(axis.get_ylim(), (9.75, 11.25))
+                _assert_view_contains(axis, (0.25, 1.75), (9.75, 11.25))
+        assert window._scan_view_limits == ((0.25, 1.75), (9.75, 11.25))
 
 
 def test_detector_and_primary_only_controls_exit_overlay_without_reenabling_it(window, tmp_path):
@@ -275,8 +300,7 @@ def test_overlay_return_zoom_tracks_axis_swap_and_survives_observable_reload(win
     window.canvas.draw()
     assert not window.compare_detectors_chk.isChecked()
     assert window._detector_compare_ax is None
-    np.testing.assert_allclose(window.ax_main.get_xlim(), (9.75, 11.25))
-    np.testing.assert_allclose(window.ax_main.get_ylim(), (0.25, 1.75))
+    _assert_view_contains(window.ax_main, (9.75, 11.25), (0.25, 1.75))
     window.toolbar.home()
     assert window._scan_view_limits is None
 

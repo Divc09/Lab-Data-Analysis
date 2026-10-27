@@ -147,7 +147,8 @@ class CustomModelSpec:
 def build_custom_expression_model(expression: str, param_names: list[str]) -> Callable[..., np.ndarray]:
     """
     Build a custom model callable from a NumPy-safe expression.
-    Expression can reference: t, np, and parameters by name.
+    Expression can reference the independent variable as t or x (aliases), np, and
+    parameters by name.
     """
     allowed_functions = {
         "abs": np.abs,
@@ -160,9 +161,12 @@ def build_custom_expression_model(expression: str, param_names: list[str]) -> Ca
         "clip": np.clip,
         "pi": np.pi,
     }
+    reserved = {"t", "x"} & set(param_names)
+    if reserved:
+        raise ValueError(f"'{sorted(reserved)[0]}' is the independent variable and cannot be a parameter name.")
     normalized = expression.replace("np.", "")
     tree = ast.parse(normalized, mode="eval")
-    allowed_names = {"t", *param_names, *allowed_functions}
+    allowed_names = {"t", "x", *param_names, *allowed_functions}
     allowed_calls = set(allowed_functions) - {"pi"}
     allowed_nodes = (
         ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call, ast.Name, ast.Load,
@@ -171,7 +175,7 @@ def build_custom_expression_model(expression: str, param_names: list[str]) -> Ca
     )
     for node in ast.walk(tree):
         if not isinstance(node, allowed_nodes):
-            raise ValueError("Custom expressions may use only numbers, operators, parameters, t, and approved functions.")
+            raise ValueError("Custom expressions may use only numbers, operators, parameters, t/x, and approved functions.")
         if isinstance(node, ast.Name) and node.id not in allowed_names:
             raise ValueError(f"Unsupported name in custom expression: {node.id}")
         if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in allowed_calls):
@@ -179,7 +183,7 @@ def build_custom_expression_model(expression: str, param_names: list[str]) -> Ca
     code = compile(tree, "<custom model>", "eval")
 
     def _model(t, *params):
-        local = {"t": t}
+        local = {"t": t, "x": t}
         for n, v in zip(param_names, params):
             local[n] = v
         return np.asarray(eval(code, {"__builtins__": {}}, {**allowed_functions, **local}), dtype=float)

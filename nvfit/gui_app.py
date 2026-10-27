@@ -3853,9 +3853,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._scan_view_limits = (xlim, ylim)
         self.ax_main.set_xlim(*xlim)
         self.ax_main.set_ylim(*ylim)
-        if self._detector_compare_ax is not None:
-            self._detector_compare_ax.set_xlim(*xlim)
-            self._detector_compare_ax.set_ylim(*ylim)
+        for axis in (self._detector_compare_ax, self._map_overlay_ax):
+            if axis is not None:
+                axis.set_xlim(*xlim)
+                axis.set_ylim(*ylim)
         self.canvas.draw_idle()
 
     def _reset_scan_view(self):
@@ -3874,9 +3875,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._scan_view_limits = None
         self.ax_main.set_xlim(xmin, xmax)
         self.ax_main.set_ylim(ymin, ymax)
-        if self._detector_compare_ax is not None:
-            self._detector_compare_ax.set_xlim(xmin, xmax)
-            self._detector_compare_ax.set_ylim(ymin, ymax)
+        for axis in (self._detector_compare_ax, self._map_overlay_ax):
+            if axis is not None:
+                axis.set_xlim(xmin, xmax)
+                axis.set_ylim(ymin, ymax)
         self._update_scan_view_fields((xmin, xmax), (ymin, ymax))
         self.canvas.draw_idle()
 
@@ -3928,9 +3930,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._scan_view_limits = (tuple(float(value) for value in source_ax.get_xlim()), tuple(float(value) for value in source_ax.get_ylim()))
         self.ax_main.set_xlim(*self._scan_view_limits[0])
         self.ax_main.set_ylim(*self._scan_view_limits[1])
-        if self._detector_compare_ax is not None:
-            self._detector_compare_ax.set_xlim(*self._scan_view_limits[0])
-            self._detector_compare_ax.set_ylim(*self._scan_view_limits[1])
+        for axis in (self._detector_compare_ax, self._map_overlay_ax):
+            if axis is not None:
+                axis.set_xlim(*self._scan_view_limits[0])
+                axis.set_ylim(*self._scan_view_limits[1])
         self._update_scan_view_fields(*self._scan_view_limits)
 
     def _on_scan_scroll(self, event):
@@ -3945,9 +3948,10 @@ class SmartFitterMainWindow(QMainWindow):
         new_ylim = (center_y - (center_y - ylim[0]) * factor, center_y + (ylim[1] - center_y) * factor)
         self.ax_main.set_xlim(*new_xlim)
         self.ax_main.set_ylim(*new_ylim)
-        if self._detector_compare_ax is not None:
-            self._detector_compare_ax.set_xlim(*new_xlim)
-            self._detector_compare_ax.set_ylim(*new_ylim)
+        for axis in (self._detector_compare_ax, self._map_overlay_ax):
+            if axis is not None:
+                axis.set_xlim(*new_xlim)
+                axis.set_ylim(*new_ylim)
         self._scan_view_limits = (new_xlim, new_ylim)
         self._update_scan_view_fields(new_xlim, new_ylim)
         self.canvas.draw_idle()
@@ -5379,7 +5383,8 @@ class SmartFitterMainWindow(QMainWindow):
                 "source": self.map_compare_source_combo.currentData(),
                 "view": self.map_compare_view_combo.currentText(),
                 "compare_detectors": self.compare_detectors_chk.isChecked(),
-                "limits": (tuple(self.ax_main.get_xlim()), tuple(self.ax_main.get_ylim())),
+                # Save the requested view, not the aspect-widened axis limits, so toggling cannot drift.
+                "limits": self._scan_view_limits,
                 "swap_axes": self.scan_swap_axes_chk.isChecked(),
                 "pixel_geometry": self.scan_pixel_geometry_combo.currentText(),
             }
@@ -5409,7 +5414,7 @@ class SmartFitterMainWindow(QMainWindow):
                 self.compare_detectors_chk.setChecked(state["compare_detectors"] and self.compare_detectors_chk.isEnabled())
                 self.scan_pixel_geometry_combo.setCurrentText(state["pixel_geometry"])
                 limits = state["limits"]
-                if state["swap_axes"] != self.scan_swap_axes_chk.isChecked():
+                if limits is not None and state["swap_axes"] != self.scan_swap_axes_chk.isChecked():
                     limits = (limits[1], limits[0])
                 self._scan_view_limits = limits
             else:
@@ -10283,9 +10288,9 @@ class SmartFitterMainWindow(QMainWindow):
                 bottom = 0.43 if show_linecut else 0.22
                 slots = [[0.07 + i * 0.32, bottom, 0.22, 0.46 if show_linecut else 0.67] for i in range(3)]
             main_rect, compare_rect, overlay_rect = [self._fit_axes_box_to_aspect(rect, box_aspect) for rect in slots]
-            self._map_overlay_ax = self.fig.add_axes(overlay_rect, sharex=self.ax_main, sharey=self.ax_main)
+            self._map_overlay_ax = self.fig.add_axes(overlay_rect)
         self.ax_main.set_position(main_rect)
-        self._detector_compare_ax = self.fig.add_axes(compare_rect, sharex=self.ax_main, sharey=self.ax_main)
+        self._detector_compare_ax = self.fig.add_axes(compare_rect)
         cbar_pad = 0.010
         cbar_width = 0.016
         self._scan_colorbar_ax = self.fig.add_axes(
@@ -10847,7 +10852,7 @@ class SmartFitterMainWindow(QMainWindow):
             # Both geometry modes preserve pixels. Physical mode uses the
             # scan-axis spacing; square mode scales the two data dimensions so
             # one sampled cell has equal screen width and height.
-            self.ax_main.set_aspect(data_aspect, adjustable="box")
+            self.ax_main.set_aspect(data_aspect, adjustable="datalim")
             self.ax_main.set_xlabel(self._friendly_axis_label(display_x_label))
             self.ax_main.set_ylabel(self._friendly_axis_label(display_y_label))
             self.ax_main.set_title(self._map_source_label(plot_trace, compare_trace))
@@ -10877,7 +10882,7 @@ class SmartFitterMainWindow(QMainWindow):
                 self._detector_compare_ax.set_xlabel(self._friendly_axis_label(compare_x_label))
                 self._detector_compare_ax.set_ylabel(self._friendly_axis_label(compare_y_label))
                 self._detector_compare_ax.set_title(self._map_source_label(compare_trace, plot_trace))
-                self._detector_compare_ax.set_aspect(data_aspect, adjustable="box")
+                self._detector_compare_ax.set_aspect(data_aspect, adjustable="datalim")
                 self._detector_compare_colorbar = self.fig.colorbar(compare_mesh, cax=self._detector_compare_colorbar_ax)
                 self._detector_compare_colorbar.set_label(
                     self._scan_colorbar_label(compare_trace.detector_id, compare_observable_label)
@@ -10886,7 +10891,7 @@ class SmartFitterMainWindow(QMainWindow):
                     self._draw_scan_spot_overlays(self._detector_compare_ax, compare_trace.detector_id)
             if overlay is not None and self._map_overlay_ax is not None:
                 self._map_overlay_ax.pcolormesh(overlay.x_edges, overlay.y_edges, overlay.rgba, shading="flat")
-                self._map_overlay_ax.set_aspect(data_aspect, adjustable="box")
+                self._map_overlay_ax.set_aspect(data_aspect, adjustable="datalim")
                 self._map_overlay_ax.set_xlabel(self._friendly_axis_label(display_x_label))
                 self._map_overlay_ax.set_ylabel(self._friendly_axis_label(display_y_label))
                 self._label_map_overlay(self._map_overlay_ax, plot_trace, compare_trace)
@@ -11117,10 +11122,13 @@ class SmartFitterMainWindow(QMainWindow):
                 lower[i] = lo
             if hi is not None:
                 upper[i] = hi
+            if v is None or not np.isfinite(v):
+                continue
+            # a supplied value is the starting seed whether or not it is locked
+            seed[i] = v
             if is_locked:
                 lower[i] = v
                 upper[i] = v
-                seed[i] = v
 
     def _populate_param_table(self, names: list[str], values: np.ndarray):
         self.param_table.blockSignals(True)

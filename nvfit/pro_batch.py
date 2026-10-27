@@ -16,7 +16,7 @@ from .diagnostics import aic, bic, durbin_watson, r_squared, rmse
 from .analysis_tools import process_series
 from .fit_engine import FitResult, fit_model_multistart
 from .fit_workflows import FitWorkflowConfig, fit_non_ramsey
-from .io_mat import DETECTOR_LABELS, ExperimentTrace, load_experiment_dataset
+from .io_mat import DETECTOR_LABELS, ExperimentTrace, is_stage_scan, load_experiment_dataset
 from .models import (
     MODEL_REGISTRY,
     build_custom_expression_model,
@@ -697,6 +697,17 @@ def _output_stem(input_dir: Path, mat_file: Path, *, recursive: bool) -> str:
     return "__".join(rel.parts)
 
 
+def _unique_stem(stem: str, used: set[str]) -> str:
+    """Reserve a run-unique output stem; flattening ``a/b.mat`` and ``a__b.mat`` (or adding a
+    detector suffix) can otherwise make two sources write the same files.  Case-insensitive
+    because Windows paths are."""
+    candidate, n = stem, 2
+    while candidate.lower() in used:
+        candidate, n = f"{stem}__{n}", n + 1
+    used.add(candidate.lower())
+    return candidate
+
+
 def _canonical_batch_detector(value: str) -> str:
     normalized = str(value or "all").strip().lower().replace(" ", "")
     aliases = {
@@ -828,6 +839,8 @@ def run_batch(
             )
 
     n_total = len(work_items)
+    used_stems: set[str] = set()
+    stem_by_row: dict[tuple[str, str], str] = {}
 
     for file_idx, (mat_file, trace, load_failure, detector_count) in enumerate(work_items):
         relative_path = _relative_batch_path(input_dir, mat_file)
@@ -835,7 +848,8 @@ def run_batch(
         detector_id = trace.detector_id if trace is not None else str((load_failure or {}).get("detector_id", "detector1"))
         detector_label = trace.detector_label if trace is not None else str((load_failure or {}).get("detector_label", labels.get(detector_id, detector_id)))
         base_stem = _output_stem(input_dir, mat_file, recursive=recursive)
-        stem = f"{base_stem}__{detector_id}" if detector_count > 1 else base_stem
+        stem = _unique_stem(f"{base_stem}__{detector_id}" if detector_count > 1 else base_stem, used_stems)
+        stem_by_row[(relative_path, detector_id)] = stem
 
         if load_failure is not None or trace is None:
             trace_metadata = {
@@ -889,7 +903,9 @@ def run_batch(
         # Apply model override
         if model_override:
             exp_type = model_override
-        elif exp_type == "LineScan" and "t1" in mat_file.name.lower():
+        elif (exp_type == "LineScan" and "t1" in mat_file.name.lower()
+              and trace.scan_dim == "scan1d" and not is_stage_scan(tuple(trace.scan_axes))):
+            # Legacy fallback for unnamed sequence scans only; a stage scan named e.g. "...AfterT1..." stays a scan.
             exp_type = "T1"
 
         if custom_spec is not None:
@@ -1092,6 +1108,9 @@ def run_batch(
         if progress_callback:
             progress_callback(file_idx, n_total, f"{mat_file.name} [{detector_label}]", f"{status} | R²={result.r2:.4f}")
 
+    for row in summary_rows:
+        row["output_stem"] = stem_by_row.get((str(row.get("relative_path", "")), str(row.get("detector_id", ""))), "")
+
     # --- Summary CSVs ---
     _SUMMARY_FIELDS = [
         "file", "relative_path", "detector_id", "detector_label", "detector_count",
@@ -1100,7 +1119,7 @@ def run_batch(
         "durbin_watson", "bound_hits_count", "success", "status", "status_reason",
         "save_type", "run_status", "iteration_completion", "completed_iterations",
         "target_iterations", "checkpoint_count", "warnings",
-        "sample_id", "condition", "power",
+        "sample_id", "condition", "power", "output_stem",
     ]
     with (output_dir / "batch_summary.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_SUMMARY_FIELDS)

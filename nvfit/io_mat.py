@@ -127,6 +127,51 @@ def _canonical_mode(mode: DataMode | str) -> DataMode:
     raise ValueError(f"Unsupported observable mode: {mode}")
 
 
+_STAGE_KEYWORDS = ("stage x", "stage y", "stage z", "stage_x", "stage_y", "stage_z")
+_STAGE_AXIS_NAMES = {"x", "y", "z"}
+
+
+def is_stage_scan(scan_types: tuple[str, ...] = (), *, parameter: str = "", identifier: str = "") -> bool:
+    """True when the saved scan axes say the stage was moved (PI stage x/y/z), whatever the file is called."""
+    axes = [str(s).strip().lower() for s in scan_types if str(s).strip()]
+    parameter_l, identifier_l = parameter.strip().lower(), identifier.strip().lower()
+    if any(_keyword_match(v, _STAGE_KEYWORDS) for v in (*axes, parameter_l, identifier_l)):
+        return True
+    if "stage" in identifier_l and (parameter_l in _STAGE_AXIS_NAMES or (axes and all(a in _STAGE_AXIS_NAMES for a in axes))):
+        return True
+    return bool(axes) and all(a in _STAGE_AXIS_NAMES for a in axes)
+
+
+def _sequence_type_from_text(text: str) -> str | None:
+    """Sequence keyword in free text (saved scan notes, scan axis names, or a file name), or None."""
+    t = text.lower()
+    if not t.strip():
+        return None
+    if "elapsed time" in t or "time trace" in t or "time_trace" in t:
+        return "TimeTrace"
+    if "deer" in t:
+        if "position" in t:
+            return "DEERPosition"
+        if "decay" in t or "scan axis: tau" in t:
+            return "DEERDecay"
+        if "duration" in t:
+            return "DEERDuration"
+        return "DEERFrequency"
+    if _keyword_match(t, ("xy8", "cpmg", "dynamic decoupling", "dynamical decoupling")):
+        return "DynamicDecoupling"
+    if "ramsey" in t:
+        return "Ramsey"
+    if re.search(r"(?:^|[^a-z0-9])t\s*1(?:[^a-z0-9]|$)", t) or "longitudinal relaxation" in t:
+        return "T1"
+    if _keyword_match(t, ("spin echo", "spinecho", "hahn echo", "t2 decay")):
+        return "SpinEcho"
+    if "rabi" in t:
+        return "Rabi"
+    if "odmr" in t:
+        return "ODMR"
+    return None
+
+
 def infer_experiment_type(
     file_name: str,
     scan_types: tuple[str, ...] = (),
@@ -135,55 +180,37 @@ def infer_experiment_type(
     parameter: str = "",
     identifier: str = "",
 ) -> str:
-    fn = file_name.lower()
-    scan_types_l = [s.lower() for s in scan_types]
-    notes_l = notes.lower()
-    parameter_l = parameter.lower()
-    identifier_l = identifier.lower()
-    combined = " ".join([fn, notes_l, parameter_l, identifier_l, *scan_types_l])
-    if "elapsed time" in combined or "time trace" in combined or "time_trace" in combined:
-        return "TimeTrace"
-    dd_keywords = ("xy8", "cpmg", "dynamic decoupling", "dynamical decoupling")
-    stage_keywords = ("stage x", "stage y", "stage z", "stage_x", "stage_y", "stage_z")
+    """Experiment type from the file's own metadata first; the file name is only a fallback.
 
-    # Prefer explicit sequence metadata and physical scan axes over generic
-    # words such as "duration" or "frequency".  Those generic axis names are
-    # useful fallbacks, but on their own they are not as strong as a sequence
-    # name in the filename/notes or a stage-axis declaration.
+    Order: (1) time-trace / DEER descriptions in the saved metadata, (2) stage axes (a stage scan is a
+    LineScan/map whatever its name says), (3) sequence keywords in the saved scan notes / axis names,
+    (4) sequence keywords in the file name (legacy files without notes), (5) generic axis names
+    ("frequency" -> ODMR, "duration" -> Rabi), (6) LineScan.  Previously the file name was mixed into
+    one keyword search, so a stage scan named e.g. "...AfterODMR..." or "..._After488_T1_..." was
+    loaded as ODMR or T1.
+    """
+    scan_types_l = [str(s).lower() for s in scan_types]
+    parameter_l, identifier_l = parameter.lower(), identifier.lower()
+    meta_text = " ".join([notes, parameter, identifier, *map(str, scan_types)])
 
-    if "deer" in combined:
-        if "position" in combined:
-            return "DEERPosition"
-        if "decay" in combined or "scan axis: tau" in combined:
-            return "DEERDecay"
-        if "duration" in combined:
-            return "DEERDuration"
-        if "frequency" in combined or "freq" in combined:
-            return "DEERFrequency"
-        return "DEERFrequency"
-
-    if any(_keyword_match(value, stage_keywords) for value in (*scan_types_l, parameter_l, identifier_l)):
+    from_meta = _sequence_type_from_text(meta_text)
+    if from_meta in ("TimeTrace", "DEERPosition", "DEERDecay", "DEERDuration", "DEERFrequency"):
+        return from_meta
+    if is_stage_scan(tuple(scan_types), parameter=parameter, identifier=identifier):
         return "LineScan"
+    if from_meta:
+        return from_meta
 
-    if _keyword_match(combined, dd_keywords):
-        return "DynamicDecoupling"
-
-    if "ramsey" in combined:
-        return "Ramsey"
-    if re.search(r"(?:^|[^a-z0-9])t\s*1(?:[^a-z0-9]|$)", combined) or "longitudinal relaxation" in combined:
-        return "T1"
-    if _keyword_match(combined, ("spin echo", "spinecho", "hahn echo", "t2 decay")):
-        return "SpinEcho"
-    if "rabi" in combined:
-        return "Rabi"
-    if "odmr" in combined:
-        return "ODMR"
+    from_name = _sequence_type_from_text(file_name)
+    if from_name:
+        return from_name
 
     if any("rf frequency" in s or "frequency" in s for s in scan_types_l) or "frequency" in parameter_l:
         return "ODMR"
     if any("pulse duration" in s or "duration" in s for s in scan_types_l) or "duration" in parameter_l:
         return "Rabi"
-    if "echo" in combined or re.search(r"(?:^|[^a-z0-9])t\s*2(?:[^a-z0-9]|$)", combined):
+    if "echo" in meta_text.lower() or "echo" in file_name.lower() or re.search(
+            r"(?:^|[^a-z0-9])t\s*2(?:[^a-z0-9]|$)", (meta_text + " " + file_name).lower()):
         return "SpinEcho"
     return "LineScan"
 
@@ -312,6 +339,7 @@ def _finalize_trace(
     valid = np.isfinite(x_ns) & np.isfinite(y)
     if y_sem_use is not None:
         valid &= np.isfinite(y_sem_use)
+    sample_index = np.arange(L)[valid]  # original sample positions, kept aligned through filter/sort
     x_ns = x_ns[valid]
     signal = signal[valid]
     reference = reference[valid]
@@ -330,6 +358,7 @@ def _finalize_trace(
         valid_iters_use = valid_iters_use[valid, :]
 
     order = np.argsort(x_ns)
+    sample_index = sample_index[order]
     x_ns = x_ns[order]
     signal = signal[order]
     reference = reference[order]
@@ -384,14 +413,20 @@ def _finalize_trace(
         scan_dim = "scan1d"
         fit_allowed = experiment_type == "LineScan"
         if scan_vectors:
-            ax = scan_vectors[0]
-            L1 = min(len(ax), len(y), len(signal), len(reference))
-            x_ns = ax[:L1]
-            y = y[:L1]
-            signal = signal[:L1]
-            reference = reference[:L1]
-            raw_x_use = None if raw_x_use is None else raw_x_use[:L1]
-            y_sem_use = None if y_sem_use is None else y_sem_use[:L1]
+            ax = np.asarray(scan_vectors[0], dtype=float).ravel()
+            # Look up each retained sample's own stage coordinate; a prefix of the scan
+            # vector would shift values onto the wrong positions once samples were dropped.
+            keep = sample_index < len(ax)
+            x_ns = ax[sample_index[keep]]
+            y = y[keep]
+            signal = signal[keep]
+            reference = reference[keep]
+            raw_x_use = None if raw_x_use is None else raw_x_use[keep]
+            y_sem_use = None if y_sem_use is None else y_sem_use[keep]
+            contrast_iters_use = None if contrast_iters_use is None else contrast_iters_use[keep]
+            signal_iters_use = None if signal_iters_use is None else signal_iters_use[keep]
+            reference_iters_use = None if reference_iters_use is None else reference_iters_use[keep]
+            valid_iters_use = None if valid_iters_use is None else valid_iters_use[keep]
 
     if scan_dim == "scan2d" and experiment_type == "LineScan":
         experiment_type = "Scan2D"
@@ -679,7 +714,8 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
 
     iterations = np.asarray(getattr(data, "iteration", []), dtype=float).ravel()
     iter_capacity = int(values.shape[1]) if values.ndim == 2 else 1
-    failed_points = _normalize_failed_points(getattr(data, "failedPoints", np.zeros((nsteps, iter_capacity), dtype=int)), (nsteps, iter_capacity))
+    # Data.failedPoints is the retry count of a collection that then succeeded (experiment.m getData
+    # errors out on a real failure and stores nothing), so a nonzero entry is still a valid point.
 
     signal = np.full(nsteps, np.nan, dtype=float)
     reference = np.full(nsteps, np.nan, dtype=float)
@@ -695,8 +731,6 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
         ref_vals: list[float] = []
         current_cells = [values[i]] if values.ndim == 1 else [values[i, j] for j in range(max_iter)]
         for j, cell in enumerate(current_cells):
-            if i < failed_points.shape[0] and j < failed_points.shape[1] and int(failed_points[i, j]) != 0:
-                continue
             pair = np.asarray(cell, dtype=float).ravel()
             if pair.size < 2 or not np.isfinite(pair[0]) or not np.isfinite(pair[1]):
                 continue
@@ -715,13 +749,6 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
     return signal, reference, meta
 
 
-def _normalize_failed_points(failed_points_obj: object, shape: tuple[int, int]) -> np.ndarray:
-    failed_points = np.asarray(failed_points_obj)
-    if failed_points.ndim == 2 and failed_points.shape[0] >= shape[0] and failed_points.shape[1] >= shape[1]:
-        return np.asarray(failed_points[: shape[0], : shape[1]], dtype=int)
-    return np.zeros(shape, dtype=int)
-
-
 def _extract_complete_iteration_contrast_stats(
     data,
     nsteps: int,
@@ -730,8 +757,7 @@ def _extract_complete_iteration_contrast_stats(
     if values.ndim != 2 or values.shape[0] < nsteps:
         return None, None, None, None, None, None, {"complete_iterations": 0}
     values = values[:nsteps, :]
-
-    failed_points = _normalize_failed_points(getattr(data, "failedPoints", np.zeros(values.shape, dtype=int)), values.shape)
+    # Nonzero Data.failedPoints entries are retry counts of successful collections, not failures.
 
     contrast = np.full(values.shape, np.nan, dtype=float)
     signal = np.full(values.shape, np.nan, dtype=float)
@@ -739,8 +765,6 @@ def _extract_complete_iteration_contrast_stats(
     valid = np.zeros(values.shape, dtype=bool)
     for i in range(values.shape[0]):
         for j in range(values.shape[1]):
-            if int(failed_points[i, j]) != 0:
-                continue
             pair = np.asarray(values[i, j], dtype=float).ravel()
             if pair.size < 2 or not np.isfinite(pair[0]) or not np.isfinite(pair[1]):
                 continue
@@ -1013,15 +1037,11 @@ def _load_param_grid_stage_scan(
 
     signal = np.full((ny, nx), np.nan, dtype=float)
     reference = np.full((ny, nx), np.nan, dtype=float)
-    failed_points = np.asarray(getattr(data, "failedPoints", np.zeros((ny, nx), dtype=int)))
-    if failed_points.shape != (ny, nx):
-        failed_points = np.zeros((ny, nx), dtype=int)
+    # Nonzero Data.failedPoints entries are retry counts of successful collections, not failures.
     iterations = np.asarray(getattr(data, "iteration", []), dtype=float)
     has_grid_iterations = iterations.shape == (ny, nx)
     for iy in range(ny):
         for ix in range(nx):
-            if int(failed_points[iy, ix]) != 0:
-                continue
             if has_grid_iterations and (not np.isfinite(iterations[iy, ix]) or iterations[iy, ix] <= 0):
                 continue
             pair = np.asarray(values[iy, ix], dtype=float).ravel()

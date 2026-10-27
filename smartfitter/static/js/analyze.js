@@ -129,9 +129,10 @@ function customSpec(spec) {
     lower: spec.custom_params.map((p) => p.min ?? -1e300), upper: spec.custom_params.map((p) => p.max ?? 1e300), seed: spec.custom_params.map((p) => p.seed ?? 1) };
 }
 
-const RESERVED = new Set(['x', 'abs', 'sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'clip', 'pi', 'e', 'np']);
+const RESERVED = new Set(['x', 't', 'abs', 'sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'clip', 'pi', 'e', 'np']);
 export function exprParams(expr, prev = []) {
-  const names = [...new Set((expr.match(/[A-Za-z_]\w*/g) || []).filter((n) => !RESERVED.has(n)))];
+  // x and t both name the independent variable; the lookbehind skips exponents such as 1e3 and attributes such as np.exp
+  const names = [...new Set((expr.match(/(?<![\w.])[A-Za-z_]\w*/g) || []).filter((n) => !RESERVED.has(n)))];
   return names.map((n) => prev.find((p) => p.name === n) || { name: n, seed: 1, min: null, max: null });
 }
 

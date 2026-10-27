@@ -25,7 +25,7 @@ from nvfit.analysis_tools import AnalysisStep, process_series
 from nvfit.app_state import fit_result_to_dict, json_safe
 from nvfit.fit_engine import FitResult
 from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
-from nvfit.io_mat import ExperimentDataset, ExperimentTrace, load_experiment_dataset
+from nvfit.io_mat import DETECTOR_LABELS, ExperimentDataset, ExperimentTrace, load_experiment_dataset
 from nvfit.iterations import iteration_matrix, selected_trace, selection_indices, iteration_sources, matrix_stats, combine_datasets
 from nvfit.map_comparison import axis_edges, axis_key, build_map_overlay, compatible_axes
 from nvfit.models import MODEL_REGISTRY
@@ -163,8 +163,15 @@ class Workspace:
 
     def trace(self, path: str, detector: str | None, mode: str) -> ExperimentTrace:
         ds = self.dataset(path, mode)
-        det = detector if detector in ds.detectors else (ds.available_detectors[0] if ds.available_detectors else None)
-        if det is None or det not in ds.detectors:
+        if detector:
+            # An explicit detector must never be answered with another channel's data.
+            if detector in ds.detectors:
+                return ds.detectors[detector]
+            failure = ds.detector_errors.get(detector)
+            label = DETECTOR_LABELS.get(detector, detector)
+            raise ValueError(failure.message if failure else f"{label} is not available in {ds.file_name}.")
+        det = next((d for d in ds.available_detectors if d in ds.detectors), None)
+        if det is None:
             failure = next(iter(ds.detector_errors.values()), None)
             raise ValueError(failure.message if failure else "No detector data could be loaded.")
         return ds.detectors[det]

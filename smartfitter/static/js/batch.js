@@ -124,12 +124,14 @@ async function start() {
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const rowKey = (r) => r.relative_path || r.file;
 
-// pro_batch writes <stem>_fit.png; dual-detector files get a __<detector_id> suffix, and
+// pro_batch writes <stem>_fit.png and records the stem as output_stem (de-duplicated when two sources
+// would collide). Older summaries lack it: dual-detector files get a __<detector_id> suffix, and
 // recursive runs flatten subfolders into the stem with "__" separators.
 async function openFigure(r) {
   const dir = S.batch.opts.output_dir;
   const stem = rowKey(r).replace(/\.[^./\\]+$/, '').split(/[\\/]/).join('__');
-  const names = r.detector_id ? [`${stem}__${r.detector_id}_fit.png`, `${stem}_fit.png`] : [`${stem}_fit.png`];
+  const guesses = r.detector_id ? [`${stem}__${r.detector_id}_fit.png`, `${stem}_fit.png`] : [`${stem}_fit.png`];
+  const names = r.output_stem ? [`${r.output_stem}_fit.png`] : guesses;
   for (const name of names) {
     try { await call('open_path', { path: `${dir}\\${name}` }, { quiet: true }); return; } catch (e) { /* try the next candidate */ }
   }

@@ -51,6 +51,8 @@ def bootstrap_fit(
     base = fit_callable(x, y, None)
     names = list(base.param_names)
     out = {"baseline": {n: float(v) for n, v in zip(names, base.params)}, "n_boot": int(n_boot)}
+    if not bool(getattr(base, "success", True)):
+        out["warning"] = "The baseline fit did not converge; bootstrap spread describes an unconverged fit."
 
     matrix = None
     if iteration_matrix is not None:
@@ -62,6 +64,7 @@ def bootstrap_fit(
     resid = resid[np.isfinite(resid)]
 
     draws = []
+    n_unconverged = 0
     for _ in range(int(n_boot)):
         try:
             if matrix is not None:
@@ -76,13 +79,16 @@ def bootstrap_fit(
                 res = fit_callable(x, yb, None)
             if list(res.param_names) != names:
                 continue  # model selection flipped; not the same parameter set
+            if not bool(getattr(res, "success", True)):
+                n_unconverged += 1
+                continue  # an unconverged optimizer is not a valid draw
             p = np.asarray(res.params, dtype=float)
             if np.all(np.isfinite(p)):
                 draws.append(p)
         except Exception:
             continue
 
-    out.update({"method": method, "n_success": len(draws)})
+    out.update({"method": method, "n_success": len(draws), "n_unconverged": n_unconverged})
     stats = {}
     if draws:
         d = np.vstack(draws)
