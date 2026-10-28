@@ -14,7 +14,7 @@ const MODES = [['metric', 'AutoFind metric (detector choice from log)'], ['det1'
 const SCALES = [['live', 'Scale: log10 max(v,1) (live)'], ['log', 'Scale: log10 v (v ≤ 0 blank)'], ['linear', 'Scale: linear (raw values)']];
 const SCALE_LABEL = { live: 'log10 max(value, 1)', log: 'log10 value', linear: 'value (linear)' };
 const ST = { root: '', runs: [], source: '', run: null, view: 'map', mode: 'metric', scale: 'linear', contours: false, selected: [], busy: '', errors: [],
-  pursuit: null, pursuitData: [], particle: 0, refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
+  pursuit: null, pursuitData: [], refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
 const cache = new Map();
 const plots = new Map();
 const note = (text) => h('div', { class: 'hint', style: 'white-space:normal;margin:8px 0;line-height:1.5' }, text);
@@ -61,7 +61,7 @@ async function discover() {
 }
 // Re-index the folder (new runs, scan counts, durations of a run still being written), then reload the open run.
 async function refresh() {
-  cache.clear();
+  cache.clear(); scanCache.clear();
   const keep = ST.source;
   if (ST.root.trim()) await discover();
   if (keep && ST.runs.some((r) => r.source === keep)) await chooseRun(keep);
@@ -76,7 +76,7 @@ async function chooseRun(source) {
   const r = await call('autofind_run', { source });
   if (request !== runRequest) return;
   // A view/metric switch cancels raster work, not the selected run itself.
-  ST.source = source; ST.run = r; ST.pursuit = null; ST.pursuitData = []; ST.particle = 0;
+  ST.source = source; ST.run = r; ST.pursuit = null; ST.pursuitData = [];
   emit();
   if (ST.view === 'pursuit' && r.pursuits.length) await choosePursuit(r.pursuits[0].id);
   else if (ST.view === 'particles') await showParticles();
@@ -103,6 +103,7 @@ async function changeMode(mode) {
   ST.pursuitData = []; emit();
   if (ST.view === 'pursuit' && ST.pursuit) await choosePursuit(ST.pursuit.id);
   else if (ST.view === 'compare') await buildCompare(epoch);
+  else if (ST.view === 'particles' && ST.run) await showParticles(epoch);
   else if (ST.run) await loadMaps(ST.source, epoch);
 }
 async function changeView(view) {
@@ -112,13 +113,28 @@ async function changeView(view) {
   if (view === 'pursuit' && ST.run?.pursuits.length && !ST.pursuit) await choosePursuit(ST.run.pursuits[0].id);
   if (view === 'particles' && ST.run) await showParticles();
 }
-// Particle i's pursuit plots first (choosePursuit bumps the epoch), then the overview rasters.
-async function showParticles(i = ST.particle) {
-  ST.particle = i;
-  const row = particleRows(ST.run)[i];
-  if (row?.pursuit) await choosePursuit(row.pursuit.id);
-  else { ST.pursuit = null; ST.pursuitData = []; emit(); }
-  await loadMaps(ST.source, ST.epoch);
+// Particle cards: each card needs its best x/y scan and its last z search; one scan at a time so cards fill in progressively.
+const scanCache = new Map();
+const scanKey = (source, mode, id) => JSON.stringify([source, mode, id]);
+const zMode = (s) => (s.type === 'z' && ST.mode === 'ratio' ? 'metric' : ST.mode);
+async function showParticles(epoch = ST.epoch) {
+  const source = ST.source;
+  for (const r of particleRows(ST.run)) {
+    for (const s of [r.best, ...r.z].filter(Boolean)) {
+      const k = scanKey(source, zMode(s), s.id);
+      if (scanCache.has(k)) continue;
+      let d;
+      try { d = await call('autofind_scan', { source, scan_id: s.id, mode: zMode(s) }); } catch (e) { d = { scan: s, unavailable: e.message }; }
+      if (epoch !== ST.epoch || source !== ST.source) return;
+      scanCache.set(k, d);
+      if (scanCache.size > 300) scanCache.delete(scanCache.keys().next().value);
+      emit();
+    }
+  }
+}
+async function exploreParticle(id) {
+  ST.view = 'pursuit'; ST.epoch++; emit();
+  await choosePursuit(id);
 }
 async function openScan(source, id) {
   const r = source === ST.source ? ST.run : ST.compare.find((r) => r.source === source);
@@ -314,8 +330,16 @@ function zPanel(height = 420) {
 // Particles: every logged particle with its exact stage position, a MATLAB move command, and its plots on one screen.
 const um4 = (v) => typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : 'NaN';
 const samePos = (a, b) => a?.length >= 3 && b?.length >= 3 && a.slice(0, 3).every((v, i) => Math.abs(v - b[i]) < 1e-9);
+// best = last fine/repeat x/y scan (what the definitive call used), else last refine/confirm/patch; z = every pass of the last z search.
 function particleRows(run) {
-  return (run?.particles || []).map((p, i) => ({ i, p, pursuit: run.pursuits.find((g) => samePos(g.particle?.position, p.position)) }));
+  return (run?.particles || []).map((p, i) => {
+    const pursuit = run.pursuits.find((g) => samePos(g.particle?.position, p.position));
+    const seq = pursuit ? run.scans.filter((s) => pursuit.scan_ids.includes(s.id) && !s.evidence_unavailable) : [];
+    const xy = (kinds) => seq.filter((s) => s.type !== 'z' && kinds.includes(s.kind)).at(-1);
+    const zs = seq.filter((s) => s.type === 'z'), tag = (s) => s.label.split('_Z')[1]?.split('_')[0] || s.label;
+    const last = zs.at(-1);
+    return { i, p, pursuit, best: xy(['fine', 'repeat']) || xy(['refine']) || xy(['confirm', 'patch']), z: last ? zs.filter((s) => tag(s) === tag(last)) : [] };
+  });
 }
 // Same order as autoFindStageAcq moveTo: z first if the target z is higher than now, then x, y, then z.
 // Unlike moveTo there is no zLimits guard, so the panel says to check z before running it.
@@ -324,33 +348,46 @@ function moveCommand(pos) {
   return `t = [${x} ${y} ${z}]; zi = strcmpi(ex.PIstage.axisSum(:,1),'z'); if t(3) >= ex.PIstage.axisSum{zi,2}, ex.PIstage = absoluteMove(ex.PIstage,'z',t(3)); end; `
     + `ex.PIstage = absoluteMove(ex.PIstage,'x',t(1)); ex.PIstage = absoluteMove(ex.PIstage,'y',t(2)); ex.PIstage = absoluteMove(ex.PIstage,'z',t(3));`;
 }
+const compact = (extra) => layout('', { margin: { l: 46, r: 8, b: 36, t: 8 }, showlegend: false, font: { family: 'Arial, sans-serif', size: 10, color: '#111111' }, ...extra });
+function particleCard(r) {
+  const p = r.p, pos = p.position, src = ST.source;
+  const best = r.best && scanCache.get(scanKey(src, ST.mode, r.best.id));
+  const zs = r.z.map((s) => scanCache.get(scanKey(src, zMode(s), s.id))).filter((m) => m?.values);
+  const peak = best?.values ? Math.max(...best.values.flat().filter((v) => v !== null && Number.isFinite(v))) : null;
+  const ring = { type: 'scatter', mode: 'markers', x: [pos[0]], y: [pos[1]], marker: { symbol: 'circle-open', size: 16, color: '#d03b3b', line: { width: 2 } }, hovertemplate: `Logged position<br>%{x:.4f}, %{y:.4f} um<extra></extra>` };
+  const xyPlot = !r.best ? note('No x/y scan linked to this particle.') : !best ? note('Loading…') : !best.values ? note(best.unavailable || 'Scan unavailable')
+    : plot(`particle ${r.i} xy`, [heatmap(best, src), ring], compact({ coloraxis: { ...range([best]), colorbar: { thickness: 8, len: 0.9, tickfont: { size: 9 } } },
+      xaxis: { ...layout('').xaxis, title: { text: 'x (um)', standoff: 2 } }, yaxis: { ...layout('').yaxis, title: { text: 'y (um)', standoff: 2 } }, uirevision: `${src}:${r.i}:xy` }), 230);
+  const zPlot = !r.z.length ? note('No z search recorded.') : !zs.length ? note('Loading…')
+    : plot(`particle ${r.i} z`, [...zs.map((m) => ({ type: 'scatter', mode: 'lines+markers', x: m.z, y: m.values, name: m.scan.label, marker: { size: 4 },
+      line: { width: 1.5, dash: m.scan.label.includes('_rev') ? 'dash' : 'solid', color: m.scan.label.includes('_rev') ? PALETTE[1] : PALETTE[0] }, hovertemplate: `${m.scan.label}<br>z %{x:.4f} um<br>%{y:.4g}<extra></extra>` })),
+      { type: 'scatter', mode: 'lines', x: [pos[2], pos[2]], y: [0, Math.max(...zs.flatMap((m) => m.values.filter(Number.isFinite)))], line: { color: '#d03b3b', width: 1, dash: 'dot' }, hoverinfo: 'skip' }],
+      compact({ xaxis: { title: { text: 'z (um)', standoff: 2 }, exponentformat: 'none', tickformat: '.6~g' }, yaxis: { gridcolor: '#e1e0d9' }, hovermode: 'x unified' }), 230);
+  const status = p.definitive ? ['definitive', '#0ca30c'] : ['not definitive', '#b07d00'];
+  return h('div', { style: 'border:1px solid var(--line);border-radius:8px;padding:10px;min-width:0' },
+    h('div', { class: 'row', style: 'justify-content:space-between;gap:6px' },
+      h('span', { style: 'font-weight:600' }, `Particle ${r.i + 1} `, h('span', { class: 'dim', style: 'font-weight:400' }, r.pursuit?.id || 'unlinked')),
+      h('span', { style: `font-size:11px;padding:1px 8px;border-radius:4px;border:1px solid ${status[1]};color:${status[1]}` }, status[0])),
+    h('div', { style: 'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin:6px 0;background:white;border-radius:4px' },
+      h('div', { style: 'min-width:0' }, xyPlot), h('div', { style: 'min-width:0' }, zPlot)),
+    h('div', { style: 'font-family:var(--mono, monospace);font-size:12px;user-select:all' }, `(${pos.slice(0, 3).map(um4).join(', ')}) um`),
+    h('div', { class: 'dim', style: 'font-size:11px;margin-top:2px' }, `peak ${peak === null ? '?' : fmt(peak)} · contrast ${fmt(p.ratio)}x · z FWHM ${fmt(p.zFWHM)} um${r.best ? ` · ${r.best.label}` : ''}`),
+    h('div', { class: 'row', style: 'gap:5px;margin-top:8px' },
+      button('Copy move', () => copyText(moveCommand(pos), `Move command for particle ${r.i + 1} copied`)),
+      button('Explore', () => exploreParticle(r.pursuit.id), !r.pursuit),
+      button('Analyze', () => openScan(src, r.best.id), !r.best?.path)));
+}
 function particlesView() {
-  const run = ST.run, rows = particleRows(run);
+  const rows = particleRows(ST.run);
   if (!rows.length) return note('No particles in this run’s log (L.particles is empty). Rejected candidates are on the Stitched map and Candidate pursuit views.');
-  const sel = rows[ST.particle] || rows[0], pos = sel.p.position;
   const tsv = [['particle', 'pursuit', 'definitive', 'x_um', 'y_um', 'z_um', 'ratio', 'sigma', 'zFWHM_um'].join('\t'),
     ...rows.map((r) => [r.i + 1, r.pursuit?.id || '', r.p.definitive ? 1 : 0, ...r.p.position.slice(0, 3).map(um4), r.p.ratio, r.p.sigma, r.p.zFWHM].join('\t'))].join('\n');
-  const maps = mapsOf(ST.source).filter((m) => m.values);
-  const ring = { type: 'scatter', mode: 'markers', x: [pos[0]], y: [pos[1]], marker: { symbol: 'circle-open', size: 22, color: '#d03b3b', line: { width: 3 } },
-    name: `Selected particle ${sel.i + 1}`, hovertemplate: `Particle ${sel.i + 1}<br>%{x:.4f}, %{y:.4f} um<extra></extra>` };
-  const overview = maps.length || run.particles.length ? plot('particle overview map', [...maps.map((m) => heatmap(m, run.source)), ...markerTraces(run, mapsOf(ST.source)), ring],
-    layout(`${run.run_id} — all particles`, { coloraxis: { ...range(maps), colorbar: { title: { text: SCALE_LABEL[ST.scale] }, thickness: 10 } }, uirevision: `${ST.source}:particles`, margin: { l: 62, r: 20, b: 50, t: 45 }, showlegend: false }), 350) : note('No coarse raster loaded yet.');
+  const label = rows.map((r) => r.best && scanCache.get(scanKey(ST.source, ST.mode, r.best.id))?.metric_label).find(Boolean);
   return h('div', {},
-    h('div', { class: 'row', style: 'gap:6px;margin:4px 0' }, h('h3', { style: 'margin:0' }, `${rows.length} particle${rows.length === 1 ? '' : 's'} (logged L.particles)`), button('Copy all coordinates (TSV)', () => copyText(tsv, 'Particle coordinates copied'))),
-    table(['#', 'Pursuit', 'Status', 'x (um)', 'y (um)', 'z (um)', 'Blob contrast', 'sigma', 'z FWHM (um)', ''], rows.map((r) => [
-      `${r === sel ? '▶ ' : ''}${r.i + 1}`, r.pursuit?.id || 'unlinked', r.p.definitive ? 'definitive' : 'not definitive', ...r.p.position.slice(0, 3).map(um4),
-      `${fmt(r.p.ratio)}x`, fmt(r.p.sigma), fmt(r.p.zFWHM),
-      h('div', { class: 'row', style: 'gap:4px' }, button('Show', () => showParticles(r.i)), button('Copy move', () => copyText(moveCommand(r.p.position), `Move command for particle ${r.i + 1} copied`)))])),
-    h('div', { style: 'margin:10px 0 4px;font-weight:600' }, `Move stage to particle ${sel.i + 1} (MATLAB, needs ex in the workspace)`),
-    h('div', { class: 'row', style: 'gap:6px;align-items:flex-start' },
-      h('pre', { style: 'flex:1;min-width:0;margin:0;padding:6px 8px;white-space:pre-wrap;word-break:break-all;user-select:all;border:1px solid var(--line);border-radius:4px;font-size:11px' }, moveCommand(pos)),
-      button('Copy', () => copyText(moveCommand(pos), 'Move command copied'))),
-    note('Logged L.particles.position in absolute stage um (not re-measured). Move order matches autoFindStageAcq moveTo, but this command has no z-limit guard: check z against your safe range before running.'),
-    h('div', { style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:10px;margin-top:8px' },
-      h('div', { style: 'min-width:0' }, overview),
-      ...(sel.pursuit && ST.pursuit?.id === sel.pursuit.id
-        ? [xyPanel('refine', ST.refine, (v) => { ST.refine = v; }), zPanel(350), xyPanel('fine / repeat', ST.fine, (v) => { ST.fine = v; })]
-        : [note(sel.pursuit ? 'Loading this particle’s pursuit scans…' : 'No pursuit scans matched this particle’s files, so only the overview is shown.')])));
+    h('div', { class: 'row', style: 'gap:8px;margin:4px 0 8px;flex-wrap:wrap' }, h('h3', { style: 'margin:0' }, `${rows.length} particle${rows.length === 1 ? '' : 's'}`),
+      button('Copy all coordinates (TSV)', () => copyText(tsv, 'Particle coordinates copied')), h('span', { class: 'dim', style: 'font-size:11px' }, label ? `Plots: ${label}; red ring / dotted line = logged position.` : '')),
+    h('div', { style: 'display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:10px' }, rows.map(particleCard)),
+    note('Positions are the logged L.particles.position in absolute stage um (not re-measured). Copy move pastes a MATLAB command (needs ex) in the same axis order as autoFindStageAcq moveTo, but without its z-limit guard: check z first. Explore opens the full candidate pursuit.'));
 }
 function pursuitView() {
   const p = ST.pursuit;
