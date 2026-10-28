@@ -21,6 +21,7 @@ from .models import (
     build_custom_expression_model,
     odmr_lorentzian,
     odmr_multi_lorentzian,
+    odmr_multi_lorentzian_jac,
     rabi_adaptive_pulse_area_model,
     rabi_chirp_model,
     rabi_cosine_decay_model,
@@ -1247,6 +1248,11 @@ def _fit_odmr_single(
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 
 
+# Residual evaluations per multi-peak start (the analytic Jacobian is not counted). On ODMR_20260324_023911 every
+# start that reached the best cost needed <= ~2000; starts at the cap had drifted to worse solutions.
+ODMR_MULTI_MAX_NFEV = 2000
+
+
 def _fit_odmr_multi(
     x: np.ndarray,
     y: np.ndarray,
@@ -1287,6 +1293,7 @@ def _fit_odmr_multi(
         result = fit_model_multistart(
             model_name="ODMRMulti",
             model_func=odmr_multi_lorentzian,
+            jac_func=odmr_multi_lorentzian_jac,
             x=x,
             y=y_fit,
             param_names=names,
@@ -1294,6 +1301,9 @@ def _fit_odmr_multi(
             upper=upper,
             seeds=seeds,
             weights=weights,
+            # Converging starts need a few hundred evaluations; with too many peaks for the data, others drift
+            # between near-equivalent solutions up to the default 20000 (about 10 s each) without a better cost.
+            max_nfev=ODMR_MULTI_MAX_NFEV,
         )
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 

@@ -170,7 +170,10 @@ def fit_model_multistart(
     max_nfev: int = 20000,
     x_scale: str | np.ndarray | float = 1.0,
     selection_note: str = "",
+    jac_func: Callable[..., np.ndarray] | None = None,
 ) -> FitResult:
+    """``jac_func(x, *params)``, when given, returns d model / d params (n_points x n_params) and replaces the
+    finite-difference Jacobian; it must match ``model_func`` exactly."""
     lower_arr = np.asarray(list(lower), dtype=float)
     upper_arr = np.asarray(list(upper), dtype=float)
     seeds = [np.asarray(seed, dtype=float).copy() for seed in seeds]
@@ -216,6 +219,7 @@ def fit_model_multistart(
             res = least_squares(
                 lambda p: w_sqrt * (model_func(x, *full(p)) - y),
                 seed[free],
+                jac=(lambda p: w_sqrt[:, None] * jac_func(x, *full(p))[:, free]) if jac_func is not None else "2-point",
                 bounds=(lower_arr[free], upper_arr[free]),
                 loss=loss,
                 f_scale=f_scale,

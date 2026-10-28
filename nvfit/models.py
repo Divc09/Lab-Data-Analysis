@@ -132,6 +132,19 @@ def odmr_multi_lorentzian(t, y0, *peak_params):
     return y
 
 
+def odmr_multi_lorentzian_jac(t, y0, *peak_params):
+    """Analytic d model / d (y0, C1, w1, x01, ...) for odmr_multi_lorentzian, one column per parameter."""
+    t = np.asarray(t, dtype=float)
+    cols = [np.ones_like(t)]
+    for i in range(len(peak_params) // 3):
+        C, w, x0 = (float(v) for v in peak_params[3 * i: 3 * i + 3])
+        d = t - x0
+        denom = d**2 + w**2
+        shape = w**2 / denom
+        cols += [shape, C * 2.0 * w * d**2 / denom**2, C * 2.0 * w**2 * d / denom**2]
+    return np.column_stack(cols)
+
+
 @dataclass(frozen=True)
 class CustomModelSpec:
     name: str
