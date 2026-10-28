@@ -10,7 +10,7 @@ const RAMP = [[0, '#cde2fb'], [0.35, '#6da7ec'], [0.7, '#2a78d6'], [1, '#0d366b'
 const PALETTE = ['#2a78d6', '#eb6834', '#1baf7a'];
 const MODES = [['metric', 'AutoFind metric (detector choice from log)'], ['det1', 'Raw det1'], ['det2', 'Raw det2'], ['ratio', 'autoFindDetect line-normalized ratio']];
 // 'live' = autoFindLivePlot's log10(max(v,1)); it blanks everything below 1, i.e. the background of the dimensionless metrics.
-const SCALES = [['live', 'Colour: log10 max(v,1) (AutoFind live)'], ['log', 'Colour: log10 v (v ≤ 0 blank)'], ['linear', 'Colour: linear']];
+const SCALES = [['live', 'Scale: log10 max(v,1) (live)'], ['log', 'Scale: log10 v (v ≤ 0 blank)'], ['linear', 'Scale: linear (raw values)']];
 const SCALE_LABEL = { live: 'log10 max(value, 1)', log: 'log10 value', linear: 'value (linear)' };
 const ST = { root: '', runs: [], source: '', run: null, view: 'map', mode: 'metric', scale: 'live', contours: false, selected: [], busy: '', errors: [],
   pursuit: null, pursuitData: [], refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
@@ -355,7 +355,7 @@ export function renderAutoFind(root) {
     h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' }, ...[['map', 'Stitched map'], ['timeline', 'Timeline'], ['pursuit', 'Candidate pursuit'], ['compare', 'Multi-run comparison']].map(([k, label]) =>
       h('button', { class: `btn sm ${ST.view === k ? 'primary' : ''}`, onclick: () => action(label, () => changeView(k)) }, label)),
       select(MODES, ST.mode, (v) => action('Metric', () => changeMode(v)), { style: 'width:220px;height:28px', title: 'Map metric', 'aria-label': 'Map metric' }),
-      select(SCALES, ST.scale, (v) => { ST.scale = v; emit(); }, { style: 'width:210px;height:28px', title: 'Colour scale', 'aria-label': 'Colour scale' }),
+      select(SCALES, ST.scale, (v) => { ST.scale = v; emit(); }, { style: 'width:230px;height:28px', title: 'Colour scale: log10 or linear (raw values)', 'aria-label': 'Colour scale' }),
       h('label', { class: 'row', style: 'gap:4px', title: ST.mode === 'ratio' ? 'Draw strongRatio / weakRatio contours' : 'Contours need the line-normalized ratio metric' }, h('input', { type: 'checkbox', checked: ST.contours, disabled: ST.mode !== 'ratio', onchange: (e) => { ST.contours = e.target.checked; emit(); } }), 'contours')),
     // Provenance and caveats stay one click away instead of pushing the plot down.
     (() => {
