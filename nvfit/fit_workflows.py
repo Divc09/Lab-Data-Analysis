@@ -23,6 +23,8 @@ from .models import (
     odmr_multi_lorentzian,
     odmr_multi_lorentzian_jac,
     rabi_adaptive_pulse_area_model,
+    rabi_chirp_jac,
+    rabi_phase_ramp_jac,
     rabi_chirp_model,
     rabi_cosine_decay_model,
     rabi_dual_model,
@@ -651,6 +653,7 @@ def _fit_rabi_phase_ramp(x: np.ndarray, y: np.ndarray, weights: np.ndarray | Non
     result = fit_model_multistart(
         model_name="RabiPhaseRamp",
         model_func=rabi_phase_ramp_model,
+        jac_func=rabi_phase_ramp_jac,
         x=x_fit,
         y=y,
         param_names=names,
@@ -797,6 +800,9 @@ def _fit_rabi_chirp(x: np.ndarray, y: np.ndarray, weights: np.ndarray | None, n_
     result = fit_model_multistart(
         model_name="RabiChirp",
         model_func=rabi_chirp_model,
+        jac_func=rabi_chirp_jac,
+        # Parameters span 1e-3 (alpha) to 1e6 (T): unscaled steps made some starts take ~19000 evaluations.
+        x_scale="jac",
         x=x_fit,
         y=y,
         param_names=names,

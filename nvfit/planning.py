@@ -223,7 +223,10 @@ def suggest_points(result, x, target_y, parameter: str, count: int = 10, x_min: 
         "fit_error": float(result.errors[names.index(parameter)]) if np.isfinite(result.errors[names.index(parameter)]) else None,
         "note": "Linearized at the current fit. Assumes the model is right and each new point has the residual noise of "
                 "the existing points (same averaging per point). Repeats mean measuring that position more than once. "
-                "'Spread like the current scan' adds the same number of points proportionally to the existing grid.",
+                "'Spread like the current scan' adds the same number of points proportionally to the existing grid. "
+                "σ here is the ordinary least-squares error. The fit's ± uses the robust soft-L1 loss, whose Jacobian "
+                "down-weights large residuals while the noise level comes from the raw residuals, so it is usually "
+                "larger (1.3-1.8x on the test files); compare the percentage improvements rather than the absolute σ.",
     }
 
 

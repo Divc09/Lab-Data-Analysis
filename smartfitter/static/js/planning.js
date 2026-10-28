@@ -144,7 +144,7 @@ function pointsSection(f, fit, spec) {
     r ? h('div', { class: 'row', style: 'gap:6px' },
       h('button', { class: 'btn sm', onclick: () => copyText(list.join(', '), `Copied ${list.length} ${unit} values`) }, `Copy list (${unit || 'native'})`),
       h('span', { class: 'note', style: 'margin:0' }, `Searched ${fmt(r.range[0], 5)}–${fmt(r.range[1], 5)} ${unit}.`)) : null,
-    r ? h('details', {}, h('summary', {}, 'Assumptions'), h('div', { class: 'note' }, `${r.note} σ is the model-based standard error; the fit reported ± ${sigma(r.fit_error)} (it may include SEM weights or other settings this estimate leaves out).`)) : null);
+    r ? h('details', {}, h('summary', {}, 'Assumptions'), h('div', { class: 'note' }, `${r.note} For this fit: σ now ${sigma(r.error_now)} (least squares) vs the fit's ± ${sigma(r.fit_error)}${Number.isFinite(r.fit_error) && r.error_now > 0 ? ` (${fmt(r.fit_error / r.error_now, 2)}×)` : ''}.`)) : null);
 }
 
 function sensitivitySection(f, fit) {

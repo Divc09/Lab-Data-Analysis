@@ -54,6 +54,23 @@ def rabi_phase_ramp_model(t, c, a, T, beta, f, tau_ramp, phi):
     return c + a * env * np.cos(theta)
 
 
+def rabi_phase_ramp_jac(t, c, a, T, beta, f, tau_ramp, phi):
+    """Analytic d model / d (c, a, T, beta, f, tau_ramp, phi) for rabi_phase_ramp_model, for T, beta and tau_ramp
+    above the model's 1e-9 safety floor (always true within the fit bounds)."""
+    x = np.asarray(t, dtype=float)
+    u = np.abs(x / T)
+    ub = u**beta
+    env = np.exp(-ub)
+    decay = np.exp(-x / tau_ramp)
+    lag = x - tau_ramp * (1.0 - decay)
+    theta = 2 * np.pi * f * lag + phi
+    cos, sin = np.cos(theta), np.sin(theta)
+    log_u = np.log(u, out=np.zeros_like(u), where=u > 0)
+    osc = -a * env * sin
+    return np.column_stack([np.ones_like(x), env * cos, a * cos * env * beta * ub / T, -a * cos * env * ub * log_u,
+                            osc * 2 * np.pi * lag, osc * 2 * np.pi * f * (decay * x / tau_ramp - (1.0 - decay)), osc])
+
+
 def rabi_adaptive_pulse_area_model(t, c, a, T, beta, f0, chirp1, chirp2, delay):
     """Rabi signal with a smooth, monotonic-capable pulse-area calibration.
 
@@ -76,6 +93,20 @@ def rabi_chirp_model(t, c, a, T, beta, f, alpha, phi):
     env = np.exp(-((np.abs(x / T)) ** beta))
     theta = 2 * np.pi * f * x + np.pi * alpha * x * x + phi
     return c + a * env * np.cos(theta)
+
+
+def rabi_chirp_jac(t, c, a, T, beta, f, alpha, phi):
+    """Analytic d model / d (c, a, T, beta, f, alpha, phi) for rabi_chirp_model."""
+    x = np.asarray(t, dtype=float)
+    u = np.abs(x / T)
+    ub = u**beta
+    env = np.exp(-ub)
+    theta = 2 * np.pi * f * x + np.pi * alpha * x * x + phi
+    cos, sin = np.cos(theta), np.sin(theta)
+    log_u = np.log(u, out=np.zeros_like(u), where=u > 0)  # u^beta * ln u -> 0 as u -> 0
+    osc = -a * env * sin
+    return np.column_stack([np.ones_like(x), env * cos, a * cos * env * beta * ub / T, -a * cos * env * ub * log_u,
+                            osc * 2 * np.pi * x, osc * np.pi * x * x, osc])
 
 
 def rabi_shifted_model(t, y0, m, A, f, phi, tau, t0):
