@@ -1,3 +1,4 @@
+import { maxAbs } from './numeric.js';
 // Iteration controls, independent fits and source-preserving run pooling.
 import { call } from './api.js';
 import { S, emit, commit, loadData, openFile, active, syncOverlay } from './state.js';
@@ -5,6 +6,7 @@ import { h, mount, check, input, field, select, modal, toast, fmt, clone, basena
 import { displayValue, parameterUnit, displayUnit, unitOptions, unitScale } from './unitdisplay.js';
 import { filePresentation } from './seriescontrol.js';
 import { baseStyle, baseLayout, axisLayout, plotConfig } from './plotstyle.js';
+import { sensitivityActions } from './sensitivity.js';
 
 export function parseIterationRange(text, count) {
   if (!text.trim()) return [];
@@ -40,9 +42,10 @@ export function iterationProvenance(f) {
   return `${f.info.combined ? 'Pooled' : 'Selected'} mean: ${it.selected.length}/${it.count} iterations [${formatIterationRange(it.selected) || 'none'}] · SEM = sample SD/√n (n ≥ 2).${target ? ` Fit: ${target}.` : ''}${f.info.combined ? ` Grid: ${f.info.combined.grid}; ${f.info.combined.runs.length} runs; no interpolation.` : ''}`;
 }
 export async function setIterationSelection(f, selection) {
-  if (f.fitting || f.iterationFitting) { toast('Wait for the current fit before changing iterations.'); return; }
+  if (f.fitting || f.iterationFitting || f.sensitivityFitting) { toast('Wait for the current fit before changing iterations.'); return; }
   commit('iteration selection');
   f.proc.iterations = selection;
+  delete f.proc.iteration_review;
   if (Object.keys(f.fit).length) f.fitStale = true;
   f.iterationFitsStale = true;
   await loadData(f); emit();
@@ -76,11 +79,11 @@ export function iterationCard(f) {
     h('div', { class: 'row wrap' }, check('Show iteration traces', f.layers.iter, (v) => { commit('iteration traces'); f.layers.iter = v; emit(); }),
       check('Mean ± SD', f.layers.meanSd, (v) => { commit('iteration spread'); f.layers.meanSd = v; emit(); })),
     h('details', {}, h('summary', {}, 'Exclude-outlier help / source iterations'),
-      h('div', { class: 'note' }, 'Inspect traces and the individual-fit trend for drift, failed acquisitions or poor fit flags. Uncheck a trace only with a recorded reason; do not select solely to obtain a desired fit. Low R² is a software quality flag, not proof of an outlier. Record the exclusion rationale in Sample notes.'),
+      h('div', { class: 'note' }, 'Sensitivity checks automatically uncheck iterations whose omission changes the selected parameter by at least the configured percentage, and refit the main plot. Recheck any iteration here to restore it to the mean; run a fit again to update the fit after a manual selection change. The sensitivity rule and excluded sources are recorded with the fit. Low R² or a large change alone does not prove an outlier.'),
       h('div', { class: 'iteration-source-list' }, it.sources.map((s, i) => h('div', { title: s.path }, `${i + 1} → ${basename(s.path)} · acquisition iteration ${s.iteration}`)))));
 }
 export async function runIterationFits(f) {
-  if (f.iterationFitting || f.fitting) return;
+  if (f.iterationFitting || f.fitting || f.sensitivityFitting) return;
   commit('fit individual iterations');
   const { prepareFitSpec } = await import('./analyze.js');
   const spec = prepareFitSpec(f), proc = clone(f.proc), det = f.detector, mode = f.mode;
@@ -99,11 +102,12 @@ export function iterationFitActions(f) {
   if (!it) return null;
   return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
     h('strong', {}, `Individual iterations · ${it.selected.length} selected`),
-    h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', disabled: f.fitting || f.iterationFitting || !it.selected.length, onclick: () => runIterationFits(f) }, f.iterationFitting ? 'Fitting iterations…' : 'Fit each selected iteration'),
+    h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', disabled: f.fitting || f.iterationFitting || f.sensitivityFitting || !it.selected.length, onclick: () => runIterationFits(f) }, f.iterationFitting ? 'Fitting iterations…' : 'Fit each selected iteration'),
       result ? h('button', { class: 'btn', onclick: () => openIterationResults(f) }, 'Iteration results…') : null),
     result ? check('Overlay individual fit curves', f.layers.iterFits, (v) => { commit('iteration fit overlays'); f.layers.iterFits = v; emit(); }) : null,
     result && f.iterationFitsStale ? h('div', { class: 'note' }, 'Individual fits are from earlier processing/settings. Refit to update.') : null,
-    h('div', { class: 'note' }, 'Uses the current model, range, seeds/bounds and smoothing setting. Single iterations have no across-iteration SEM.'));
+    h('div', { class: 'note' }, 'Uses the current model, range, seeds/bounds and smoothing setting. Single iterations have no across-iteration SEM.'),
+    sensitivityActions(f));
 }
 export function iterationRows(f, result = f.iterationFits?.[f.detector]) {
   const cfg = filePresentation(f, f);
@@ -128,7 +132,7 @@ export function iterationFigure(f) {
   const result = f.iterationFits?.[f.detector], parameter = f.iterationView?.parameter;
   const rows = (result?.rows || []).filter((r) => r.fit?.params.some((p) => p.name === parameter));
   const unit = parameterUnit(rows[0]?.fit.params.find((p) => p.name === parameter) || {}, f.info);
-  const max = Math.max(...rows.map((r) => Math.abs(r.fit.params.find((p) => p.name === parameter).value)), 0);
+  const max = maxAbs(rows.map((r) => r.fit.params.find((p) => p.name === parameter).value));
   const chosen = f.iterationView?.unit || 'auto', shownUnit = chosen === 'auto' ? displayUnit(max, unit).unit : chosen === 'native' ? unit : chosen;
   const scale = unitScale(unit, shownUnit) ?? 1;
   const st = baseStyle({ ...f.style, title: `${parameter || 'Parameter'} vs iteration · ${result?.mode || f.mode}`, x: {}, y: {} });

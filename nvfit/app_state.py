@@ -57,6 +57,7 @@ def fit_result_to_dict(result: FitResult | None) -> dict[str, Any] | None:
         "message": result.message,
         "selection_note": result.selection_note,
         "extras": result.extras,
+        "covariance": result.covariance, "free_mask": result.free_mask, "uncertainty": result.uncertainty,
     })
 
 
@@ -79,6 +80,8 @@ def fit_result_from_dict(value: dict[str, Any] | None) -> FitResult | None:
         message=str(value.get("message", "")),
         selection_note=str(value.get("selection_note", "")),
         extras=dict(value.get("extras") or {}),
+        covariance=np.asarray(value['covariance'], float) if value.get('covariance') is not None else None,
+        free_mask=value.get('free_mask'), uncertainty=dict(value.get('uncertainty') or {}),
     )
 
 

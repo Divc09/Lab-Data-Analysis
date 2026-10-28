@@ -134,7 +134,7 @@ export function renderFigure(root) {
   });
 }
 
-async function exportFigure(kind) {
+export async function exportFigure(kind) {
   const F = S.figure;
   const g = geometry();
   const fontPx = Math.round(((F.base || FONT_PT[F.preset] || 9) * 96) / 72);

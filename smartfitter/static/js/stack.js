@@ -1,7 +1,9 @@
+import {canonical} from './analysisidentity.js';
+import { finiteExtent } from './numeric.js';
 // Stacks workspace: z-stack of 2D maps, spot trajectory through z, and drift across sequential maps.
 // Maps are shown at native resolution (no interpolation, no regridding) with equal axis scaling.
 import { call } from './api.js';
-import { S, emit, detLabel } from './state.js';
+import { S, emit, detLabel, recordResult } from './state.js';
 import { h, mount, select, field, num, fmt, fmtPm, toast, basename, dirname, tag } from './util.js';
 import { copyText } from './export.js';
 
@@ -11,11 +13,13 @@ const KEY_COLOR = { x: '#1F6FB5', y: '#C0392B' };
 const OBSERVABLES = [['auto', 'Auto fluorescence (raw counts)'], ['value', 'Map value (selected mode)'], ['signal', 'Signal'], ['reference', 'Reference'], ['difference', 'Reference − signal']];
 
 // Persistent across view switches.
-const ST = {
+const STACK_DEFAULTS = {
   sel: [], det: 'detector1', source: 'auto', both: true,
   polarity: 'Auto', threshold: 3, maxJump: 3, gate: 3,
   stack: null, traj: null, drift: null, built: '', idx: 0, busy: '', peekTries: 0,
 };
+const ST = S.stack;
+Object.assign(ST,{...STACK_DEFAULTS,...ST});
 const els = {};
 
 const peekOf = (p) => S.library.peeks[p] || S.files[p]?.info || null;
@@ -46,7 +50,10 @@ function zLabel() {
 // ------------------------------------------------------------------ actions
 const run = async (label, fn) => {
   ST.busy = label; emit();
-  try { await fn(); } catch (e) { /* toast shown by api */ } finally { ST.busy = ''; emit(); }
+  try {
+    await fn();
+    for(const result of [ST.stack,ST.traj,ST.drift])if(result?.analysis)recordResult({detector:ST.det},result);
+  } catch (e) { /* toast shown by api */ } finally { ST.busy = ''; emit(); }
 };
 const baseOpts = () => ({ source: ST.source, polarity: ST.polarity, threshold: ST.threshold });
 
@@ -97,8 +104,30 @@ function sliceRows() {
   if (!out.length) for (const s of ST.stack?.slices || []) out.push({ det: s.detector, z: s.third_value, z_source: s.third_source, file_name: s.file_name, linked: null });
   return out;
 }
+const stackRequest=(kind)=>({paths:ST.sel,...(kind==='stack_trajectory'?{detectors:ST.both && ST.sel.every(p=>detectorCount(peekOf(p))>1)?[ST.det,ST.det==='detector1'?'detector2':'detector1']:[ST.det]}:{detector:ST.det}),mode:'contrast',opts:kind==='stack_build'?{source:ST.source,include_maps:true}:kind==='stack_trajectory'?{...baseOpts(),max_jump_fwhm:ST.maxJump}:{...baseOpts(),gate_fwhm:ST.gate}});
+const sourceChecks=new Map();
+function historicalWarnings(){
+  const out=[];
+  for(const [label,r]of [['Stack',ST.stack],['Trajectory',ST.traj],['Drift',ST.drift]]){
+    if(!r)continue;
+    const env=r.analysis,check=env && sourceChecks.get(env.signature);
+    if(!env || env.unverified)out.push(`${label}: unverified saved result; rebuild to verify.`);
+    else if(canonical(env.settings)!==canonical(stackRequest(env.kind)))out.push(`${label}: historical result; selected sources or options changed.`);
+    else if(check && !check.fresh)out.push(`${label}: historical result; ${check.reason}.`);
+    else if(!check)out.push(`${label}: checking source revisions…`);
+  }
+  return out;
+}
+function checkSources(){
+  for(const r of [ST.stack,ST.traj,ST.drift]){
+    const env=r?.analysis;if(!env || env.unverified)continue;
+    const old=sourceChecks.get(env.signature);if(old?.pending || old && Date.now()-old.checked<2000)continue;
+    sourceChecks.set(env.signature,{...old,pending:true});
+    call('validate_analysis',{analysis:env},{quiet:true}).then(check=>{sourceChecks.set(env.signature,{...check,checked:Date.now()});emit();}).catch(()=>{sourceChecks.set(env.signature,{fresh:false,reason:'Source verification unavailable',checked:Date.now()});emit();});
+  }
+}
 function warnings() {
-  return [...new Set([...(ST.stack?.warnings || []), ...(ST.traj?.warnings || []), ...(ST.drift?.warnings || [])])];
+  return [...new Set([...historicalWarnings(),...(ST.stack?.warnings || []), ...(ST.traj?.warnings || []), ...(ST.drift?.warnings || [])])];
 }
 
 function csvText(sep = '\t') {
@@ -107,7 +136,7 @@ function csvText(sep = '\t') {
     return sep === ',' && /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const row = (a) => a.map(q).join(sep);
-  const out = [`# SmartFitter stack results; positions in ${UNITS}; z provenance per slice below`];
+  const out = [`# SmartFitter stack results; positions in ${UNITS}; z provenance per slice below`,...['stack','traj','drift'].filter(k=>ST[k]).map(k=>'# '+k+' analysis '+JSON.stringify(ST[k].analysis || {unverified:true}))];
   const walk = walkRows();
   if (walk.length) {
     out.push('', '# Walk slope vs z (OLS; SE from scatter about the line)', row(['detector', 'axis', 'n', 'slope', 'slope_SE', 'R2', 'units']));
@@ -143,6 +172,10 @@ async function saveCsv() {
   toast('Saved stack results', 'ok');
 }
 
+export const hasStackResults = () => !!(walkRows().length || driftRows().length || sliceRows().length);
+export const saveStackResults = () => saveCsv();
+export const copyStackResults = () => copyText(csvText('\t'), 'Stack results copied');
+
 // ------------------------------------------------------------------ plots
 const AX = { automargin: true, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false, exponentformat: 'none' };
 const LAYOUT = (extra = {}) => ({ separators: '.', margin: { l: 72, r: 16, t: 14, b: 52 }, font: { family: 'Arial', size: 12, color: '#1D2330' }, showlegend: true, legend: { orientation: 'h', y: 1.12, x: 0 }, paper_bgcolor: '#fff', plot_bgcolor: '#fff', ...extra });
@@ -165,8 +198,8 @@ function drawSlice() {
   const dx = sl.x_step, dy = sl.y_step;
   const hx = (Number.isFinite(dx) ? dx : 1) / 2, hy = (Number.isFinite(dy) ? dy : 1) / 2; // half a pixel: the axis frames whole pixels
   const layout = LAYOUT({ margin: { l: 72, r: 16, t: 14, b: 52 }, showlegend: false,
-    xaxis: { ...AX, showgrid: false, title: { standoff: 10, text: `${ax0} (${UNITS})` }, constrain: 'domain', autorange: false, range: [Math.min(...sl.x) - hx, Math.max(...sl.x) + hx] },
-    yaxis: { ...AX, showgrid: false, title: { standoff: 10, text: `${ax1} (${UNITS})` }, scaleanchor: 'x', scaleratio: 1, constrain: 'domain', autorange: false, range: [Math.min(...sl.y) - hy, Math.max(...sl.y) + hy] } });
+    xaxis: { ...AX, showgrid: false, title: { standoff: 10, text: `${ax0} (${UNITS})` }, constrain: 'domain', autorange: false, range: [finiteExtent(sl.x)[0] - hx, finiteExtent(sl.x)[1] + hx] },
+    yaxis: { ...AX, showgrid: false, title: { standoff: 10, text: `${ax1} (${UNITS})` }, scaleanchor: 'x', scaleratio: 1, constrain: 'domain', autorange: false, range: [finiteExtent(sl.y)[0] - hy, finiteExtent(sl.y)[1] + hy] } });
   Plotly.react(plot('slice'), traces, layout, CFG);
   if (els.sliceInfo) {
     els.sliceInfo.textContent = `Slice ${ST.idx + 1}/${ST.stack.slices.length} · ${sl.file_name} · ${ST.stack.third_axis} = ${fmt(sl.third_value, 6)} [${zKind(sl.third_source)}] · ${sl.shape[1]} × ${sl.shape[0]} px · step ${fmt(dx, 4)} × ${fmt(dy, 4)} ${UNITS}`;
@@ -190,7 +223,7 @@ function drawTraj() {
         text: pts.map((p) => `${p.file_name}<br>z source: ${p.z_source}<br>err: ${p.err_source}`), hovertemplate: `${k} %{y:.6g} ± %{error_y.array:.2g}<br>z %{x:.6g}<br>%{text}<extra>${name}</extra>` });
       const w = r.walk?.[k];
       if (w && w.slope !== null && pts.length >= 2) {
-        const zs = pts.map((p) => p.z), lo = Math.min(...zs), hi = Math.max(...zs);
+        const zs = pts.map((p) => p.z), [lo, hi] = finiteExtent(zs);
         traces.push({ type: 'scatter', mode: 'lines', x: [lo, hi], y: [w.intercept + w.slope * lo, w.intercept + w.slope * hi], xaxis: 'x', yaxis: ya, line: { color: c, dash: 'dash', width: 1.4 }, legendgroup: d, showlegend: false, hoverinfo: 'skip' });
       }
     });
@@ -227,7 +260,7 @@ function drawOffset() {
       error_y: { type: 'data', array: rows.map((r) => r.err[k]), visible: true, color: c, thickness: 1.2, width: 4 } });
     const f = o.fit_vs_z?.[k];
     if (f && f.slope !== null && rows.length >= 2) {
-      const zs = rows.map((r) => r.z), lo = Math.min(...zs), hi = Math.max(...zs);
+      const zs = rows.map((r) => r.z), [lo, hi] = finiteExtent(zs);
       traces.push({ type: 'scatter', mode: 'lines', x: [lo, hi], y: [f.intercept + f.slope * lo, f.intercept + f.slope * hi], line: { color: c, dash: 'dash', width: 1.4 }, showlegend: false, hoverinfo: 'skip' });
     }
   }
@@ -253,7 +286,7 @@ function drawDrift() {
       text: good.map((d) => `${d.file_name}<br>matched ${d.n_matched}/${d.n_detected}`), hovertemplate: `%{y:.6g}<br>t %{x:.3g} min<br>%{text}<extra>${k}</extra>` });
     const f = D.drift_rate?.[k];
     if (f && f.slope !== null && good.length >= 2) {
-      const ts = good.map((d) => d.t_min), lo = Math.min(...ts), hi = Math.max(...ts);
+      const ts = good.map((d) => d.t_min), [lo, hi] = finiteExtent(ts);
       traces.push({ type: 'scatter', mode: 'lines', x: [lo, hi], y: [f.intercept + f.slope * lo, f.intercept + f.slope * hi], line: { color: c, dash: 'dash', width: 1.4 }, name: `${k} fit: ${fmtPm(f.slope, f.slope_se)} / min`, hoverinfo: 'skip' });
     }
   }
@@ -267,6 +300,8 @@ const card = (title, sub, el, min = 300) => h('section', { style: 'display:flex;
   h('div', { class: 'plotcard', style: `flex:none;height:${min}px;min-height:${min}px` }, el));
 
 export function renderStack(root) {
+  Object.assign(ST,{...STACK_DEFAULTS,...ST});
+  checkSources();
   const cands = candidates();
   const sel = ST.sel.filter((p) => cands.includes(p) || is2d(p));
   ST.sel = sel;

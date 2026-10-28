@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Callable, Iterable
 
 import numpy as np
@@ -26,6 +28,39 @@ class FitResult:
     message: str
     selection_note: str = ""
     extras: dict[str, object] = field(default_factory=dict)
+    covariance: np.ndarray | None = None
+    free_mask: list[bool] | None = None
+    uncertainty: dict[str, object] = field(default_factory=dict)
+    model_func: Callable | None = field(default=None, repr=False, compare=False)
+
+
+_controls = ContextVar('fit_parameter_controls', default=None)
+
+
+def current_parameter_controls():
+    return _controls.get()
+
+
+@contextmanager
+def parameter_controls(controls):
+    """One prepared request's controls, including nested model-selection fits."""
+    token = _controls.set(controls)
+    try:
+        yield
+    finally:
+        _controls.reset(token)
+
+
+def apply_parameter_controls(names, lower, upper, seed, controls):
+    for i, name in enumerate(names):
+        if not controls or name not in controls:
+            continue
+        value, locked, lo, hi = controls[name]
+        if lo is not None: lower[i] = lo
+        if hi is not None: upper[i] = hi
+        if value is not None and np.isfinite(value):
+            seed[i] = value
+            if locked: lower[i] = upper[i] = value
 
 
 def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
@@ -49,7 +84,7 @@ def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
     js = jac[:, idx] / norms[idx]
     # full_matrices so an underdetermined Jacobian (fewer rows than parameters) keeps its
     # null directions; their singular values are zero and mark those parameters NaN below.
-    _, sv, vt = np.linalg.svd(js, full_matrices=True)
+    _, sv, vt = np.linalg.svd(js, full_matrices=js.shape[0] < js.shape[1])
     sv = np.concatenate([sv, np.zeros(vt.shape[0] - len(sv))])
     keep = sv > sv[0] * 1e-8
     inv_s2 = np.where(keep, 1.0 / np.where(keep, sv, 1.0) ** 2, 0.0)
@@ -110,9 +145,15 @@ def fit_model_multistart(
 ) -> FitResult:
     lower_arr = np.asarray(list(lower), dtype=float)
     upper_arr = np.asarray(list(upper), dtype=float)
+    seeds = [np.asarray(seed, dtype=float).copy() for seed in seeds]
+    if not seeds:
+        raise ValueError('At least one optimizer start is required.')
+    apply_parameter_controls(param_names, lower_arr, upper_arr, seeds[0], _controls.get())
+    if np.any(upper_arr < lower_arr):
+        raise ValueError('Parameter bounds are reversed; lower must not exceed upper.')
     # A locked parameter arrives as lower == upper.  least_squares needs a strictly positive
     # interval, so optimize only the free parameters and re-insert the fixed values.
-    fixed = upper_arr <= lower_arr
+    fixed = upper_arr == lower_arr
     free = ~fixed
     if not np.any(free):
         raise ValueError("All fit parameters are locked; unlock at least one parameter to fit.")
@@ -123,6 +164,7 @@ def fit_model_multistart(
         p[free] = p_free
         return p
 
+    weighted = weights is not None
     if weights is None:
         weights = np.ones_like(y, dtype=float)
     w_sqrt = np.sqrt(weights)
@@ -169,12 +211,15 @@ def fit_model_multistart(
     # best.cost is the robust-loss sum for soft_l1 etc.; use the actual (weighted) residuals for s^2
     raw_cost = 0.5 * float(np.sum(np.square(best.fun)))
     p_err = np.zeros(len(p_opt))  # locked parameters are exact, not estimated
+    covariance = np.zeros((len(p_opt), len(p_opt)))
     if dof >= 1:
         cov = _estimate_covariance(best.jac, raw_cost, dof=dof)
+        covariance[np.ix_(free, free)] = cov
         p_err[free] = np.sqrt(np.maximum(np.diag(cov), 0.0))  # NaN propagates for unidentifiable parameters
     else:
         # no residual degrees of freedom: the data cannot estimate parameter uncertainty
         p_err[free] = np.nan
+        covariance[np.ix_(free, free)] = np.nan
     hits = bound_hit_flags(p_opt, lower_arr, upper_arr)
     hits = [bool(h and not f) for h, f in zip(hits, fixed)]
 
@@ -198,5 +243,9 @@ def fit_model_multistart(
         message=message,
         selection_note=selection_note,
         extras={"fixed_params": [n for n, f in zip(param_names, fixed) if f]} if np.any(fixed) else {},
+        covariance=covariance, free_mask=free.tolist(), model_func=model_func,
+        uncertainty={"method": "optimizer Jacobian; relative residual scale", "loss": loss,
+                     "weighted": weighted, "dof": dof, "n_observations": len(y),
+                     "band": "1-sigma model-mean confidence; excludes prediction noise"},
     )
 

@@ -149,7 +149,7 @@ export function modal(content, { onClose, className = '' } = {}) {
 export function contextMenu(x, y, items) {
   document.querySelectorAll('.ctx').forEach((m) => m.remove());
   const menu = h('div', { class: 'ctx', style: { left: `${x}px`, top: `${y}px` } },
-    items.filter(Boolean).map((it) => h('button', { onclick: () => { menu.remove(); it.run(); } }, h('span', {}, it.label), it.kbd ? h('span', { class: 'kbd' }, it.kbd) : null)));
+    items.filter(Boolean).map((it) => h('button', { disabled: !!it.disabled, onclick: () => { menu.remove(); it.run(); } }, h('span', {}, it.label), it.kbd ? h('span', { class: 'kbd' }, it.kbd) : null)));
   document.body.append(menu);
   const r = menu.getBoundingClientRect();
   if (r.right > innerWidth) menu.style.left = `${innerWidth - r.width - 8}px`;

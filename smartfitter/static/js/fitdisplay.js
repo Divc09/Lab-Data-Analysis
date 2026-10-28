@@ -19,13 +19,11 @@ const numbers = (a) => (a || []).map((v) => v === null ? NaN : v);
 export function normalizationFromData(d) {
   const xs = d?.proc?.fit_x || d?.proc?.x || [];
   const y = (d?.proc?.fit_y || d?.proc?.y || []).filter((v, i) => Number.isFinite(v) && Number.isFinite(xs[i]));
-  const raw = d?.raw?.trace_y || d?.raw?.y || [];
-  const useRaw = raw.length === y.length && raw.every(Number.isFinite);
-  const base = useRaw ? raw : y;
+  const base = y;
   if (!base.length) return null;
   const lo = base.reduce((a, b) => Math.min(a, b), Infinity), hi = base.reduce((a, b) => Math.max(a, b), -Infinity);
   const span = Math.max(hi - lo, 1e-9);
-  return { lo, span, source: useRaw ? 'trace.y' : 'y', stored: false };
+  return { lo, span, source: 'y', stored: false };
 }
 
 export function displaySeries(f, det, space, mainFit = null) {

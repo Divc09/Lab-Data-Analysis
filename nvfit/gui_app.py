@@ -121,6 +121,7 @@ from .preprocess import apply_roi, bin_trace, smooth_trace
 from .profiles import PROFILES, FitProfile, classify_status
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
+from .prepared_fit import PreparedFit, evaluate_result
 from .sessions import load_session, resolve_source, save_session, source_descriptor
 from .scan_spots import SpotFit, detect_fluorescent_spots
 from .map_comparison import PALETTES, axis_key, compatible_axes, build_map_overlay
@@ -3476,7 +3477,7 @@ class SmartFitterMainWindow(QMainWindow):
 
         results_row = QHBoxLayout()
         self.batch_filter_combo = NoScrollComboBox()
-        self.batch_filter_combo.addItems(["All", "PASS", "WARN", "FAIL"])
+        self.batch_filter_combo.addItems(["All", "PASS", "WARN", "FAIL", "PLOT_ONLY", "UNCONVERGED", "FALLBACK", "EXCLUDED"])
         self.batch_filter_combo.currentTextChanged.connect(self._apply_batch_filter)
         self.batch_search_edit = QLineEdit()
         self.batch_search_edit.setPlaceholderText("Search file, model, metric, or path")
@@ -3708,7 +3709,8 @@ class SmartFitterMainWindow(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 if col == 2:
                     item.setTextAlignment(Qt.AlignCenter)
-                    color = {"PASS": "#6fcf97", "WARN": "#e0a458", "FAIL": "#e57373"}.get(status)
+                    color = {"PASS": "#6fcf97", "WARN": "#e0a458", "FAIL": "#e57373",
+                             "PLOT_ONLY": "#a2aab7", "UNCONVERGED": "#e57373", "FALLBACK": "#e0a458"}.get(status)
                     if color:
                         item.setForeground(QColor(color))
                 self.batch_results_table.setItem(row_idx, col, item)
@@ -11332,13 +11334,8 @@ class SmartFitterMainWindow(QMainWindow):
         )
         self._active_fit_request = request
 
-        if is_ramsey_auto:
-            self.fit_worker = FitWorker(fit_ramsey_physics_first, x, y_target)
-        else:
-            if robust:
-                self.fit_worker = FitWorker(self._run_robust_fit_background, model_name, x, y_target, locks, fit_config)
-            else:
-                self.fit_worker = FitWorker(self._run_single_fit_background, model_name, x, y_target, locks, fit_config)
+        fit_route = self._run_robust_fit_background if robust else self._run_single_fit_background
+        self.fit_worker = FitWorker(fit_route, model_name, x, y_target, locks, fit_config)
 
         self.fit_worker.finished.connect(lambda result, req=request: self.on_fit_finished(FitOutcome(req, result)))
         self.fit_worker.error.connect(lambda message, req=request: self.on_fit_error(message, req))
@@ -11611,6 +11608,12 @@ class SmartFitterMainWindow(QMainWindow):
             )
         else:
             result = result_obj
+            if result is not None and result.extras.get('ramsey_candidates'):
+                summary_header = f"Selected by: {result.extras.get('ramsey_selected_by', 'prepared request')}"
+                summary_extra = "\n".join(f"- {c['model']}: R²={c['r2']:.4f}, BIC={c['bic']:.2f}, bound_hits={c['bound_hits']}" for c in result.extras['ramsey_candidates'])
+            if result is not None and result.extras.get('robust_subset'):
+                summary_header = 'Robust fit (best subset selected)'
+                robust_summary = "\n".join(f"- {c['subset']}: weighted MSE={c['weighted_mse']:.6g}" for c in result.extras.get('robust_candidates',[]))
             # Check for robust fit comparison in result.message
             if result is not None and result.message and "Robust fit candidate" in result.message:
                 msg_lines = result.message.split("\n")
@@ -11763,139 +11766,19 @@ class SmartFitterMainWindow(QMainWindow):
             )
             self._refresh_plot_only()
 
+    def _prepared_background_request(self, model_name, x, y, locks, config):
+        settings = {key: config[key] for key in FitWorkflowConfig.__dataclass_fields__ if key in config}
+        cfg = FitWorkflowConfig(**settings)
+        ramsey = model_name.startswith('Ramsey')
+        return PreparedFit.create(x,y,'Ramsey' if ramsey else model_name,cfg,locks,config.get('trace'),
+                                  'Auto' if model_name == 'RamseyAuto' else model_name if ramsey else 'Auto')
+
     def _run_single_fit_background(self, model_name, x, y, locks, config):
-        rng = np.random.default_rng(22)
-        tspan = float(np.max(x) - np.min(x))
-        yamp = float(0.5 * (np.percentile(y, 95) - np.percentile(y, 5)))
-        y0 = float(np.median(y))
-        f0 = estimate_ramsey_frequency(x, y)
-        n_starts = int(config["multistart"])
-
-        if model_name == "RamseySimple":
-            names = ["y0", "A", "f", "phi", "tau", "n"]
-            lower = [-0.2, 0.0, 2e-4, -2 * np.pi, 50.0, 0.5]
-            upper = [0.1, 0.2, 0.03, 2 * np.pi, 12000.0, 5.0]
-            seed0 = np.array([y0, max(1e-4, yamp), f0, 0.0, max(120.0, tspan / 3), 2.0])
-            SmartFitterMainWindow._apply_locks(names, lower, upper, seed0, locks)
-            scale = [0.05 * (u - l) for l, u in zip(lower, upper)]
-            seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
-            return fit_model_multistart(model_name=model_name, model_func=ramsey_simple, x=x, y=y, param_names=names, lower=lower, upper=upper, seeds=seeds)
-
-        if model_name == "RamseyHyperfine":
-            names = ["y0", "A", "f", "phi", "tau", "n"]
-            lower = [-0.2, 0.0, 2e-4, -2 * np.pi, 50.0, 0.5]
-            upper = [0.1, 0.2, 0.03, 2 * np.pi, 12000.0, 5.0]
-            seed0 = np.array([y0, max(1e-4, yamp), f0, 0.0, max(120.0, tspan / 3), 2.0])
-            SmartFitterMainWindow._apply_locks(names, lower, upper, seed0, locks)
-            scale = [0.05 * (u - l) for l, u in zip(lower, upper)]
-            seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
-            return fit_model_multistart(model_name=model_name, model_func=ramsey_hyperfine_n14, x=x, y=y, param_names=names, lower=lower, upper=upper, seeds=seeds)
-
-        return fit_non_ramsey(
-            model_name,
-            x,
-            y,
-            config=FitWorkflowConfig(
-                gaussian_peak_count=int(config.get("gaussian_peak_count", 1)),
-                multistart=n_starts,
-                rabi_use_sem=bool(config.get("rabi_use_sem", True)),
-                rabi_pi_lock=bool(config["rabi_pi_lock"]),
-                rabi_pi_ns=float(config["rabi_pi_ns"]),
-                rabi_pi2_ns=float(config["rabi_pi2_ns"]),
-                rabi_dead_time_ns=float(config["rabi_dead_time_ns"]),
-                rabi_mode=str(config["rabi_mode"]),
-                odmr_multipeak=bool(config["odmr_multipeak"]),
-                odmr_polarity=str(config.get("odmr_polarity", "Auto")),
-                odmr_peak_ranges=tuple(config.get("odmr_peak_ranges", ())),
-                odmr_peak_count=int(config["odmr_peak_count"]),
-                odmr_auto_peak=bool(config["odmr_auto_peak"]),
-                t1_prep_mode=str(config.get("t1_prep_mode", "Auto")),
-                t1_model_family=str(config.get("t1_model_family", "Stretched exponential")),
-                custom_spec=config["custom_spec"],
-                custom_expr=str(config["custom_expr"]),
-            ),
-            locks=locks,
-            custom_spec=config["custom_spec"],
-            trace_experiment_type=str(config.get("trace_experiment_type", model_name)),
-            trace=config.get("trace"),
-        )
+        return self._prepared_background_request(model_name,x,y,locks,config).run()[0]
 
     def _run_robust_fit_background(self, model_name, x, y, locks, config):
-        """Robust fit: run fits on multiple data subsets, compare ALL on full data."""
-        # 1. Baseline fit (full data)
-        base_res = self._run_single_fit_background(model_name, x, y, locks, config)
-
-        # 2. Define data subsets to try
-        n = len(x)
-        cuts = [
-            ("full",        0,              0),
-            ("trim_start4", int(n * 0.04),  0),
-            ("trim_start8", int(n * 0.08),  0),
-            ("trim_end5",   0,              int(n * 0.05)),
-            ("trim_both4",  int(n * 0.04),  int(n * 0.04)),
-            ("trim_start12",int(n * 0.12),  0),
-            ("trim_end10",  0,              int(n * 0.10)),
-        ]
-
-        # Each entry: (label, FitResult on subset, FitResult re-evaluated on full)
-        candidates = [("full", base_res, base_res)]  # base already on full data
-
-        sub_config = config.copy()
-        sub_config["multistart"] = max(1, int(config["multistart"] // 2))
-
-        for idx, (label, onset, offset) in enumerate(cuts[1:]):  # skip 'full' — already done
-            if n - onset - offset < 10:
-                continue
-            # Emit progress to UI
-            if self.fit_worker is not None:
-                self.fit_worker.progress.emit(f"Robust: fitting subset {idx+1}/{len(cuts)-1} ({label})...")
-            xv = x[onset : n - offset if offset else n]
-            yv = y[onset : n - offset if offset else n]
-            try:
-                sub_res = self._run_single_fit_background(model_name, xv, yv, locks, sub_config)
-                # Re-evaluate this candidate's params on the FULL data
-                model_func = MODEL_REGISTRY.get("SpinEcho" if sub_res.model_name == "T1" else sub_res.model_name)
-                if model_func is not None:
-                    x_eval = x
-                    if isinstance(sub_res.extras, dict) and sub_res.extras.get("x_offset_ns") is not None and sub_res.model_name in {"RabiPhaseRamp", "RabiCosine", "RabiChirp", "RabiLongDamped"}:
-                        x_eval = x - float(sub_res.extras["x_offset_ns"])
-                    y_fit_full = model_func(x_eval, *sub_res.params)
-                    full_eval = FitResult(
-                        model_name=sub_res.model_name,
-                        param_names=sub_res.param_names,
-                        params=sub_res.params,
-                        errors=sub_res.errors,
-                        y_fit=y_fit_full,
-                        r2=_r_squared(y, y_fit_full),
-                        rmse=_rmse(y, y_fit_full),
-                        aic=_aic(y, y_fit_full, len(sub_res.params)),
-                        bic=_bic(y, y_fit_full, len(sub_res.params)),
-                        durbin_watson=_dw(y - y_fit_full),
-                        bound_hits=sub_res.bound_hits,
-                        success=sub_res.success,
-                        message=f"{sub_res.message} (robust subset: {label})",
-                        extras=dict(sub_res.extras),
-                    )
-                else:
-                    full_eval = sub_res
-                candidates.append((label, sub_res, full_eval))
-            except Exception:
-                continue
-
-        # 3. Compare ALL candidates using full-data R² (apples-to-apples)
-        best_label, _, best_full = max(candidates, key=lambda t: t[2].r2)
-
-        # 4. Build a summary of all candidates for the user
-        summary_lines = ["Robust fit candidate comparison (all scored on full data):"]
-        for label, sub_res, full_res in candidates:
-            marker = " ★" if label == best_label else ""
-            summary_lines.append(
-                f"  {label}: subset_R²={sub_res.r2:.4f}, full_R²={full_res.r2:.4f}, "
-                f"RMSE={full_res.rmse:.6g}, BIC={full_res.bic:.2f}{marker}"
-            )
-        best_full.message = best_full.message + "\n" + "\n".join(summary_lines)
-        return best_full
-
+        progress = self.fit_worker.progress.emit if self.fit_worker is not None else None
+        return self._prepared_background_request(model_name,x,y,locks,config).run(robust=True,progress=progress)[0]
 
     def _plot_fit(self, fit_result: FitResult, y_raw: np.ndarray):
         self._start_series_registry()
@@ -11974,8 +11857,11 @@ class SmartFitterMainWindow(QMainWindow):
                         x_eval = x
                         if isinstance(fit_result.extras, dict) and fit_result.extras.get("x_offset_ns") is not None and fit_result.model_name in {"RabiPhaseRamp", "RabiCosine", "RabiChirp", "RabiLongDamped"}:
                             x_eval = x - float(fit_result.extras["x_offset_ns"])
-                        y_upper = model_func(x_eval, *(fit_result.params + fit_result.errors))
-                        y_lower = model_func(x_eval, *(fit_result.params - fit_result.errors))
+                        from smartfitter.core import _conf_band
+                        sigma = _conf_band(fit_result, x, x, y)
+                        if sigma is None: raise ValueError('Confidence covariance unavailable')
+                        prediction = evaluate_result(fit_result, x)
+                        y_upper, y_lower = prediction + sigma, prediction - sigma
                         yu_disp, _ = self._display_y(y_upper)
                         yl_disp, _ = self._display_y(y_lower)
                         # Ensure upper >= lower for fill_between

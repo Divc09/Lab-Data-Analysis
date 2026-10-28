@@ -1,3 +1,4 @@
+import { finiteExtent } from './numeric.js';
 // AutoFind: saved search evidence in native absolute stage coordinates (um).
 import { call } from './api.js';
 import { S, emit, openFile } from './state.js';
@@ -146,6 +147,16 @@ async function exportSet() {
   toast(`Exported ${ST.exportResult.pngs.length} PNGs; ${ST.exportResult.errors.length} errors. See export.json for provenance.`);
 }
 
+export const canExportAutoFind = () => !!ST.source && !ST.busy;
+export const exportAutoFind = () => action('Export figure set', async () => {
+  if (!ST.exportDir) {
+    const dir = await call('dialog', { kind: 'open_folder', title: 'Choose figure export directory', directory: '' });
+    if (!dir) return;
+    ST.exportDir = dir;
+  }
+  await exportSet();
+}, { preempt: false });
+
 function layout(title, extra = {}) {
   return { paper_bgcolor: 'white', plot_bgcolor: 'white', font: { family: 'Arial, sans-serif', size: 11, color: '#111111' },
     title: { text: title, font: { size: 13 } }, margin: { l: 72, r: 30, b: 65, t: 55 }, hovermode: 'closest',
@@ -200,7 +211,7 @@ function contourTraces(m, run, showlegend = true) {
 function footprints(run) {
   const present = new Set();
   return run.scans.filter((s) => s.xLim && s.yLim).map((s) => {
-    const [x0, x1] = [Math.min(...s.xLim), Math.max(...s.xLim)], [y0, y1] = [Math.min(...s.yLim), Math.max(...s.yLim)];
+    const [x0, x1] = finiteExtent(s.xLim), [y0, y1] = finiteExtent(s.yLim);
     const showlegend = !present.has(s.kind); present.add(s.kind);
     return { type: 'scatter', mode: 'lines', x: [x0, x1, x1, x0, x0], y: [y0, y0, y1, y1, y0],
       line: { color: COLORS[s.kind], width: 1, dash: DASH[s.kind] || 'dot' }, name: `${s.kind} footprint`, showlegend,
@@ -308,7 +319,7 @@ function compareView() {
   const allMaps = subset.flatMap((r) => mapsOf(r.source)).filter((m) => m.values);
   const xs = allMaps.flatMap((m) => m.x_edges), ys = allMaps.flatMap((m) => m.y_edges);
   for (const r of subset) { xs.push(...r.visits.map((v) => v.x)); ys.push(...r.visits.map((v) => v.y)); }
-  const bounds = (v) => v.length ? [Math.min(...v), Math.max(...v)] : [0, 1];
+  const bounds = (v) => v.length ? finiteExtent(v, [0, 1]) : [0, 1];
   subset.forEach((r) => {
     const i = ST.colors.get(r.source) || 0, maps = mapsOf(r.source).filter((m) => m.values), axis = `coloraxis${i === 0 ? '' : i + 1}`;
     axes[axis] = { ...range(maps), colorscale: [[0, 'white'], [1, PALETTE[i]]], showscale: false };

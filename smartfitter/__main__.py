@@ -25,16 +25,20 @@ LOCK = core.SETTINGS_DIR / "instance.json"
 
 def _existing_instance() -> int | None:
     try:
-        port = int(json.loads(LOCK.read_text())["port"])
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/index.html", timeout=0.7).read(16)
+        record=json.loads(LOCK.read_text())
+        port = int(record['port'])
+        request=urllib.request.Request(f'http://127.0.0.1:{port}/api/ping',data=b'{}',headers={'Content-Type':'application/json','X-SmartFitter-Token':record['token']},method='POST')
+        if not json.loads(urllib.request.urlopen(request,timeout=.7).read()).get('ok'): return None
         return port
     except Exception:
         return None
 
 
 def _post(port: int, name: str, payload: dict) -> None:
+    record=json.loads(LOCK.read_text())
+    if int(record['port']) != port: raise ValueError('SmartFitter instance changed; retry the launch.')
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/{name}", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+                                 headers={"Content-Type": "application/json",'X-SmartFitter-Token':record['token']}, method="POST")
     urllib.request.urlopen(req, timeout=3).read()
 
 
@@ -66,7 +70,7 @@ def main() -> None:
     api.pending_open = files
     server = serve(api, args.port)
     port = server.server_address[1]
-    url = f"http://127.0.0.1:{port}/"
+    url = f"http://127.0.0.1:{port}/#token={api.token}"
     core.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.serve or args.browser:
@@ -79,7 +83,7 @@ def main() -> None:
             pass
         return
 
-    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid()}))
+    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid(),'token':api.token}))
     try:
         import webview
 

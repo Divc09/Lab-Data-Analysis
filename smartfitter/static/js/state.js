@@ -2,6 +2,7 @@
 import { call } from './api.js';
 import { clone, toast } from './util.js';
 import { unitScale } from './unitdisplay.js';
+import { canonical, scientificRevision, sourcePath, analysisDescriptor, analysisId, resultEnvelope, remapReferences, persistentValue, fitSettings } from './analysisidentity.js';
 
 export const S = {
   version: '', desktop: false, settings: {},
@@ -9,6 +10,7 @@ export const S = {
   libCollapsed: false,
   library: { folder: null, listing: null, peeks: {}, filter: '', chip: 'all', extra: [], seen: {}, newSince: {} },
   files: {},
+  results: {}, stack: {},
   primary: null,
   overlays: [], overlaySlots: {},
   compare: { set: [], norm: 'max', layout: 'overlaid', param: '', against: 'time', results: {}, trendSel: null },
@@ -22,7 +24,7 @@ export const subscribe = (fn) => { listeners.add(fn); return () => listeners.del
 export function emit(what = 'all') { listeners.forEach((fn) => fn(what)); }
 
 export const DEFAULT_LAYERS = {
-  data: true, fit: true, band: false, res: true, smooth: false, iter: false, iterFits: false, meanSd: false, envelope: false,
+  data: true, fit: true, band: false, res: false, smooth: false, iter: false, iterFits: false, meanSd: false, envelope: false,
   conf: false, sigref: false, fft: false, legend: true, results: false, peaks: true,
 };
 
@@ -31,7 +33,7 @@ export function defaultFitSpec(info) {
     model: 'Auto', experiment: '', range_min: null, range_max: null, multistart: 12, robust: false,
     rabi_mode: 'Auto compare', sem_weights: true, pi_lock: false, pi_ns: 200, pi2_ns: 100, dead_time_ns: 0,
     odmr_polarity: 'Auto', odmr_multi: false, odmr_peaks: 2, odmr_auto_peaks: true, odmr_ranges: [],
-    t1_prep: 'Auto', t1_family: 'Stretched exponential', ramsey_model: 'Auto', peaks: 1,
+    t1_prep: 'Auto', t1_family: 'Regular exponential', ramsey_model: 'Auto', peaks: 1,
     custom_expr: 'y0 + A*exp(-x/tau)', custom_params: [], fit_smoothed: false, quality_gate: true, params: {},
     apply_both: false,
   };
@@ -45,7 +47,7 @@ function newFileState(path, info, settings) {
     detector: info.detectors[0] || 'detector1',
     labels: { ...(st.detector_labels || {}), ...info.detector_labels },
     proc: { bin: 1, smooth: 5, iterations: null, roi_min: null, roi_max: null, excluded: [], exclusion_ranges: [], steps: [] },
-    data: {}, fit: {}, fitHistory: [], iterationFits: {}, iterationView: {}, combinedRecipe: info.combined_recipe || null,
+    data: {}, fit: {}, fitHistory: [], iterationFits: {}, iterationSensitivity: {}, iterationView: {}, combinedRecipe: info.combined_recipe || null,
     display: { invert: false, xscale: 1, xoffset: 0, t1: 'original', overlayFits: true }, sample: {}, reportKeys: null,
     fitSpec: defaultFitSpec(info),
     layers: { ...DEFAULT_LAYERS, ...(info.type === 'TimeTrace' ? { res: false, legend: true } : {}) },
@@ -79,14 +81,32 @@ export async function openFile(path, { primary = true } = {}) {
 }
 
 // Fetch (or refetch) the processed data for every detector this view needs.
+// Keep request ownership outside serializable/undoable file state.
+const loadRevisions = new WeakMap();
 export async function loadData(f, { all = true } = {}) {
-  const dets = all ? f.info.detectors : [f.detector];
-  const results = await Promise.all(dets.map((d) => call('load', { path: f.path, detector: d, mode: f.mode, proc: f.proc }, { label: 'Loading' })));
+  const revision = (loadRevisions.get(f) || 0) + 1;
+  loadRevisions.set(f, revision);
+  const path = f.path, mode = f.mode, proc = clone(f.proc);
+  const dets = [...(all ? f.info.detectors : [f.detector])];
+  const current = () => loadRevisions.get(f) === revision && S.files[path] === f && f.path === path
+    && f.mode === mode && JSON.stringify(f.proc) === JSON.stringify(proc);
+  let results;
+  try {
+    results = await Promise.all(dets.map((d) => call('load', { path, detector: d, mode, proc }, { quiet: true, label: 'Loading' })));
+  } catch (e) {
+    if (!current()) return false;
+    toast(`Loading: ${e.message}`, 'err');
+    throw e;
+  }
+  if (!current()) return false;
   dets.forEach((d, i) => { f.data[d] = results[i]; });
   f.info = results[0].info;
+  return true;
 }
 
 export async function reloadFile(f) {
+  f.sourceRevision = (f.sourceRevision || 0) + 1;
+  for (const result of Object.values(f.iterationSensitivity || {})) result.source_changed = true;
   await loadData(f);
   emit();
 }
@@ -123,9 +143,98 @@ export async function syncOverlays(f) {
 export const active = () => (S.primary ? S.files[S.primary] : null);
 export const detLabel = (f, d) => (f.labels && f.labels[d]) || (d === 'detector2' ? 'Detector 2' : 'Detector 1');
 
+export function envelopeFor(f, det = f.detector, settings = f.fitSpec || {}, kind = 'fit', hints = {}) {
+  const dependencies = { ...hints,...(f.data?.[det]?.analysis?.dependencies || {}) };
+  for(const dep of Object.keys(dependencies)) {
+    const owner=Object.values(S.files).find(o=>sourcePath(o.path)===sourcePath(dep));
+    if(owner?.info?.source_revision)dependencies[dep]=owner.info.source_revision;
+  }
+  const baseline = f.proc?.baseline?.path;
+  if (baseline) {
+    const owner = Object.values(S.files).find((o) => sourcePath(o.path) === sourcePath(baseline));
+    if (owner?.info?.source_revision) dependencies[sourcePath(baseline)] = owner.info.source_revision;
+  }
+  const cleanSettings = kind==='fit' ? fitSettings(settings) : settings;
+  return resultEnvelope(analysisDescriptor(f.path,det,f.mode,clone(f.proc || {})), f.info?.source_revision || null, clone(cleanSettings), clone(dependencies), kind);
+}
+
+export function recordResult(f, result, {det = f.detector, settings = f.fitSpec, kind = 'fit'} = {}) {
+  if (!result) return result;
+  result.analysis ||= envelopeFor(f,det,settings,kind);
+  S.results[`${result.analysis.kind}:${result.analysis.signature}`] = {analysis:result.analysis,payload:result};
+  return result;
+}
+
+export function resultFreshness(f, result, det = f.detector, settings = null) {
+  if (!result?.analysis || result.unverified || result.analysis.unverified) return {fresh:false,reason:'Unverified saved result; refit'};
+  const env = result.analysis;
+  if (!f.info?.source_revision) return {fresh:false,reason:'Source revision unavailable'};
+  const expected = settings || (env.kind === 'fit' ? {...(f.fitSpec || {}),robust:!!env.settings.robust} : env.settings);
+  const context=['deer_ratio','tt_steps','tt_drift','tt_ratio'].includes(env.kind) ? {...f,proc:env.descriptor.processing} : f;
+  const now = envelopeFor(context,det,expected,env.kind,env.dependencies);
+  return {fresh:now.signature === env.signature,reason:now.signature === env.signature ? '' : 'Source, detector, observable, processing or settings changed'};
+}
+export const currentResult = (f, det = f.detector) => resultFreshness(f,f.fit?.[det],det).fresh ? f.fit[det] : null;
+export const plotFile = (f) => ({...f,fit:Object.fromEntries(Object.entries(f.fit || {}).filter(([det,r])=>resultFreshness(f,r,det).fresh))});
+
+// A Compare item fixes detector identity and optionally captures independent processing.
+export function compareFile(id) {
+  const item = S.compare.items?.[id];
+  if (!item) return S.files[id]; // migrated at the next Compare render/session save
+  const f = S.files[item.path];
+  if (!f) return null;
+  const cached = item.data?.[item.detector];
+  const data = item.linked === false ? (cached && canonical(scientificRevision(cached.info.source_revision)) === canonical(scientificRevision(f.info?.source_revision)) ? item.data : {}) : f.data;
+  return {...f,path:item.path,detector:item.detector,mode:item.linked === false ? item.mode : f.mode,
+    proc:item.linked === false ? item.proc : f.proc,fitSpec:item.linked === false ? item.spec : f.fitSpec,
+    info:{...(cached?.info || f.info),source_revision:f.info?.source_revision},data};
+}
+export async function reloadCompareItem(id) {
+  const item=S.compare.items?.[id],f=compareFile(id); if(!item || !f || item.loading)return;
+  item.loading=true;
+  try {
+    const payload=await call('load',{path:f.path,detector:f.detector,mode:f.mode,proc:f.proc},{label:'Loading Compare variant'});
+    if(S.compare.items[id]!==item)return;
+    item.data={[f.detector]:payload};
+    if(S.files[f.path])S.files[f.path].info.source_revision=payload.info.source_revision;
+  } finally {item.loading=false;}
+}
+export function addCompareItem(f, {detector = f.detector, mode = f.mode, proc = f.proc, spec = f.fitSpec, result = null, linked = true, data = null} = {}) {
+  S.compare.items ||= {};
+  const descriptor = analysisDescriptor(f.path,detector,mode,clone(proc || {})), id = analysisId(descriptor);
+  S.compare.items[id] = {path:f.path,detector,mode,proc:clone(proc || {}),spec:clone(spec || {}),linked,data};
+  if (!S.compare.set.includes(id)) S.compare.set.push(id);
+  if (result) {
+    if(!result.analysis) result.unverified=true;
+    S.compare.results[id] = recordResult({...f,mode,proc,fitSpec:spec},result,{det:detector,settings:spec});
+  }
+  return id;
+}
+export function refreshCompareItems() {
+  const c = S.compare; c.items ||= {}; c.results ||= {};
+  for (const old of [...c.set]) {
+    if (!c.items[old]) {
+      const f = S.files[old]; if (!f) continue;
+      const result = c.results[old]; c.set = c.set.filter((id)=>id!==old);
+      const id = addCompareItem(f,{result});
+      delete c.results[old];
+      for (const key of ['hidden','sel','trendSel']) if (Array.isArray(c[key])) c[key] = c[key].map((v)=>v===old?id:v);
+      continue;
+    }
+    const f = compareFile(old), item = c.items[old]; if (!f || item.linked === false) continue;
+    const id = analysisId(analysisDescriptor(f.path,item.detector,f.mode,f.proc));
+    if (id === old) continue;
+    c.items[id] = {...item,mode:f.mode,proc:clone(f.proc),spec:clone(f.fitSpec)};
+    c.set = [...new Set(c.set.map((v)=>v===old?id:v))];
+    if (c.results[old]) c.results[id] = c.results[old];
+    for (const key of ['hidden','sel','trendSel']) if (Array.isArray(c[key])) c[key] = c[key].map((v)=>v===old?id:v);
+    delete c.items[old]; delete c.results[old];
+  }
+}
+
 // ---- undo / redo: snapshots of the analysis-relevant parts of the active file ----
 const undoStack = [], redoStack = [];
-const SNAP_KEYS = ['mode', 'detector', 'proc', 'fitSpec', 'fit', 'fitByMode', 'fitStale', 'layers', 'layersTouched', 'styleMode', 'errorMode', 'style', 'map', 'spots', 'spotRemoved', 'tt', 'compareDetectors', 'pins', 'measure', 'display', 'xrange', 'yrange', 'sample', 'reportKeys', 'iterationFits', 'iterationView', 'iterationFitsStale'];
+const SNAP_KEYS = ['mode', 'detector', 'proc', 'fitSpec', 'fit', 'fitByMode', 'fitStale', 'layers', 'layersTouched', 'styleMode', 'errorMode', 'style', 'map', 'spots', 'spotRemoved', 'tt', 'compareDetectors', 'pins', 'measure', 'display', 'xrange', 'yrange', 'sample', 'reportKeys', 'iterationFits', 'iterationSensitivity', 'iterationView', 'iterationFitsStale'];
 const fileSnap = (f) => clone(Object.fromEntries(SNAP_KEYS.map((k) => [k, f[k]])));
 const snap = (f) => ({ path: f.path, state: fileSnap(f), states: Object.fromEntries(Object.values(S.files).map((o) => [o.path, fileSnap(o)])), overlays: [...S.overlays], overlaySlots: { ...S.overlaySlots } });
 
@@ -162,6 +271,7 @@ export function clearHistory() { undoStack.length = 0; redoStack.length = 0; }
 
 // ---- session documents ----
 export function sessionDoc() {
+  refreshCompareItems();
   const files = Object.values(S.files).map((f) => ({
     path: f.path, mode: f.mode, detector: f.detector, labels: f.labels, proc: f.proc, fitSpec: f.fitSpec,
     fit: Object.fromEntries(Object.entries(f.fit).map(([d, r]) => [d, { ...r, raw: undefined }])),
@@ -169,20 +279,26 @@ export function sessionDoc() {
     spots: f.spots, spotRemoved: f.spotRemoved, tt: { ...f.tt, pgram: null }, compareDetectors: f.compareDetectors, pins: f.pins, measure: f.measure,
     xrange: f.xrange, yrange: f.yrange, tab: f.tab, display: f.display, sample: f.sample, reportKeys: f.reportKeys,
     fitByMode: f.fitByMode, fitStale: f.fitStale, layersTouched: f.layersTouched, exp: f.exp, expStem: f.expStem, expDir: f.expDir,
-    iterationFits: f.iterationFits, iterationView: f.iterationView, iterationFitsStale: f.iterationFitsStale, combinedRecipe: f.combinedRecipe,
+    iterationFits: f.iterationFits, iterationSensitivity: f.iterationSensitivity, iterationView: f.iterationView, iterationFitsStale: f.iterationFitsStale, combinedRecipe: f.combinedRecipe,
+    boot:persistentValue(f.boot), peakPick:persistentValue(f.peakPick), peakPickOpts:f.peakPickOpts,
+    deerRatio:persistentValue(f.deerRatio), _sci:persistentValue(f._sci), fitHistory:persistentValue(f.fitHistory),
   }));
   // Compare fits may have been produced in its own workspace and need not exist in f.fit.
   // Keep the curves/metrics needed for the overlay and trend, omitting only the large raw fitter payload.
   const compareResults = Object.fromEntries(Object.entries(S.compare.results || {})
-    .filter(([path]) => S.files[path] && S.compare.set.includes(path))
+    .filter(([id]) => compareFile(id) && S.compare.set.includes(id))
     .map(([path, result]) => [path, { ...result, raw: undefined }]));
-  return { files: files.map((x) => x.path), state: files, primary: S.primary, overlays: S.overlays, overlaySlots: S.overlaySlots, compare: { ...S.compare, results: compareResults }, figure: S.figure, library: { folder: S.library.folder, extra: S.library.extra } };
+  return {schema_version:2, results:persistentValue(S.results), stack:persistentValue(S.stack), files: files.map((x) => x.path), state: files, primary: S.primary, overlays: S.overlays, overlaySlots: S.overlaySlots, compare: { ...S.compare, items:persistentValue(S.compare.items),results: compareResults }, figure: S.figure, library: { folder: S.library.folder, extra: S.library.extra } };
 }
 
 export async function applySession(doc) {
   const moved = doc.moved || {};
+  doc = remapReferences(clone(doc),moved);
+  doc.changed = (doc.changed || []).map(p=>moved[p] || p);
   clearHistory();
   S.files = {};
+  S.results = Object.fromEntries(Object.values(doc.results || {}).map(r=>[`${r.analysis.kind}:${r.analysis.signature}`,r]));
+  Object.keys(S.stack).forEach(k=>delete S.stack[k]); Object.assign(S.stack,clone(doc.stack || {}));
   const remapSources = (value) => {
     if (!value || typeof value !== 'object') return;
     if (typeof value.path === 'string') value.path = moved[value.path] || value.path;
@@ -201,7 +317,11 @@ export async function applySession(doc) {
       }
       const f = await openFile(path, { primary: false });
       Object.assign(f, clone({ ...saved, path }));
-      if (changed) { f.fitStale = true; f.iterationFitsStale = true; }
+      for(const result of Object.values(f.fit || {})) if(!result.analysis) result.unverified=true;
+      if (changed) {
+        f.fitStale = true; f.iterationFitsStale = true;
+        for (const result of Object.values(f.iterationSensitivity || {})) result.source_changed = true;
+      }
       f.style ||= {};
       if (f.style.fileOrder) f.style.fileOrder = f.style.fileOrder.map((p) => moved[p] || p);
       if (f.style.comparison) f.style.comparison = Object.fromEntries(Object.entries(f.style.comparison).map(([p, cfg]) => [moved[p] || p, cfg]));
@@ -222,18 +342,30 @@ export async function applySession(doc) {
   S.compare = { set: [], norm: 'max', layout: 'overlaid', param: '', against: 'time', results: {}, trendSel: null, ...clone(savedCompare) };
   for (const key of ['set', 'hidden', 'sel', 'trendSel']) if (Array.isArray(S.compare[key])) S.compare[key] = S.compare[key].map((p) => moved[p] || p);
   const changed = new Set(doc.changed || []);
-  S.compare.results = Object.fromEntries(Object.entries(savedCompare.results || {})
-    .map(([path, result]) => [moved[path] || path, result, path])
-    .filter(([path, , oldPath]) => S.files[path] && !changed.has(oldPath) && !changed.has(path))
-    .map(([path, result]) => [path, result]));
+  if(S.compare.items) {
+    const replacements = {};
+    S.compare.items = Object.fromEntries(Object.entries(S.compare.items).map(([old,item])=>{
+      const id=analysisId(analysisDescriptor(item.path,item.detector,item.mode,item.proc)); replacements[old]=id;return [id,item];
+    }));
+    for(const key of ['set','hidden','sel','trendSel']) if(Array.isArray(S.compare[key])) S.compare[key]=S.compare[key].map(id=>replacements[id] || id);
+    S.compare.results=Object.fromEntries(Object.entries(savedCompare.results || {}).map(([id,result])=>[replacements[id] || id,result]));
+  } else S.compare.results=Object.fromEntries(Object.entries(savedCompare.results || {}).map(([p,r])=>[moved[p] || p,r]));
+  for(const result of Object.values(S.compare.results)) if(!result.analysis) result.unverified=true;
+  refreshCompareItems();
+  for(const id of S.compare.set) if(S.compare.items?.[id]?.linked===false) {
+    if(compareFile(id)?.data[S.compare.items[id].detector]?.proc)continue;
+    S.compare.items[id].data={};
+    try{await reloadCompareItem(id);}catch(e){toast(`Could not reload captured analysis: ${e.message}`,'err');}
+  }
   // A pooled fit refers to the original source paths too; discard it when any input changed.
   if (S.compare.global?.res?.datasets?.some((d) => changed.has(d.path) || changed.has(moved[d.path] || d.path) || !S.files[moved[d.path] || d.path])) S.compare.global = null;
   else if (S.compare.global?.res?.datasets) {
     S.compare.global.res.datasets.forEach((d) => { d.path = moved[d.path] || d.path; });
     S.compare.global.key = S.compare.global.key?.split('|').map((p) => moved[p] || p).join('|');
   }
-  Object.assign(S.figure, doc.figure || {});
-  S.figure.panels = S.figure.panels.map((p) => ({ ...p, path: moved[p.path] || p.path }));
+  Object.assign(S.figure, clone(doc.figure || {}));
+  S.figure.panels = S.figure.panels.map((p) => ({ ...p, path: moved[p.path] || p.path,
+    ...(p.overlays ? { overlays: p.overlays.map((path) => moved[path] || path) } : {}) }));
   if (doc.library?.folder) S.library.folder = doc.library.folder;
   S.library.extra = (doc.library?.extra || []).map((p) => moved[p] || p);
   S.view = S.primary ? 'analyze' : 'home';

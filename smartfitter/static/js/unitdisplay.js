@@ -2,9 +2,10 @@
 const GROUPS = {
   time: { ps: 1e-12, ns: 1e-9, us: 1e-6, ms: 1e-3, s: 1 },
   frequency: { Hz: 1, kHz: 1e3, MHz: 1e6, GHz: 1e9 },
+  length: { nm:1e-9, um:1e-6, mm:1e-3, m:1 },
 };
 export const parameterUnit = (p, info) => p.unit === 'axis units' ? (info.x_unit || p.unit) : p.unit;
-export const canonicalUnit = (u) => String(u || '').trim().replace(/[µμ]/g, 'u');
+export const canonicalUnit = (u) => String(u || '').trim().replace(/[µμ�]/g, 'u');
 export function unitGroup(unit) {
   const u = canonicalUnit(unit);
   return Object.keys(GROUPS).find((g) => Object.hasOwn(GROUPS[g], u)) || null;

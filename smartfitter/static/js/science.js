@@ -2,10 +2,15 @@
 // DEER reference normalisation + resonance helper, and time-trace step / ratio / drift tools.
 // Everything here states its method and assumptions next to the numbers. State lives on f._sci / f.boot / f.deerRatio.
 import { call } from './api.js';
-import { S, emit, detLabel } from './state.js';
+import { S, emit, detLabel, envelopeFor, recordResult, resultFreshness } from './state.js';
 import { h, input, check, field, select, seg, fmt, fmtPm, num } from './util.js';
 
 const sci = (f) => (f._sci = f._sci || {});
+export function historicalToolNote(f) {
+  const records=[...Object.values(f.boot || {}).map(b=>b.res),...Object.values(f.peakPick || {}),f.deerRatio?.res,f._sci?.nv?.res,f._sci?.tt?.steps,f._sci?.tt?.ratio,f._sci?.tt?.drift].filter(Boolean);
+  const stale=records.filter(r=>!resultFreshness(f,r,r.analysis?.descriptor.detector || f.detector).fresh);
+  return stale.length ? warn(`${stale.length} scientific result(s) are historical or unverified. Rerun their tools for this analysis.`) : null;
+}
 const spin = () => h('span', { class: 'spinner' });
 const card = (...kids) => h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, ...kids);
 const title = (t, right) => h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, t), h('span', { class: 'sp' }), right || null);
@@ -34,7 +39,17 @@ async function run(f, key, fn) {
   const s = sci(f);
   if (s[key + 'Busy']) return;
   s[key + 'Busy'] = true; emit('insp');
-  try { await fn(); } catch (e) { s[key + 'Err'] = e.message; } finally { s[key + 'Busy'] = false; emit('insp'); }
+  const inputs=key==='nv' ? {fit_D:s.nv?.fitD,fit_E:s.nv?.fitE,text:s.nv?.text} : key==='deerRes' ? {B:s.deer?.B,fGHz:s.deer?.fGHz} : key==='boot' ? {n_boot:s.nBoot ?? 200,parentSignature:f.fit[f.detector]?.analysis?.signature} : {};
+  const analysis=envelopeFor(f,f.detector,{tool:key,inputs},key);
+  try {
+    await fn();
+    const bind=(r)=>{if(r&&typeof r==='object'){r.analysis ||= analysis;recordResult(f,r,{kind:key});}};
+    if(key==='boot')bind(f.boot?.[analysis.descriptor.detector]?.res);
+    else if(key==='deer')bind(f.deerRatio?.res);
+    else if(key==='nv')bind(s.nv?.res);
+    else if(key==='deerRes')bind(s.deer?.res);
+    else if(s.tt)bind(s.tt[key]);
+  } catch (e) { s[key + 'Err'] = e.message; } finally { s[key + 'Busy'] = false; emit('insp'); }
 }
 
 // ------------------------------------------------------------------ 1. SEM weighting + reduced chi-squared
@@ -69,7 +84,7 @@ export function bootstrapCard(f, fit, getSpec) {
     s.bootErr = null;
     const spec = getSpec();
     const res = await call('bootstrap', { path: f.path, detector: det, mode: f.mode, proc: f.proc, spec, n_boot: Math.max(10, Math.round(s.nBoot ?? 200)) }, { label: 'Bootstrap' });
-    f.boot[det] = { res, fitRef: fit, n_boot: res.n_boot };
+    f.boot[det] = { res, parentSignature:fit.analysis?.signature, n_boot: res.n_boot };
   });
   const out = card(title('Bootstrap errors', null),
     h('div', { class: 'row' }, field('Resamples', input(n, (v) => { s.nBoot = Math.max(10, Math.round(num(v) || 200)); emit('insp'); }, { style: 'width:70px' })),
@@ -80,7 +95,7 @@ export function bootstrapCard(f, fit, getSpec) {
     const r = b.res;
     const units = Object.fromEntries(fit.params.map((p) => [p.name, p.unit && p.unit !== '-' ? p.unit : '']));
     const method = r.method === 'iterations' ? 'iteration resampling (whole iterations drawn with replacement, then averaged)' : 'residual resampling (fit residuals redrawn; the per-point SEM stays fixed)';
-    if (b.fitRef !== fit) out.append(warn('These bootstrap numbers belong to an earlier fit; rerun after changing the fit.'));
+    if (b.parentSignature !== fit.analysis?.signature || !resultFreshness(f,r,det).fresh) out.append(warn('Historical bootstrap result; rerun after changing the analysis.'));
     out.append(h('table', { class: 'tbl' }, th('Parameter', 'Value', 'Analytic ±', 'Bootstrap σ', '16–84 %'),
       Object.entries(r.params || {}).map(([name, p]) => td(`${name}${units[name] ? ` (${units[name]})` : ''}`, fmt(p.value, 5), p.analytic_error != null ? fmt(p.analytic_error, 2) : 'n/a',
         Number.isFinite(p.std) ? fmt(p.std, 2) : 'n/a', Number.isFinite(p.p16) ? `${fmt(p.p16, 4)} … ${fmt(p.p84, 4)}` : 'n/a'))));
@@ -107,7 +122,7 @@ export function nvFieldCard(f, getSpec) {
     const spec = { ...getSpec(), fit_D: nv.fitD, fit_E: nv.fitE, odmr_multi: true };
     if (unitKey) spec.x_unit = unitKey;
     const r = await call('nv_field_from_fit', { path: f.path, detector: f.detector, mode: f.mode, proc: f.proc, spec }, { label: 'NV field' });
-    nv.res = r.field; nv.source = 'fit'; nv.centres = r.centres_ghz; nv.centreErr = r.centre_errors_ghz;
+    nv.res = {...r.field,analysis:r.analysis}; nv.source = 'fit'; nv.centres = r.centres_ghz; nv.centreErr = r.centre_errors_ghz;
   });
   const manual = () => run(f, 'nv', async () => {
     s.nvErr = null;
@@ -171,7 +186,7 @@ export function deerCard(f) {
     run(f, 'deer', async () => {
       s.deerErr = null; f.deerRatio = null;
       const res = await call('deer_ratio', { path: f.path, detector: f.detector, mode: f.mode, ref_path: path, ref_detector: f.detector }, { label: 'DEER ratio' });
-      f.deerRatio = { refPath: path, res, det: f.detector };
+      f.deerRatio = { refPath: path, res, det: res.analysis?.descriptor.detector || f.detector };
     });
   };
   const dr = f.deerRatio;

@@ -1,12 +1,21 @@
 // 1D figure builder (pulse experiments, line scans) and time-trace figure builder.
-import { S, detLabel } from './state.js';
+import { S, detLabel, plotFile } from './state.js';
 import { PALETTES, baseStyle, baseLayout, axisLayout, legendLayout, scatterTrace, resultsAnnotation, userDecorations, friendlyAxis, MODE_LABEL, seriesStyle } from './plotstyle.js';
 
 import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized } from './fitdisplay.js';
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
 import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
+import { uniformSampling, magnitudeSpectrum } from './spectrum.js';
 
 const nonNull = (a) => (a || []).map((v) => (v === null ? NaN : v));
+
+export function fftAvailability(f) {
+  const proc = f.data[f.detector]?.proc;
+  const processed = uniformSampling(proc?.x, proc?.y);
+  if (!processed.ok) return processed;
+  const shown = displaySeries(f, f.detector, displaySpace(f), f.fit[f.detector]);
+  return uniformSampling(shown?.x, shown?.y);
+}
 
 function modeFor(f, styleMode) {
   return styleMode === 'pts' ? 'markers' : styleMode === 'line' ? 'lines' : 'lines+markers';
@@ -28,14 +37,15 @@ const displayOf = (f) => {
 };
 
 export function xTitle(f) {
-  const d = xDisplay(f, comparisonFiles(f));
+  const d = xDisplay(f, comparisonFiles(f).map(plotFile));
   const t = friendlyAxis(f.info.x_label, d.unit, f.info.type);
   return d.calibrated ? `${t} (calibrated)` : t;
 }
 
 // Returns { data, layout } for Plotly plus helpers the view needs.
 export function figure1D(f, { forExport = false } = {}) {
-  const xd = resolveXAxis(f, comparisonFiles(f));
+  f = plotFile(f);
+  const xd = resolveXAxis(f, comparisonFiles(f).map(plotFile));
   const st = baseStyle(f.style);
   const pal = PALETTES[st.palette] || PALETTES.lab;
   const L = f.layers;
@@ -44,8 +54,9 @@ export function figure1D(f, { forExport = false } = {}) {
   if (!d || !d.proc) return null;
   const fit = f.fit[det];
   const traces = [];
-  const showRes = L.res && fit && !L.fft;
-  const bottom = showRes || (L.fft && !f.info.irregular);
+  const fftReady = L.fft && fftAvailability(f).ok;
+  const showRes = L.res && fit && !fftReady;
+  const bottom = showRes || fftReady;
   const countsPanel = L.sigref && !f.info.reference_only;
   const domainMain = countsPanel ? (bottom ? [0.62, 1] : [0.42, 1]) : (bottom ? [0.3, 1] : [0, 1]);
   const mode = modeFor(f, f.styleMode);
@@ -170,7 +181,7 @@ export function figure1D(f, { forExport = false } = {}) {
     const fx = TX(nonNull(fit.dense?.x || fit.x)), fy = TY(shown.fitY);
     const fb = shown.band || [];
     if (L.conf && fit.dense?.band && fb.length === fx.length && fb.every(Number.isFinite)) {
-      const s = seriesStyle(st, 'conf', { name: 'Fit ±1σ', color: pal[1] });
+      const s = seriesStyle(st, 'conf', { name: 'Model mean ±1σ', color: pal[1] });
       traces.push({ type: 'scatter', x: [...fx, ...[...fx].reverse()], y: [...fy.map((v, i) => v + fb[i]), ...fy.map((v, i) => v - fb[i]).reverse()],
         fill: 'toself', fillcolor: hexA(s.color, 0.18), line: { width: 0 }, name: s.name, hoverinfo: 'skip', showlegend: s.legend, visible: s.visible === false ? 'legendonly' : true, meta: { key: 'conf' } });
     }
@@ -201,7 +212,7 @@ export function figure1D(f, { forExport = false } = {}) {
   }
   // FFT of the processed data (regular sampling only)
   let fftInfo = null;
-  if (L.fft && !f.info.irregular && x.length > 8) {
+  if (fftReady) {
     fftInfo = fft(xr, yr, f.info.x_unit); // uncalibrated x keeps the frequency unit tied to x_unit
     traces.push({ type: 'scatter', mode: 'lines', x: fftInfo.f, y: fftInfo.mag, xaxis: 'x2', yaxis: 'y3', name: 'FFT', showlegend: false, line: { color: '#7A4FD6', width: 1.4 }, meta: { key: 'fft' } });
   }
@@ -263,7 +274,7 @@ export function figure1D(f, { forExport = false } = {}) {
     }
   }
   const xbreakBlocked = bottom ? 'residual panel or FFT' : hasCounts ? 'signal/reference counts panel' : '';
-  const fileOrder = comparisonFiles(f).map((o) => o.path), explicitOrder = st.seriesOrder || [];
+  const fileOrder = comparisonFiles(f).map(plotFile).map((o) => o.path), explicitOrder = st.seriesOrder || [];
   const rank = (t) => {
     const key = t.meta?.key;
     if (explicitOrder.includes(key)) return explicitOrder.indexOf(key);
@@ -375,22 +386,9 @@ function fftUnit(xu) {
 }
 
 function fft(x, y, xUnit) {
-  // Uniformly sampled assumption: use median step; zero-mean; magnitude spectrum.
-  const n = y.length;
-  const dx = (x[n - 1] - x[0]) / (n - 1);
-  const m = y.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0) / n;
-  const N = Math.min(2048, n);
   const { scale, unit } = fftUnit(xUnit);
-  const f = [], mag = [];
-  let best = -1, peak = null;
-  for (let k = 1; k < N / 2; k++) {
-    let re = 0, im = 0;
-    for (let i = 0; i < n; i++) { const v = (Number.isFinite(y[i]) ? y[i] : m) - m; const ang = -2 * Math.PI * k * i / N; re += v * Math.cos(ang); im += v * Math.sin(ang); }
-    f.push((k / (N * Math.abs(dx))) * scale);
-    mag.push(Math.hypot(re, im) / n);
-    if (mag[mag.length - 1] > best) { best = mag[mag.length - 1]; peak = f[f.length - 1]; }
-  }
-  return { f, mag, peak, unit };
+  const spectrum = magnitudeSpectrum(x, y);
+  return { ...spectrum, f: spectrum.f.map((v) => v * scale), peak: spectrum.peak === null ? null : spectrum.peak * scale, unit };
 }
 
 export function hexA(hex, a) {
@@ -412,6 +410,7 @@ export function rolling(x, y, w) {
 }
 
 export function figureTT(f) {
+  f = plotFile(f);
   const st = baseStyle(f.style);
   const pal = PALETTES[st.palette] || PALETTES.lab;
   const tt = f.tt;

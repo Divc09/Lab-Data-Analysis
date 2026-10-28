@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 import traceback
+import secrets
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +35,13 @@ class Api:
         self.window = None          # pywebview window when running as a desktop app
         self.pending_open: list[str] = []
         self.session_lock = threading.Lock()
+        self.token = secrets.token_urlsafe(32)
+
+    def ping(self) -> dict:
+        return {'version':core.APP_VERSION}
+
+    def validate_analysis(self,analysis: dict) -> dict:
+        return core.validate_analysis(self.ws,analysis)
 
     # -- app / settings ---------------------------------------------------
     def app_info(self) -> dict:
@@ -141,6 +150,18 @@ class Api:
     def batch_start(self, opts: dict) -> str:
         return core.batch_start(self.ws, opts)
 
+    def batch_import(self,manifest_path: str,row_id: str) -> dict:
+        return core.batch_import(self.ws,manifest_path,row_id)
+
+    def batch_rerun(self,manifest_path: str,rows: list[str]) -> str:
+        return core.batch_rerun(self.ws,manifest_path,rows)
+
+    def batch_resume(self,manifest_path: str) -> str:
+        return core.batch_resume(self.ws,manifest_path)
+
+    def batch_run_record(self,output_dir: str):
+        return core.batch_run_record(output_dir)
+
     def batch_status(self, job: str) -> dict:
         j = self.ws.jobs.get(job)
         if not j:
@@ -177,11 +198,24 @@ class Api:
 
         doc = dict(doc)
         doc["format"] = "smartfitter-session"
-        doc["version"] = 1
+        doc["version"] = 2
         doc["sources"] = {}
         physical_sources = [src for src in doc.get("files", []) if not src.startswith("combined:")]
         for saved in doc.get("state", []):
             physical_sources.extend(r["path"] for r in (saved.get("combinedRecipe") or {}).get("runs", []))
+        def collect(value):
+            if isinstance(value,dict):
+                for key,item in value.items():
+                    if key in ('path','source','refPath','ref_path') and isinstance(item,str) and item.lower().endswith('.mat'):
+                        physical_sources.append(item)
+                    if key in ('dependencies','sources') and isinstance(item,dict):
+                        physical_sources.extend(p for p in item if str(p).lower().endswith('.mat'))
+                    collect(item)
+            elif isinstance(value,list):
+                for item in value:
+                    if isinstance(item,str) and item.lower().endswith('.mat'): physical_sources.append(item)
+                    else: collect(item)
+        collect(doc)
         for src in dict.fromkeys(physical_sources):
             try:
                 doc["sources"][src] = source_descriptor(src, path)
@@ -296,10 +330,16 @@ def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header('Referrer-Policy','no-referrer')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.send_header('X-Frame-Options','DENY')
+            if code == 403:
+                self.send_header('Connection','close'); self.close_connection=True
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
+            if not self._local_host(): return self._send(403,b'Forbidden Host','text/plain')
             path = self.path.split("?", 1)[0]
             if path in ("/", ""):
                 path = "/index.html"
@@ -317,6 +357,13 @@ def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
             self._send(200, target.read_bytes(), ctype + ("; charset=utf-8" if ctype.startswith("text") else ""))
 
         def do_POST(self):
+            if not self._local_host(): return self._send(403,b'{"ok":false,"error":"Forbidden Host"}','application/json')
+            origin=self.headers.get('Origin')
+            allowed={f'http://127.0.0.1:{self.server.server_port}',f'http://localhost:{self.server.server_port}'}
+            if origin and origin not in allowed:
+                return self._send(403,b'{"ok":false,"error":"Forbidden Origin"}','application/json')
+            if not hmac.compare_digest(self.headers.get('X-SmartFitter-Token',''),api.token):
+                return self._send(403,b'{"ok":false,"error":"Session token missing or invalid. Open SmartFitter from its launcher."}','application/json')
             if not self.path.startswith("/api/"):
                 return self._send(404, b"not found", "text/plain")
             name = self.path[5:].split("?", 1)[0]
@@ -326,12 +373,30 @@ def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
                 args = json.loads(self.rfile.read(length) or b"{}") if length else {}
                 if fn is None:
                     raise ValueError(f"Unknown API call: {name}")
+                pending = None
+                if name in {'bootstrap','fit_iterations','odmr_pick_peaks','deer_ratio','nv_field_from_fit','tt_steps','tt_drift','tt_ratio','iteration_sensitivity'} and args.get('path'):
+                    tr=api.ws.trace(args['path'],args.get('detector'),args.get('mode','contrast'))
+                    settings={k:v for k,v in args.items() if k not in ('path','detector','mode','proc')}
+                    pending=core.analysis_for(api.ws,args['path'],tr.detector_id,args.get('mode',tr.mode),args.get('proc') or {},settings,kind=name)
+                    if args.get('ref_path'):
+                        from nvfit.analysis_identity import source_path, result_envelope
+                        pending['dependencies'][source_path(args['ref_path'])]=api.ws.source_revision(args['ref_path'])
+                        pending=result_envelope(pending['descriptor'],pending['source_revision'],settings,pending['dependencies'],name)
+                elif name in {'stack_build','stack_trajectory','track_spots'}:
+                    from nvfit.analysis_identity import source_path, analysis_descriptor, result_envelope
+                    revisions={source_path(p):api.ws.source_revision(p) for p in args.get('paths',[])}
+                    descriptor=analysis_descriptor('aggregate',args.get('detectors') or args.get('detector','detector1'),args.get('mode','contrast'),{'paths':[source_path(p) for p in args.get('paths',[])],'opts':args.get('opts') or {}})
+                    pending=result_envelope(descriptor,revisions,args,revisions,name)
                 result = fn(**args)
+                if pending is not None and isinstance(result,dict): result.setdefault('analysis',pending)
                 body = json.dumps({"ok": True, "result": core.clean(result)}, allow_nan=False).encode()
             except Exception as exc:  # report to the interface instead of crashing the server
                 body = json.dumps({"ok": False, "error": str(exc) or exc.__class__.__name__,
                                    "trace": traceback.format_exc()[-3000:]}).encode()
             self._send(200, body, "application/json")
+
+        def _local_host(self):
+            return self.headers.get('Host','') in {f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'}
 
     return Handler
 

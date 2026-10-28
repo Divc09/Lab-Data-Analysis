@@ -1,14 +1,15 @@
 // Application shell: top bar, library, routing, keyboard shortcuts, drag & drop, folder watching.
 import { call, onBusy } from './api.js';
-import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay } from './state.js';
+import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile } from './state.js';
 import { h, mount, icon, toast, modal, contextMenu, fmt, fmtTime, fmtDate, basename, dirname, tag, debounce } from './util.js';
-import { renderAnalyze, renderInspector, runFit, saveResults, copyFigure, resetView, ALT_TABS, kindOf } from './analyze.js';
-import { renderCompare } from './compare.js';
-import { renderFigure } from './figure.js';
-import { renderBatch } from './batch.js';
-import { renderDay } from './day.js';
-import { renderStack } from './stack.js';
-import { renderAutoFind } from './autofind.js';
+import { renderAnalyze, renderInspector, runFit, runFitScoped, saveResults, copyFigure, resetView, ALT_TABS, kindOf } from './analyze.js';
+import { renderCompare, hasCompareTrend, hasCompareOverlay, saveCompareTrend, copyCompareOverlay } from './compare.js';
+import { renderFigure, exportFigure } from './figure.js';
+import { renderBatch, saveBatchSummary, copyBatchSummary } from './batch.js';
+import { renderDay, hasDaySummary, saveDaySummary, copyDaySummary } from './day.js';
+import { renderStack, hasStackResults, saveStackResults, copyStackResults } from './stack.js';
+import { renderAutoFind, canExportAutoFind, exportAutoFind } from './autofind.js';
+import { workspaceActions } from './workspaceactions.js';
 
 const app = document.getElementById('app');
 const els = {};
@@ -47,7 +48,6 @@ function render() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    renderTop();
     renderLibrary();
     const v = S.view;
     const analyze = v === 'analyze' || v === 'home';
@@ -62,6 +62,7 @@ function render() {
     else if (v === 'day') renderDay(els.full);
     else if (v === 'stack') renderStack(els.full);
     else if (v === 'autofind') renderAutoFind(els.full);
+    renderTop();
     applyPanelWidths();
     renderStatus(0, '');
   });
@@ -76,12 +77,41 @@ function renderInspectorOnly() {
 }
 
 // Shared list for the Start-screen card and the "?" overlay.
-const SHORTCUTS = [['Open files', 'Ctrl O'], ['Add files', 'Ctrl Shift O'], ['Search files / commands', 'Ctrl K'], ['Command palette', 'Ctrl Shift P'], ['Run fit · robust fit', 'Ctrl F · Ctrl Shift F'], ['Save results · session', 'Ctrl S · Ctrl Shift S'],
-  ['Open session', 'Ctrl Alt O'], ['Undo · redo', 'Ctrl Z · Ctrl Y'], ['Copy figure', 'Ctrl Shift C'], ['Reset plot view', 'Ctrl Home'], ['Inspector tabs', 'Alt 1–7'], ['Next · previous library file', 'Alt Down · Alt Up'], ['Clear selection / search', 'Esc'], ['This shortcut list', '?']];
+const SHORTCUTS = [['Open files', 'Ctrl O'], ['Add files', 'Ctrl Shift O'], ['Search files / commands', 'Ctrl K'], ['Command palette', 'Ctrl Shift P'], ['Run fit · robust fit', 'Ctrl F · Ctrl Shift F'], ['Save/export workspace · save session', 'Ctrl S · Ctrl Shift S'],
+  ['Open session', 'Ctrl Alt O'], ['Undo · redo', 'Ctrl Z · Ctrl Y'], ['Copy workspace figure/table', 'Ctrl Shift C'], ['Reset plot view', 'Ctrl Home'], ['Inspector tabs', 'Alt 1–7'], ['Next · previous library file', 'Alt Down · Alt Up'], ['Clear selection / search', 'Esc'], ['This shortcut list', '?']];
+
+function currentWorkspaceActions() {
+  const view = S.view;
+  return workspaceActions(S.view, {
+    analysis: !!active(), figure: !!S.figure.panels.length,
+    trend: view === 'compare' && hasCompareTrend(), overlay: view === 'compare' && hasCompareOverlay(),
+    day: view === 'day' && hasDaySummary(), stack: view === 'stack' && hasStackResults(),
+    batch: !!S.batch.rows.length, autofind: view === 'autofind' && canExportAutoFind(),
+    session: !!Object.keys(S.files).length || !!S.figure.panels.length,
+  }, {
+    analysis_save: () => saveResults(active()), analysis_copy: () => copyFigure(active()),
+    figure_save: () => {
+      const rect = els.top.querySelector('.workspace-save')?.getBoundingClientRect();
+      contextMenu(rect?.left || 20, rect?.bottom || 50, ['svg', 'png', 'pdf'].map((kind) => ({
+        label: `Export figure as ${kind.toUpperCase()}…`, run: () => exportFigure(kind).catch((e) => toast(e.message, 'err')),
+      })));
+    },
+    figure_copy: () => exportFigure('copy'), trend_save: saveCompareTrend, overlay_copy: copyCompareOverlay,
+    day_save: saveDaySummary, day_copy: copyDaySummary, stack_save: saveStackResults, stack_copy: copyStackResults,
+    batch_save: saveBatchSummary, batch_copy: copyBatchSummary, autofind_save: exportAutoFind, session_save: saveSessionAs,
+  });
+}
+
+async function performWorkspaceAction(kind) {
+  const action = currentWorkspaceActions()[kind];
+  if (!action?.enabled) { toast(action ? `No results available to ${action.label.toLowerCase()}.` : 'Copy is unavailable in this workspace.'); return; }
+  try { await action.run(); } catch (e) { toast(e.message, 'err'); }
+}
 
 // ------------------------------------------------------------------ top bar
 function renderTop() {
   const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['day', 'Day'], ['stack', 'Stacks'], ['autofind', 'AutoFind'], ['batch', 'Batch']];
+  const save = currentWorkspaceActions().save;
   mount(els.top,
     h('div', { class: 'brand', title: 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 20, '#5AA9F0'), h('span', { class: 'brand-name' }, 'SmartFitter')),
     h('nav', { class: 'nav', 'aria-label': 'Workspaces' }, nav.map(([k, l]) => h('button', { class: S.view === k || (k === 'analyze' && S.view === 'home' && active()) ? 'on' : '', onclick: () => { S.view = k; emit(); } }, l))),
@@ -92,7 +122,7 @@ function renderTop() {
       h('button', { class: 'ibtn', title: 'Redo (Ctrl+Y)', 'aria-label': 'Redo', disabled: !canRedo(), onclick: redo }, icon('redo', 15)),
       h('button', { class: 'ibtn', title: 'Keyboard shortcuts (?)', 'aria-label': 'Keyboard shortcuts', onclick: openShortcuts }, '?')),
     h('button', { class: 'btn', title: 'Open files (Ctrl+O) · add files (Ctrl+Shift+O)', onclick: openFilesDialog }, icon('open', 14), 'Open'),
-    h('button', { class: 'btn primary', title: 'Save results (Ctrl+S)', disabled: !active(), onclick: () => saveResults(active()) }, icon('save', 14), 'Save'));
+    h('button', { class: 'btn primary workspace-save', title: `${save.title} (Ctrl+S)`, disabled: !save.enabled, onclick: () => performWorkspaceAction('save') }, icon('save', 14), save.label));
 }
 
 function renderStatus(n, label) {
@@ -205,7 +235,7 @@ function fileRow(p, meta) {
 function fileMenu(e, p) {
   contextMenu(e.clientX, e.clientY, [
     { label: 'Open', run: () => openPath(p) },
-    { label: 'Add to Compare set', run: async () => { await openFile(p, { primary: false }); if (!S.compare.set.includes(p)) S.compare.set.push(p); toast('Added to Compare.'); emit(); } },
+    { label: 'Add to Compare set', run: async () => { const f=await openFile(p,{primary:false}); addCompareItem(f); toast('Added to Compare.'); emit(); } },
     active() && active().path !== p ? { label: 'Subtract from current file (baseline)', run: async () => { await openFile(p, { primary: false }); const f = active(); const { setProc } = await import('./analyze.js'); setProc(f, { baseline: { path: p, detector: f.detector } }, 'baseline file'); } } : null,
     { label: 'Show in folder', run: () => call('reveal', { path: p }) },
     { label: 'Copy path', run: () => navigator.clipboard.writeText(p).then(() => toast('Path copied')) },
@@ -217,7 +247,7 @@ function fileMenu(e, p) {
 function closeFile(p) {
   delete S.files[p];
   S.overlays = S.overlays.filter((q) => q !== p);
-  S.compare.set = S.compare.set.filter((q) => q !== p);
+  S.compare.set = S.compare.set.filter((q) => (S.compare.items?.[q]?.path || q) !== p);
   S.library.extra = S.library.extra.filter((q) => q !== p);
   if (S.primary === p) S.primary = Object.keys(S.files)[0] || null;
   emit();
@@ -226,9 +256,10 @@ function closeFile(p) {
 function closeAllFiles() {
   const n = Object.keys(S.files).length;
   if (!n) return;
-  const fitted = Object.values(S.files).filter((f) => Object.keys(f.fit).length || S.compare.results?.[f.path]).length;
+  const fitted = Object.values(S.files).filter((f) => Object.keys(f.fit).length || S.compare.set.some(id=>(S.compare.items?.[id]?.path || id)===f.path && S.compare.results[id])
+    || Object.keys(f.iterationFits || {}).length || Object.keys(f.iterationSensitivity || {}).length).length;
   const go = () => {
-    S.files = {}; S.overlays = []; S.compare.set = []; S.compare.results = {}; S.compare.global = null; S.library.extra = []; S.primary = null;
+    S.files = {}; S.overlays = []; S.compare.set = []; S.compare.results = {}; S.compare.items = {}; S.compare.global = null; S.library.extra = []; S.primary = null;
     emit(); toast(`Closed ${n} file${n === 1 ? '' : 's'}.`);
   };
   if (!fitted) return go();
@@ -239,13 +270,24 @@ function closeAllFiles() {
       h('button', { class: 'btn primary', onclick: () => { m.close(); go(); } }, 'Close all'))));
 }
 
+// Subfolder list: drag its bottom edge to resize (CSS resize: vertical); the height is remembered.
+function resizableFolderList(rows) {
+  const el = h('div', { class: 'lib-folders-list', style: S.library.foldersHeight ? `height:${S.library.foldersHeight}px` : '' }, rows);
+  // The native resize grip sets an inline height; store it when the drag ends.
+  el.addEventListener('mouseup', () => {
+    const px = parseFloat(el.style.height);
+    if (px > 0 && px !== S.library.foldersHeight) { S.library.foldersHeight = Math.round(px); saveLibraryPrefs(); }
+  });
+  return el;
+}
+
 // The library list is rebuilt on every render; remember its scroll so clicking a file doesn't jump to the top.
 let libScroll = 0;
 const libScrolls = {}, libSelected = new Set();
 let libAnchor = null, libFocus = null;
 const saveLibraryPrefs = debounce(() => {
-  const { filter, chip, sort, type } = S.library;
-  S.settings.library_nav = { filter, chip, sort, type };
+  const { filter, chip, sort, type, foldersHeight } = S.library;
+  S.settings.library_nav = { filter, chip, sort, type, foldersHeight };
   call('settings_set', { patch: { library_nav: S.settings.library_nav } }, { quiet: true }).catch(() => {});
 }, 200);
 
@@ -344,7 +386,7 @@ Click to open · drag onto the Compare set, Figure panels or the plot`, style: S
         Object.keys(S.files).length ? h('button', { class: 'btn sm', title: 'Close every open file (nothing on disk is deleted)', onclick: closeAllFiles }, `Close all (${Object.keys(S.files).length})`) : null)),
     listing?.folders.length ? h('details', { class: 'lib-folders', open: lib.foldersOpen !== false, ontoggle: (e) => { lib.foldersOpen = e.target.open; } },
       h('summary', { class: 'lbl' }, `Subfolders (${listing.folders.length})`),
-      h('div', { class: 'lib-folders-list' }, listing.folders.map((d) => h('button', { class: 'subfolder', title: d.path, onclick: () => openFolder(d.path) }, icon('folder', 13), h('span', { class: 'ellip' }, d.name))))) : null,
+      resizableFolderList(listing.folders.map((d) => h('button', { class: 'subfolder', title: d.path, onclick: () => openFolder(d.path) }, icon('folder', 13), h('span', { class: 'ellip' }, d.name))))) : null,
     // Selection bar only when something is selected (Ctrl/Shift-click hint lives in the row tooltips).
     libSelected.size ? h('div', { class: 'lib-selection row wrap' },
       h('span', { class: 'note', style: 'flex:1' }, `${libSelected.size} selected`),
@@ -499,7 +541,7 @@ export async function saveSession(path) { await call('save_session', { path, doc
 async function saveSessionAs() {
   const f = active();
   const p = await call('dialog', { kind: 'save', title: 'Save analysis session', filename: `${f ? f.info.name.replace(/\.mat$/i, '').replace(/[<>:"/\\|?*]/g, '_') : 'analysis'}.sfsession.json`, directory: f ? dirname(f.combinedRecipe?.runs?.[0]?.path || f.path) : '' });
-  if (p) saveSession(p.endsWith('.json') ? p : `${p}.sfsession.json`);
+  if (p) return saveSession(p.endsWith('.json') ? p : `${p}.sfsession.json`);
 }
 async function openSessionDialog() {
   const p = await call('dialog', { kind: 'open_files', title: 'Open analysis session', filters: ['SmartFitter session (*.sfsession.json;*.json)'] });
@@ -541,11 +583,12 @@ function renderHome(main) {
 // ------------------------------------------------------------------ command palette
 function commands() {
   const f = active();
+  const actions = currentWorkspaceActions();
   return [
     ['Open files…', 'Ctrl O', () => openFilesDialog()], ['Add files…', 'Ctrl Shift O', () => openFilesDialog(true)], ['Choose data folder…', '', chooseFolder],
-    ['Run fit', 'Ctrl F', () => f && runFit(f)], ['Robust fit', 'Ctrl Shift F', () => f && runFit(f, { robust: true })],
-    ['Save results', 'Ctrl S', () => f && saveResults(f)], ['Save session…', 'Ctrl Shift S', saveSessionAs], ['Open session…', 'Ctrl Alt O', openSessionDialog],
-    ['Copy figure', 'Ctrl Shift C', () => f && copyFigure(f)], ['Reset plot view', 'Ctrl Home', () => f && resetView(f)], ['Edit plot', '', () => { S.editor.open = true; emit(); }],
+    ['Run fit', 'Ctrl F', () => f && runFitScoped(f)], ['Robust fit', 'Ctrl Shift F', () => f && runFitScoped(f, { robust: true })],
+    [actions.save.label, 'Ctrl S', () => performWorkspaceAction('save')], ['Save session…', 'Ctrl Shift S', saveSessionAs], ['Open session…', 'Ctrl Alt O', openSessionDialog],
+    ...(actions.copy ? [[actions.copy.label, 'Ctrl Shift C', () => performWorkspaceAction('copy')]] : []), ['Reset plot view', 'Ctrl Home', () => f && resetView(f)], ['Edit plot', '', () => { S.editor.open = true; emit(); }],
     ['Go to Analyze', '', () => { S.view = 'analyze'; emit(); }], ['Go to Compare', '', () => { S.view = 'compare'; emit(); }], ['Go to Figure composer', '', () => { S.view = 'figure'; emit(); }], ['Go to Batch', '', () => { S.view = 'batch'; emit(); }],
     ['Go to Day view', '', () => { S.view = 'day'; emit(); }], ['Go to Stacks', '', () => { S.view = 'stack'; emit(); }], ['Go to AutoFind', '', () => { S.view = 'autofind'; emit(); }],
     ['Add current plot to Figure', '', () => import('./figure.js').then((m) => m.addCurrentPlot())],
@@ -626,10 +669,10 @@ document.addEventListener('keydown', (e) => {
   if (ctrl && e.shiftKey && k === 'o') { e.preventDefault(); openFilesDialog(true); return; }
   if (ctrl && k === 'o') { e.preventDefault(); openFilesDialog(); return; }
   if (ctrl && e.shiftKey && k === 's') { e.preventDefault(); saveSessionAs(); return; }
-  if (ctrl && k === 's') { e.preventDefault(); if (f) saveResults(f); return; }
-  if (ctrl && e.shiftKey && k === 'c') { e.preventDefault(); if (f) copyFigure(f); return; }
-  if (ctrl && e.shiftKey && k === 'f') { e.preventDefault(); if (f) runFit(f, { robust: true }); return; }
-  if (ctrl && k === 'f') { e.preventDefault(); if (f) runFit(f); return; }
+  if (ctrl && k === 's') { e.preventDefault(); performWorkspaceAction('save'); return; }
+  if (ctrl && e.shiftKey && k === 'c') { e.preventDefault(); performWorkspaceAction('copy'); return; }
+  if (ctrl && e.shiftKey && k === 'f') { e.preventDefault(); if (f) runFitScoped(f, { robust: true }); return; }
+  if (ctrl && k === 'f') { e.preventDefault(); if (f) runFitScoped(f); return; }
   if (ctrl && k === 'home') { e.preventDefault(); if (f) resetView(f); return; }
   if (typing) return;
   if (e.key === '?' && !ctrl && !e.altKey) { e.preventDefault(); openShortcuts(); return; }
@@ -720,7 +763,7 @@ window.addEventListener('drop', async (e) => {
       for (const p of files) await addOverlay(p);
       toast(`Comparing ${files.length} file${files.length === 1 ? '' : 's'} on this plot.`, 'ok');
     } else if (zone === 'compareset') {
-      for (const p of files) { await openFile(p, { primary: false }); if (!S.compare.set.includes(p)) S.compare.set.push(p); }
+      for (const p of files) { const f=await openFile(p,{primary:false}); addCompareItem(f); }
     } else if (zone === 'figure') {
       const prev = S.primary, { addCurrentPlot } = await import('./figure.js');
       try { for (const p of files) { await openFile(p, { primary: false }); S.primary = p; await addCurrentPlot({ quiet: true, overlays: [] }); } }

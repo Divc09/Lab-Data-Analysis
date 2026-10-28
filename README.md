@@ -43,6 +43,14 @@ Other:
 - Fit uncertainties: the covariance estimate in `nvfit/fit_engine.py` now scales the Jacobian by column and uses an SVD cutoff. Badly scaled parameters (e.g. Rabi T, β, delay) previously got unrealistically small errors. Unidentifiable parameters report NaN, shown as "n/a" in the app.
 - Batch: under Auto, 1D line scans are plotted, not fitted. Choose GaussianPeaks or `--model-override` to fit them.
 
+Iteration sensitivity (Analyze → Fit, or Process):
+
+- **Check iteration sensitivity…** fits the current full selection and refits its mean with each iteration omitted in turn, then automatically deselects flagged iterations and refits the main plot. Select all first to use every available complete iteration. This supports T1 and other 1D models with iteration data.
+- The flag rule is the absolute percentage change in the selected parameter (T1/T2/timescale by default), with an adjustable threshold of 10%. Failed or noncomparable omission fits are not automatically excluded. If every iteration is flagged, the selection is preserved. The rule identifies sensitivity, not proven statistical outliers.
+- Checked **Excluded** rows immediately change the main selection and refit. **Exclude listed & refit** applies a typed range. **Test combined omission** adds a comparison row for the current excluded group. Restore any iteration in **Process → Iterations used for mean + fit**, or use **Restore baseline iterations** in the popup. Undo restores the previous selection and fit.
+- The popup provides **Error bars** and **Rescale plot** controls, a scrollable table, compact source labels with full provenance on hover, and an automatically recorded exclusion reason. The Fit/Process panel retains its scroll position during updates.
+- Diagnostics and exclusion reasons persist in sessions and JSON exports; **Export sensitivity CSV** saves the parameter comparison and source iteration identities. Changed settings/source files mark old diagnostics stale. These correlated refits do not provide independent uncertainty estimates or justify exclusion on their own.
+
 ## Highlights
 
 - Loads legacy MATLAB `savedData` files and newer single- or dual-detector snapshot exports.

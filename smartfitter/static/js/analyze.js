@@ -1,10 +1,12 @@
+import { finiteExtent } from './numeric.js';
 // Analyze workspace: 1D experiments, time traces and 2D maps, with their inspectors.
 import { call } from './api.js';
-import { S, emit, active, commit, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe } from './state.js';
+import { canonical, sourcePath } from './analysisidentity.js';
+import { S, emit, active, commit, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor } from './state.js';
 import { openOverlayPicker, browseOverlays } from './overlaypicker.js';
 import { isNormalizedT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, fmtPm, fmtCounts, num, toast, clone, tag, basename, dirname, stem, contextMenu, linreg } from './util.js';
-import { figure1D, figureTT, xTitle, yTitle } from './plot1d.js';
+import { figure1D, figureTT, xTitle, yTitle, fftAvailability } from './plot1d.js';
 import { figureMaps, linecuts, CMAP_GRADIENT, visibleSpots, peakCell, displayMap, mapPanels, nearest, fitColorbars, lineLength, mapRelayoutView, rememberMapRanges, mapValueLabel } from './plot2d.js';
 // Readout suffix for map values: contrast of the selected observable is dimensionless; raw sources keep their unit.
 const mapUnitSuffix = (f) => ((f.map?.source || 'value') === 'value' && f.mode === 'contrast' ? '' : f.info.unit ? ` ${f.info.unit}` : '');
@@ -12,7 +14,7 @@ import { plotConfig, resultLines, baseStyle, MODE_LABEL, friendlyAxis } from './
 import { renderImage, copyImage, copyText } from './export.js';
 import { openSeriesEditor, editorPanel, applyPlotlyEdit, inlinePlotEditor, styleTools as styleToolsBox } from './ploteditor.js';
 import * as sci from './science.js';
-import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries } from './seriescontrol.js';
+import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries, fitAllSeries, fitFamily, fitPlan } from './seriescontrol.js';
 import { xDisplay, displayValue, unitOptions, parameterUnit } from './unitdisplay.js';
 import { iterationCard, iterationFitActions, iterationProvenance, iterationCSV, openCombineDialog, fitTargetLabel } from './iterations.js';
 
@@ -38,10 +40,7 @@ export function plotDiv() {
 }
 
 export const kindOf = (f) => (f.info.dim === 'scan2d' ? '2d' : f.info.type === 'TimeTrace' ? 'tt' : '1d');
-const family = (f) => {
-  const t = f.fitSpec.experiment || f.info.type;
-  return { DEERDuration: 'Rabi', DEERFrequency: 'ODMR', DEERDecay: 'SpinEcho', DynamicDecoupling: 'SpinEcho', DEERPosition: 'LineScan' }[t] || t;
-};
+const family = (f) => fitFamily(f);
 
 // ---------------------------------------------------------------- actions
 export async function setMode(f, mode) {
@@ -73,7 +72,7 @@ export async function runFit(f, { robust = false, recordUndo = true } = {}) {
   }
   if (recordUndo) commit('fit');
   if (f.data[f.detector]?.iterations?.selected?.length === 0) { toast('Select at least one iteration before fitting.', 'err'); return; }
-  if (f.fitting || f.iterationFitting) return;
+  if (f.fitting || f.iterationFitting || f.sensitivityFitting) return;
   const spec = prepareFitSpec(f), proc = clone(f.proc), mode = f.mode;
   const signature = JSON.stringify([mode, proc, spec]);
   spec.robust = robust;
@@ -82,6 +81,7 @@ export async function runFit(f, { robust = false, recordUndo = true } = {}) {
   try {
     for (const det of dets) {
       const res = await call('fit', { path: f.path, detector: det, mode, proc, spec }, { label: `Fitting ${detLabel(f, det)}` });
+      recordResult(f,res,{det,settings:spec});
       if (f.mode === mode) f.fit[det] = res;
       else { f.fitByMode ||= {}; (f.fitByMode[mode] ||= {})[det] = res; }
       f.fitHistory.unshift({ at: new Date().toLocaleTimeString(), det, mode, spec, res });
@@ -93,6 +93,10 @@ export async function runFit(f, { robust = false, recordUndo = true } = {}) {
     if (r) toast(`${r.model}: R² ${fmt(r.r2, 4)} · ${r.status}${r.elapsed_s ? ` · ${r.elapsed_s.toFixed(1)} s` : ''}`, r.status === 'PASS' ? 'ok' : '');
   } finally { f.fitting = false; emit(); }
 }
+
+// Run fit / Ctrl+F: with compared series on the plot, fits all of them unless the Fit tab scope says "This file only".
+export const fitScopeAll = (f) => kindOf(f) === '1d' && comparisonFiles(f).length > 1 && f.display.fitScope !== 'primary';
+export function runFitScoped(f, opts = {}) { return fitScopeAll(f) ? fitAllSeries(f, opts) : runFit(f, opts); }
 
 // ODMR "peak-pick only" (v1 parity): detected sample positions, no model fit, no uncertainties.
 function peakPickCard(f) {
@@ -148,7 +152,7 @@ export function copyFigure(f) {
   const fig = currentFigure(f);
   if (!fig) return;
   const st = baseStyle(f.style);
-  renderImage(fig, { width_in: st.width_in, height_in: st.height_in, dpi: st.dpi }).then(copyImage);
+  return renderImage(fig, { width_in: st.width_in, height_in: st.height_in, dpi: st.dpi }).then(copyImage);
 }
 
 export function currentFigure(f) {
@@ -156,7 +160,7 @@ export function currentFigure(f) {
   const k = kindOf(f);
   if (k === '1d') return figure1D(f, { forExport: true });
   if (k === 'tt') return figureTT(f);
-  return figureMaps(f, overlayCache[f.path]);
+  return figureMaps(f, displayedOverlay(f));
 }
 
 export function resetView(f) {
@@ -171,7 +175,13 @@ export function renderAnalyze(main, insp) {
   const f = active();
   if (!f) { mount(main, h('div', { class: 'empty' }, 'Open a file from the Library, or press Ctrl+O.')); mount(insp); return; }
   const k = kindOf(f);
+  f.fitStale=Object.entries(f.fit || {}).some(([det,r])=>!resultFreshness(f,r,det).fresh);
+  if(k==='2d' && f.map.layout.includes('overlay') && mapRequest(f) && !displayedOverlay(f) && !f.overlayLoading && f.overlayErrorKey!==canonical(mapRequest(f))) {
+    f.overlayLoading=true;
+    ensureOverlay(f).finally(()=>{f.overlayLoading=false;emit();});
+  }
   mount(main, header(f), k === '2d' ? mapToolbar(f) : toolbar(f),
+    sci.historicalToolNote(f),
     k === '1d' && displayProvenance(f) ? h('div', { class: 'note', 'aria-label': 'Display provenance' }, displayProvenance(f)) : null,
     k === '1d' && iterationNoteUseful(f) ? h('div', { class: 'note iteration-provenance', 'aria-label': 'Iteration provenance' }, iterationProvenance(f)) : null,
     // Plot first; per-file Series controls sit below it (like a docked properties panel) so the plot never gets pushed off-screen.
@@ -187,7 +197,7 @@ function header(f) {
   const bits = [];
   if (i.dim === 'scan2d') {
     const m = f.data[f.detector]?.map;
-    if (m) bits.push(`${m.x.length} × ${m.y.length} · ${friendlyAxis(m.x_label).split(' [')[0]} ${fmt(Math.min(...m.x), 6)}–${fmt(Math.max(...m.x), 6)}, ${friendlyAxis(m.y_label).split(' [')[0]} ${fmt(Math.min(...m.y), 6)}–${fmt(Math.max(...m.y), 6)}`);
+    if (m) bits.push(`${m.x.length} × ${m.y.length} · ${friendlyAxis(m.x_label).split(' [')[0]} ${fmt(finiteExtent(m.x)[0], 6)}–${fmt(finiteExtent(m.x)[1], 6)}, ${friendlyAxis(m.y_label).split(' [')[0]} ${fmt(finiteExtent(m.y)[0], 6)}–${fmt(finiteExtent(m.y)[1], 6)}`);
   } else {
     const x = f.data[f.detector]?.raw?.x || [];
     if (x.length) bits.push(`${x.length} points · ${fmt(x[0], 5)}–${fmt(x[x.length - 1], 5)}${i.type === 'TimeTrace' ? ' s' : ''}`);
@@ -233,9 +243,10 @@ function iterationNoteUseful(f) {
 
 // Less-used layers live in one menu so the chip row fits on one line; the button shows how many are on.
 function moreLayers(f, fit) {
+  const sampling = fftAvailability(f);
   const items = [
-    ['meanSd', 'Iteration mean ± SD band', !f.data[f.detector]?.iterations], ['conf', 'Confidence band', !fit?.dense?.band], ['envelope', 'Rabi envelope (T2ρ)', !fit?.envelope], ['sigref', 'Signal + Ref panel', f.info.reference_only],
-    ['fft', 'FFT panel', f.info.irregular], ['peaks', 'Fitted peak markers', !fit?.params?.some((p) => /^(x0|center)/.test(p.name))],
+    ['meanSd', 'Iteration mean ± SD band', !f.data[f.detector]?.iterations], ['conf', 'Model mean confidence (±1σ)', !fit?.dense?.band], ['envelope', 'Rabi envelope (T2ρ)', !fit?.envelope], ['sigref', 'Signal + Ref panel', f.info.reference_only],
+    ['fft', sampling.ok ? 'FFT panel' : `FFT panel — ${sampling.reason}`, !sampling.ok], ['peaks', 'Fitted peak markers', !fit?.params?.some((p) => /^(x0|center)/.test(p.name))],
     ['picked', 'Picked peaks (peak-pick only)', !f.peakPick?.[f.detector]], ...(f.info.detectors.length > 1 ? [['__both', 'Both detectors', false]] : []),
   ];
   const isOn = (k) => (k === '__both' ? !!f.compareDetectors : k === 'picked' ? f.layers.picked !== false && !!f.peakPick?.[f.detector] : !!f.layers[k]);
@@ -243,7 +254,7 @@ function moreLayers(f, fit) {
   return h('button', { class: `chip ${on ? 'on' : ''}`, title: 'Confidence band, Rabi envelope, Signal + Ref panel, FFT, peak markers, both detectors',
     onclick: (e) => {
       const r = e.currentTarget.getBoundingClientRect();
-      contextMenu(r.left, r.bottom + 4, items.map(([k, label, off]) => ({ label: `${isOn(k) && !off ? '✓ ' : '   '}${label}${off ? ' (n/a)' : ''}`,
+      contextMenu(r.left, r.bottom + 4, items.map(([k, label, off]) => ({ disabled: off, label: `${isOn(k) && !off ? '✓ ' : '   '}${label}${off ? ' (n/a)' : ''}`,
         run: () => { if (off) return; if (k === '__both') f.compareDetectors = !f.compareDetectors; else if (k === 'picked') f.layers.picked = !isOn('picked'); else { f.layers[k] = !f.layers[k]; f.layersTouched = true; } emit(); } })));
     } }, `More layers${on ? ` · ${on}` : ''} ▾`);
 }
@@ -337,9 +348,13 @@ function drawPlot(f) {
   let fig;
   if (k === '1d') fig = figure1D(f);
   else if (k === 'tt') fig = figureTT(f);
-  else fig = figureMaps(f, overlayCache[f.path]);
+  else fig = figureMaps(f, displayedOverlay(f));
   if (!fig) return;
-  if (fftEl?.isConnected) { const pk = fig.fftPeak; fftEl.textContent = f.layers.fft && pk && Number.isFinite(pk.f) ? `FFT peak ≈ ${fmt(pk.f, 5)} ${pk.unit || ''}` : ''; }
+  if (fftEl?.isConnected) {
+    const pk = fig.fftPeak, sampling = fftAvailability(f);
+    fftEl.textContent = f.layers.fft && !sampling.ok ? `FFT unavailable: ${sampling.reason}`
+      : f.layers.fft && pk && Number.isFinite(pk.f) ? `FFT peak ≈ ${fmt(pk.f, 5)} ${pk.unit || ''}` : '';
+  }
   fig.layout.dragmode = f.ttPick && k === 'tt' ? 'select' : f.tool === 'pan' ? 'pan' : f.tool === 'select' ? 'select' : 'zoom';
   // Only the newest request draws. If the box is not laid out yet, retry each frame: the plot div is reused, so the
   // ResizeObserver alone never fires when it settles at its previous size (the next file then stayed undrawn/stale).
@@ -366,7 +381,7 @@ function drawCuts(f) {
   const colors = ['#D63384', '#11998C', '#1F5FBF'];
   const data = [], st = baseStyle(f.style);
   const norm = f.map.cutNorm !== false && cuts.length > 1;
-  const nz = (arr) => { if (!norm) return arr; const m = Math.max(...arr.filter(Number.isFinite)); return arr.map((v) => v / (m || 1)); };
+  const nz = (arr) => { if (!norm) return arr; const m = finiteExtent(arr, [0, 0])[1]; return arr.map((v) => v / (m || 1)); };
   cuts.forEach((c, i) => {
     if (c.h) c.h = { ...c.h, y: nz(c.h.y) };
     if (c.v) c.v = { ...c.v, y: nz(c.v.y) };
@@ -575,7 +590,7 @@ function dataTable(f) {
   for (const det of dets) {
     const d = f.data[det];
     if (!d?.proc) continue;
-    const fit = f.fit[det];
+    const fit = currentResult(f,det);
     const tag = dets.length > 1 ? ` · ${detLabel(f, det)}` : '';
     const x = d.proc.x || [];
     cols.push(tt ? x : xDisplay(f, comparisonFiles(f)).transform(x)); head.push(`x${tag} (${xt})`);
@@ -613,7 +628,7 @@ function setWindowByDrag(f, which) {
 
 function readout(f) {
   const d = f.data[f.detector];
-  const fit = f.fit[f.detector];
+  const fit = currentResult(f);
   const row = h('div', { class: 'readout' });
   readoutLive = null; fftEl = null;
   if (f.tool === 'measure') {
@@ -719,15 +734,32 @@ function mapReadout(f) {
   return row;
 }
 
-export async function ensureOverlay(f) {
+export function mapRequest(f) {
   const M = f.map;
   let second = M.compareWith;
   if (!second && f.info.detectors.length > 1) second = { path: f.path, detector: f.info.detectors.find((d) => d !== f.detector) };
-  if (!second) { toast('Add another 2D file of the same plane, then pick it in Compare.'); return; }
+  if (!second) return null;
+  return {first:{path:f.path,detector:f.detector,mode:f.mode,source:M.source || 'value'},second:{...second,mode:f.mode,source:M.source || 'value'},
+    opts:{shared:M.overlayScale==='shared',background:M.background,palette:M.palette,swap:M.swap}};
+}
+function displayedOverlay(f) {
+  const overlay=overlayCache[f.path];
+  if(!overlay || canonical(overlay.request)!==canonical(mapRequest(f)))return null;
+  for(const env of overlay.analyses || []) {
+    const owner=Object.values(S.files).find(o=>sourcePath(o.path)===env.descriptor.source);
+    if(owner?.info.source_revision?.sha256 && owner.info.source_revision.sha256!==env.source_revision?.sha256)return null;
+  }
+  return overlay;
+}
+export async function ensureOverlay(f) {
+  const request=mapRequest(f);
+  if(!request){toast('Add another 2D file of the same plane, then pick it in Compare.');return;}
+  delete f.overlayErrorKey;
   try {
-    overlayCache[f.path] = await call('map_overlay', { first: { path: f.path, detector: f.detector, mode: f.mode, source: M.source || 'value' }, second: { ...second, mode: f.mode, source: M.source || 'value' },
-      opts: { shared: M.overlayScale === 'shared', background: M.background, palette: M.palette, swap: M.swap } }, { label: 'Building overlay' });
-  } catch (e) { overlayCache[f.path] = null; }
+    const result=await call('map_overlay',request,{label:'Building overlay'});
+    recordResult(f,result,{kind:'map_overlay'});
+    if(canonical(request)===canonical(mapRequest(f))){overlayCache[f.path]=result;return result;}
+  } catch (e) { overlayCache[f.path] = null;f.overlayErrorKey=canonical(request); }
 }
 
 // ---------------------------------------------------------------- inspector
@@ -739,16 +771,26 @@ const TABS = {
 // Alt+1..7 keep the original app's numbering: Model, Params, Process, Plot, Results, Map, Export.
 export const ALT_TABS = { 1: 'fit', 2: 'fit', 3: 'proc', 4: 'plot', 5: 'fit', 6: 'map', 7: 'export', 8: 'info' };
 
+const inspectorScroll = new WeakMap();
 export function renderInspector(f, insp) {
+  const previous = insp.querySelector('.insp-body');
+  if (previous && previous.dataset.path === f.path) {
+    const saved = inspectorScroll.get(f) || {};
+    saved[previous.dataset.tab] = previous.scrollTop;
+    inspectorScroll.set(f, saved);
+  }
   const k = kindOf(f);
   const tabs = TABS[k];
   if (!tabs.some(([t]) => t === f.tab)) f.tab = tabs[0][0];
   const body = h('div', { class: 'insp-body' });
+  body.dataset.path = f.path; body.dataset.tab = f.tab;
+  body.addEventListener('scroll', () => { const saved = inspectorScroll.get(f) || {}; saved[body.dataset.tab] = body.scrollTop; inspectorScroll.set(f, saved); });
   const builders = { fit: fitTab, proc: procTab, plot: plotTab, export: exportTab, info: infoTab, stats: statsTab, map: mapTab, spots: spotsTab, compare: mapCompareTab };
   const pane = builders[f.tab](f);
   if (f.tab === 'stats') pane.append(sci.ttSciCard(f));
   body.append(pane);
   mount(insp, h('div', { class: 'tabs', role: 'tablist' }, tabs.map(([t, l]) => h('button', { class: f.tab === t ? 'on' : '', role: 'tab', onclick: () => { f.tab = t; emit('insp'); } }, l))), body);
+  body.scrollTop = inspectorScroll.get(f)?.[f.tab] || 0;
 }
 
 function t1DisplayControl(f) {
@@ -764,7 +806,7 @@ function overlaysCard(f) {
   const paths = S.overlays.filter((p) => p !== f.path);
   const rows = [f.path, ...paths].filter((p) => S.files[p]).map((p) => {
     const o = S.files[p], det = o.info.detectors.includes(f.detector) ? f.detector : o.detector;
-    const r = o.fit[det], t1 = r?.params.find((q) => q.name === 'T1');
+    const r = currentResult(o,det), t1 = r?.params.find((q) => q.name === 'T1');
     return { o, det, r, t1 };
   });
   return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
@@ -875,11 +917,11 @@ function fitTab(f) {
   const fr = f.data[f.detector]?.proc?.x || [];
   const splitAt = out.children.length; // everything appended from here on is secondary (moved below the results)
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Fit range (native ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'})`),
-    h('div', { class: 'row wrap', style: 'gap:4px' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(Math.min(...fr.filter(Number.isFinite)), 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
-      input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { placeholder: fr.length ? fmt(Math.max(...fr.filter(Number.isFinite)), 5) : 'max', style: 'width:90px' }),
+    h('div', { class: 'row wrap', style: 'gap:4px' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(finiteExtent(fr)[0], 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
+      input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { placeholder: fr.length ? fmt(finiteExtent(fr)[1], 5) : 'max', style: 'width:90px' }),
       h('button', { class: 'btn sm', title: 'Use the current zoomed x range', onclick: () => { const r = f.xrange?.map(f.info.type === 'TimeTrace' ? (v) => v * (f.tt.unit === 'min' ? 60 : 1) : xDisplay(f, comparisonFiles(f)).inverse).sort((a, b) => a - b); set({ range_min: r?.[0] ?? null, range_max: r?.[1] ?? null }); } }, 'Use view'),
       h('button', { class: 'btn sm', onclick: () => set({ range_min: null, range_max: null }) }, 'All'),
-      h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const xs = fr.filter(Number.isFinite); const lo = Math.min(...xs), hi = Math.max(...xs); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
+      h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const [lo, hi] = finiteExtent(fr); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
       h('button', { class: 'btn sm', title: 'Profile default: clear the range so the experiment profile chooses it', onclick: () => set({ range_min: null, range_max: null }) }, 'Profile'))));
   // options
   const opts = h('details', { class: 'card pad', open: !!f.display.fitOptions, ontoggle: (e) => { f.display.fitOptions = e.target.open; } }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
@@ -895,9 +937,13 @@ function fitTab(f) {
   out.append(h('div', { class: 'card pad' }, check('Fit smoothed data', s.fit_smoothed, (v) => { if (v) f.layers.smooth = true; set({ fit_smoothed: v }); emit(); }),
     h('div', { class: 'note', title: `Window ${f.data[f.detector]?.proc?.smoothing_window || 1} points (requested ${f.proc.smooth}; change in Process). Default off. Smoothing correlates neighbouring samples, so ordinary fit uncertainties are underestimated; no corrected estimate is supplied, and SEM weighting is disabled for smoothed fits.` },
       s.fit_smoothed ? `${f.data[f.detector]?.proc?.smoothing_window || 1}-pt window · errors underestimated (hover for details)` : `${f.data[f.detector]?.proc?.smoothing_window || 1}-pt window (Process tab) · hover for caveats`)), opts, presetCard(f));
+  const series = kindOf(f) === '1d' ? comparisonFiles(f) : [f], all = fitScopeAll(f), busy = f.fitting || f.compareFitting;
+  if (series.length > 1) out.append(h('div', { class: 'card pad fit-scope', style: 'display:flex;flex-direction:column;gap:6px' },
+    field('Run fit applies to', seg([['all', `All ${series.length} series`], ['primary', 'This file only']], all ? 'all' : 'primary', (v) => { f.display.fitScope = v; emit('insp'); })),
+    all ? h('div', { class: 'note', style: 'white-space:pre-line' }, series.map((o) => { const p = fitPlan(f, o); return `${o === f ? '★ ' : ''}${o.info.name.replace(/\.mat$/i, '')}: ${p.model} (${p.source})`; }).join('\n')) : null));
   out.append(h('div', { class: 'row fit-run' },
-    h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: f.fitting, onclick: () => runFit(f) }, f.fitting ? h('span', { class: 'spinner' }) : null, 'Run fit', h('span', { class: 'kbd' }, 'Ctrl F')),
-    h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: f.fitting, title: 'Fits subsets of the data and keeps the candidate that best describes the full trace', onclick: () => runFit(f, { robust: true }) }, 'Robust fit', h('span', { class: 'kbd' }, 'Ctrl Shift F'))));
+    h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: busy, onclick: () => runFitScoped(f) }, busy ? h('span', { class: 'spinner' }) : null, all ? `Run fit · ${series.length} files` : 'Run fit', h('span', { class: 'kbd' }, 'Ctrl F')),
+    h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: busy, title: 'Fits subsets of the data and keeps the candidate that best describes the full trace', onclick: () => runFitScoped(f, { robust: true }) }, 'Robust fit', h('span', { class: 'kbd' }, 'Ctrl Shift F'))));
   if (kindOf(f) === '1d') out.append(iterationFitActions(f));
   const primaryResults = fit ? [resultCard(f, fit), paramCard(f, fit)].filter(Boolean) : [];
   if (fit) out.append(...primaryResults, sci.bootstrapCard(f, fit, () => {
@@ -910,7 +956,8 @@ function fitTab(f) {
   if (f.fitHistory.length > 1) out.append(historyCard(f));
   // Most-used first: model choice, then Run fit and its result; range/smoothing/options/presets/iterations follow.
   const anchor = out.children[splitAt], run = out.querySelector('.fit-run');
-  if (anchor && run) { out.insertBefore(run, anchor); primaryResults.forEach((el) => el instanceof Node && out.insertBefore(el, anchor)); }
+  const scope = out.querySelector('.fit-scope');
+  if (anchor && run) { if (scope) out.insertBefore(scope, anchor); out.insertBefore(run, anchor); primaryResults.forEach((el) => el instanceof Node && out.insertBefore(el, anchor)); }
   return out;
 }
 
@@ -965,11 +1012,11 @@ function paramCard(f, fit) {
       const d = displayValue(p.value, p.error, parameterUnit(p, f.info), filePresentation(f, f));
       return h('tr', { title: `${p.desc}\nNative: ${p.value} ${parameterUnit(p, f.info)}; seeds/bounds use native units.` },
         h('td', { class: 'txt', style: 'color:var(--text2)' }, `${p.name}${d.unit && d.unit !== '-' ? ` (${d.unit})` : ''}`),
-        h('td', {}, d.text), h('td', { style: 'color:var(--text3)' }, d.error ? '' : 'n/a'),
+        h('td', {}, d.text), h('td', { style: 'color:var(--text3)' }, p.locked ? 'locked' : p.error == null ? 'n/a' : ''),
         h('td', { style: 'width:14px;color:var(--warn)', title: p.bound_hit ? 'At a bound' : '' }, p.bound_hit ? '⚑' : ''));
     })));
     if (isNormalizedT1(fit)) card.append(h('div', { class: 'note', style: 'margin-top:6px' }, 'A and y0 remain in normalized 1 − data space. Time/frequency values above are display-scaled only; fitting, seeds and bounds remain in the labelled native units.'));
-    if (fit.params.some((p) => !p.error)) card.append(h('div', { class: 'note', style: 'margin-top:6px' }, 'n/a: the covariance gives no usable standard error for this parameter (degenerate or at a bound).'));
+    if (fit.params.some((p) => !p.locked && p.error == null)) card.append(h('div', { class: 'note', style: 'margin-top:6px' }, 'n/a: the covariance gives no usable standard error for this parameter (degenerate or at a bound).'));
   } else {
     s.params = s.params || {};
     card.append(h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Param'), h('th', {}, 'Value'), h('th', {}, 'Min'), h('th', {}, 'Max'), h('th', {}, 'Lock')),
@@ -1134,6 +1181,10 @@ function exportTab(f) {
 export async function saveResults(f) {
   if (!f) return;
   const k = kindOf(f);
+  if(k==='2d' && f.map.layout.includes('overlay') && !displayedOverlay(f)) {
+    await ensureOverlay(f);
+    if(!displayedOverlay(f))throw new Error('Map overlay is unavailable; rebuild it before exporting.');
+  }
   f.exp = f.exp || { png: true, json: true, csv: k === '1d', time_trace: k === 'tt', spots_csv: k === '2d' };
   const e = f.exp;
   const st = baseStyle(f.style);
@@ -1142,7 +1193,7 @@ export async function saveResults(f) {
   const size = { width_in: st.width_in, height_in: st.height_in, dpi: st.dpi };
   if (e.png || e.pdf) { const png = await renderImage(fig, size); if (e.png) images.png = png; if (e.pdf) images.pdf_png = png; }
   if (e.svg || e.pdf) { const svg = await renderImage(fig, { ...size, format: 'svg' }); if (e.svg) images.svg = svg; if (e.pdf) images.pdf_svg = svg; }
-  const fit = f.fit[f.detector];
+  const fit = currentResult(f);
   let reportImgs = null;
   if ((e.report || e.report_pdf) && fit) {
     const rs = { width_in: st.width_in + 3.2, height_in: st.height_in, dpi: st.dpi }, rf = reportFigure(f, fig, fit);
@@ -1158,13 +1209,15 @@ export async function saveResults(f) {
   const res = await call('export', { req: {
     output_dir: dir, stem: stemName, images, dpi: st.dpi, source: f.path, detector: f.detector, mode: f.mode, processing: f.proc, fit_spec: f.fitSpec,
     fit: fit ? { ...fit, raw: undefined, dense: undefined } : null, json: e.json, csv: e.csv && !!fit, origin: e.origin, detectors_raw: e.detectors_raw, time_trace: e.time_trace,
-    provenance: f.data[f.detector]?.provenance, iteration_fits: f.iterationFits, combined_recipe: f.combinedRecipe,
+    provenance: f.data[f.detector]?.provenance, iteration_fits: f.iterationFits, iteration_sensitivity: f.iterationSensitivity, combined_recipe: f.combinedRecipe,
     spots: spotsRows, spots_csv: e.spots_csv && spotsRows?.length,
     extra_csv: k === '1d' && e.csv ? { '_comparison.csv': comparisonCSV(f), ...(f.iterationFits?.[f.detector] ? { '_iterations.csv': iterationCSV(f) } : {}) } : undefined,
-    plot_state: { style: f.style, layers: f.layers, sample: f.sample, display: f.display, xrange: f.xrange, yrange: f.yrange,
+    analysis:envelopeFor(f), historical_results:Object.values(S.results).filter(r=>r.analysis.descriptor.source===sourcePath(f.path)),
+    map_comparison: k==='2d' ? displayedOverlay(f) : null,
+    plot_state: { map:k==='2d' ? clone(f.map) : undefined, style: f.style, layers: f.layers, sample: f.sample, display: f.display, xrange: f.xrange, yrange: f.yrange,
       comparison: k === '1d' ? comparisonRows(f) : undefined,
       series: k === '1d' ? comparisonFiles(f).map((o) => ({ path: o.path, mode: o.mode, detector: o.detector, processing: o.proc, fit_spec: o.fitSpec, fit: Object.fromEntries(Object.entries(o.fit).map(([det, r]) => [det, { ...r, raw: undefined }])) })) : undefined },
-    map_comparison_csv: e.map_csv && overlayCache[f.path], map_comparison_request: k === '2d' && overlayCache[f.path] ? [{ path: f.path, detector: f.detector, mode: f.mode }, { ...(M.compareWith || { path: f.path, detector: f.info.detectors.find((x) => x !== f.detector) }), mode: f.mode }, { shared: M.overlayScale === 'shared', background: M.background, palette: M.palette }] : null,
+    map_comparison_csv: !!e.map_csv && !!displayedOverlay(f),
   } }, { label: 'Saving results' });
   if (reportImgs) await call('export', { req: { output_dir: dir, stem: `${stemName}_report`, images: reportImgs, dpi: st.dpi, json: false } }, { label: 'Saving report PDF' });
   if (e.session) { const { saveSession } = await import('./app.js'); await saveSession(`${dir}\\${stemName}.sfsession.json`); }
@@ -1219,9 +1272,47 @@ function infoTab(f) {
     i.detectors.length > 1 ? h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Detector labels (this session, saved in exports)'),
       i.detectors.map((d) => input(detLabel(f, d), (v) => { f.labels[d] = v; emit(); }))) : null,
     Object.keys(i.detector_errors || {}).length ? h('div', { class: 'note', style: 'color:var(--bad)' }, Object.entries(i.detector_errors).map(([k, v]) => `${k}: ${v}`).join('\n')) : null,
+    matParamsCard(f),
     h('details', { open: true }, h('summary', {}, `File metadata (${Object.keys(meta).length})`),
       h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(meta).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v', style: 'font-size:11px' }, String(v))]))),
     h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => call('reveal', { path: f.path }) }, 'Show in folder'), h('button', { class: 'btn sm', onclick: () => copyText(f.path, 'Path copied') }, 'Copy path')));
+}
+
+// Acquisition settings exactly as saved in the .mat (params / scanInfo / metadata); read on first open, no interpretation.
+function matParamsCard(f) {
+  const st = (f.matParams ||= { open: false, filter: '' });
+  const load = async () => {
+    st.loading = true; emit('insp');
+    try { st.data = await call('mat_params', { path: f.path }, { label: 'Reading .mat parameters' }); st.error = null; }
+    catch (e) { st.error = e.message; } finally { st.loading = false; emit('insp'); }
+  };
+  if (st.open && !st.data && !st.loading && !st.error) load();
+  // Live filter: hides non-matching rows in place so typing never loses focus to a re-render.
+  const applyFilter = (root) => {
+    const q = st.filter.trim().toLowerCase();
+    root.querySelectorAll('[data-param]').forEach((el) => { el.style.display = !q || el.dataset.param.includes(q) ? '' : 'none'; });
+    root.querySelectorAll('details[data-section]').forEach((d) => { if (q) d.open = !!d.querySelector('[data-param]:not([style*="none"])'); });
+  };
+  const filter = h('input', { class: 'field', value: st.filter, placeholder: 'Filter (e.g. piTime, RF, duration)', 'aria-label': 'Filter .mat parameters',
+    oninput: (e) => { st.filter = e.target.value; applyFilter(e.target.closest('.mat-params')); } });
+  filter.addEventListener('keydown', (e) => e.stopPropagation());
+  const card = h('details', { open: st.open, ontoggle: (e) => { if (e.target.open !== st.open) { st.open = e.target.open; emit('insp'); } } },
+    h('summary', {}, 'Run parameters (saved in the .mat)'),
+    !st.open ? null : st.loading ? h('div', { class: 'note' }, 'Reading…')
+      : st.error ? h('div', { class: 'note', style: 'color:var(--bad)' }, st.error, ' ', h('button', { class: 'btn sm', onclick: () => { st.error = null; load(); } }, 'Retry'))
+      : st.data ? h('div', { class: 'mat-params', style: 'display:flex;flex-direction:column;gap:6px;margin-top:6px' },
+        h('div', { class: 'row' }, filter, h('button', { class: 'btn sm', title: 'Copy all parameters as tab-separated text',
+          onclick: () => copyText(st.data.sections.flatMap((s) => s.rows.map(([k, v]) => `${k}\t${v}`)).join('\n'), 'Parameters copied') }, 'Copy')),
+        st.data.sections.map((s) => h('details', { open: s.name !== 'Data', 'data-section': s.name }, h('summary', {}, `${s.name} (${s.rows.length})`),
+          h('div', { class: 'kv', style: 'margin-top:4px' }, s.rows.flatMap(([k, v]) => {
+            const key = `${k} ${v}`.toLowerCase();
+            return [h('span', { class: 'k', 'data-param': key, style: 'overflow-wrap:anywhere' }, k.slice(s.name.length + 1) || k),
+              h('span', { class: 'v', 'data-param': key, style: 'font-size:11px;overflow-wrap:anywhere' }, v)];
+          })))),
+        h('div', { class: 'note' }, 'Values as stored by the acquisition code (no unit conversion). MATLAB string/datetime objects can only be read in MATLAB.')) : null);
+  const body = card.querySelector('.mat-params');
+  if (body && st.filter) applyFilter(body);
+  return card;
 }
 
 // ---- Time-trace stats tab
@@ -1354,7 +1445,7 @@ function centerOnSpot(f, r) {
   const [cx, cy] = swap ? [r.center_y, r.center_x] : [r.center_x, r.center_y];
   const half = Math.max(3 * (r.fwhm_major || 0), 4 * Math.max(step(dx), step(dy)));
   const win = (c, a) => {
-    const pad = step(a) / 2, L = Math.min(...a) - pad, H = Math.max(...a) + pad;
+    const [lo, hi] = finiteExtent(a); const pad = step(a) / 2, L = lo - pad, H = hi + pad;
     const hw = Math.min(half, (H - L) / 2);
     let a0 = c - hw, a1 = c + hw;
     if (a0 < L) { a1 += L - a0; a0 = L; }

@@ -10,6 +10,10 @@ import { addCurrentPlot } from './figure.js';
 import { copyText } from './export.js';
 
 const D = { fitting: '', adding: false, onlyFitted: false };
+const daySummaryRows = () => dayFiles().map(summaryOf).filter((s) => !D.onlyFitted || s.value !== null);
+export const hasDaySummary = () => !!daySummaryRows().length;
+export const saveDaySummary = () => saveCsv(daySummaryRows());
+export const copyDaySummary = () => copyText(tableText(daySummaryRows()), 'Day summary copied');
 let stripEl;
 
 function dayFiles() {

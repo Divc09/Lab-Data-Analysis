@@ -1,3 +1,4 @@
+import { finiteExtent } from './numeric.js';
 // 2D map figures: per-detector maps with colorbars, RGB overlay panel, spot shapes, cursor.
 import { detLabel } from './state.js';
 import { baseStyle, baseLayout, friendlyAxis } from './plotstyle.js';
@@ -46,7 +47,7 @@ export function mapLimits(f, det, z) {
   const M = f.map;
   const flat = z.flat();
   if (M.limits === 'manual' && M.manual[det] && M.manual[det][0] !== null) return M.manual[det];
-  if (M.limits === 'auto') return [Math.min(...flat.filter(Number.isFinite)), Math.max(...flat.filter(Number.isFinite))];
+  if (M.limits === 'auto') return finiteExtent(flat, [0, 1]);
   return [percentile(flat, M.plo), percentile(flat, M.phi)];
 }
 
@@ -210,7 +211,7 @@ function lineProfiles(f) {
     const d = displayMap(m, M.swap, M.cutSource || M.source || 'value');
     const N = 2 * Math.max(d.x.length, d.y.length);
     // Map extent = cell centres +/- half a cell at each edge.
-    const ext = (a) => { const lo = Math.min(...a), hi = Math.max(...a), hw = a.length > 1 ? (hi - lo) / (a.length - 1) / 2 : Infinity; return [lo - hw, hi + hw]; };
+    const ext = (a) => { const [lo, hi] = finiteExtent(a), hw = a.length > 1 ? (hi - lo) / (a.length - 1) / 2 : Infinity; return [lo - hw, hi + hw]; };
     const [exl, exh] = ext(d.x), [eyl, eyh] = ext(d.y);
     const xs = [], ys = [];
     for (let k = 0; k < N; k++) {

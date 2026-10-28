@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Mapping
 import numpy as np
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 
-from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights
+from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights, parameter_controls, current_parameter_controls
 from .models import (
     gaussian_peaks,
     time_trace_decay,
@@ -56,6 +56,7 @@ class FitWorkflowConfig:
     t1_model_family: str = "Stretched exponential"
     custom_spec: dict | None = None
     custom_expr: str = ""
+    t1_normalization: tuple[float, float] | None = None
 
 
 def _fit_time_trace_decay(x, y, n_starts, locks=None, weights=None) -> FitResult:
@@ -276,6 +277,7 @@ def _prepare_t1_series(
     prep_mode: str,
     trace: "ExperimentTrace | None" = None,
     norm_extras: dict | None = None,
+    normalization: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, str]:
     mode = prep_mode.lower().strip()
     if mode.startswith("direct decay"):
@@ -291,11 +293,8 @@ def _prepare_t1_series(
         return y, "direct"
     base = y.copy()
     source = "y"
-    if trace is not None and len(trace.y) == len(y):
-        base = trace.y.astype(float, copy=True)
-        source = "trace.y"
-    lo = float(np.min(base))
-    span = max(float(np.max(base) - lo), 1e-9)
+    # y is the selected target: processing/baseline/smoothing must never be bypassed.
+    lo, span = normalization or (float(np.min(base)), max(float(np.ptp(base)), 1e-9))
     if norm_extras is not None:
         norm_extras.update(t1_norm_lo=lo, t1_norm_span=span, t1_norm_source=source)
     normalized = (base - lo) / span
@@ -992,7 +991,7 @@ def _fit_t1(
     weights: np.ndarray | None = None,
 ) -> FitResult:
     norm_extras = {}
-    y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace, norm_extras=norm_extras)
+    y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace, norm_extras=norm_extras, normalization=config.t1_normalization)
     rng = np.random.default_rng(41)
     tspan = float(np.max(x) - np.min(x))
     y0 = float(np.min(y_fit)) if prep_used == "direct" else float(np.percentile(y_fit, 10))
@@ -1020,7 +1019,7 @@ def _fit_t1(
     upper = [max(y0, y1) + amp, max(4.0 * amp, 1.0), max(200000.0, 8.0 * tspan)] + ([4.5] if use_stretch else [])
     _apply_locks(names, lower, upper, seed0, locks)
     scale = _scaled_perturbation(lower, upper)
-    seeds = [seed0 + rng.normal(0, scale) for _ in range(max(4, int(config.multistart)))]
+    seeds = [seed0 + rng.normal(0, scale) for _ in range(max(1, int(config.multistart)))]
     result = fit_model_multistart(
         model_name=base_name,
         model_func=model,
@@ -1130,6 +1129,10 @@ def _single_odmr_bounds(
     return names, lower, upper, seed0
 
 
+def _odmr_controls(controls,y_scale):
+    return {name:tuple(v/y_scale if i!=1 and v is not None and (name=='y0' or name.startswith('C')) else v for i,v in enumerate(values)) for name,values in (controls or {}).items()}
+
+
 def _fit_odmr_single(
     x: np.ndarray,
     y: np.ndarray,
@@ -1143,20 +1146,22 @@ def _fit_odmr_single(
     y_scale = max(float(np.percentile(y, 95) - np.percentile(y, 5)), 1e-9)
     y_fit = y / y_scale
     names, lower, upper, seed0 = _single_odmr_bounds(x, y_fit, polarity, center_range=center_range)
-    _apply_locks(names, lower, upper, seed0, locks)
+    controls=_odmr_controls(locks or current_parameter_controls(),y_scale)
+    _apply_locks(names, lower, upper, seed0, controls)
     scale = _scaled_perturbation(lower, upper)
     seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
-    result = fit_model_multistart(
-        model_name="ODMR",
-        model_func=odmr_lorentzian,
-        x=x,
-        y=y_fit,
-        param_names=names,
-        lower=lower,
-        upper=upper,
-        seeds=seeds,
-        weights=weights,
-    )
+    with parameter_controls(controls):
+        result = fit_model_multistart(
+            model_name="ODMR",
+            model_func=odmr_lorentzian,
+            x=x,
+            y=y_fit,
+            param_names=names,
+            lower=lower,
+            upper=upper,
+            seeds=seeds,
+            weights=weights,
+        )
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 
 
@@ -1196,27 +1201,30 @@ def _fit_odmr_multi(
         upper += [4.0 * amp if polarity == "peak" else 0.0, 0.18 * span, center_hi]
     scale = _scaled_perturbation(lower, upper)
     seeds = [np.asarray(seed, dtype=float) + rng.normal(0, scale) for _ in range(n_starts)]
-    result = fit_model_multistart(
-        model_name="ODMRMulti",
-        model_func=odmr_multi_lorentzian,
-        x=x,
-        y=y_fit,
-        param_names=names,
-        lower=lower,
-        upper=upper,
-        seeds=seeds,
-        weights=weights,
-    )
+    with parameter_controls(_odmr_controls(current_parameter_controls(),y_scale)):
+        result = fit_model_multistart(
+            model_name="ODMRMulti",
+            model_func=odmr_multi_lorentzian,
+            x=x,
+            y=y_fit,
+            param_names=names,
+            lower=lower,
+            upper=upper,
+            seeds=seeds,
+            weights=weights,
+        )
     return _rescale_odmr_result(result, y_scale, extras={"odmr_polarity": polarity})
 
 
 def _rescale_odmr_result(result: FitResult, y_scale: float, extras: dict[str, object] | None = None) -> FitResult:
     params = result.params.copy()
     errors = result.errors.copy()
+    factors = np.ones(len(params))
     for idx, name in enumerate(result.param_names):
         if name == "y0" or name.startswith("C"):
             params[idx] *= y_scale
             errors[idx] *= y_scale
+            factors[idx] = y_scale
     return FitResult(
         model_name=result.model_name,
         param_names=result.param_names,
@@ -1233,6 +1241,8 @@ def _rescale_odmr_result(result: FitResult, y_scale: float, extras: dict[str, ob
         message=result.message,
         selection_note=result.selection_note,
         extras={**dict(result.extras), **(extras or {})},
+        covariance=result.covariance * np.outer(factors, factors) if result.covariance is not None else None,
+        free_mask=result.free_mask, uncertainty=result.uncertainty, model_func=result.model_func,
     )
 
 
@@ -1285,7 +1295,7 @@ def _fit_non_ramsey_impl(
             result.extras["fit_engine_experiment_type"] = exp_type
         return result
 
-    n_starts = max(4, int(cfg.multistart))
+    n_starts = max(1, int(cfg.multistart))
     tspan = float(np.max(x) - np.min(x))
     yamp = float(0.5 * (np.percentile(y, 95) - np.percentile(y, 5)))
     y0 = float(np.median(y))
@@ -1471,6 +1481,7 @@ def fit_non_ramsey(
     if not weighted:
         return result
     n_locked = sum(1 for n in result.param_names if locks and n in locks and locks[n][1])
-    base = trace.y if trace is not None and len(trace.y) == len(y) else y
+    base = y
     result.extras["sem_weights_applied"] = True
-    return _attach_sem_chi2(result, y, sem, n_locked, float(np.ptp(base)), weighted=True)
+    span = result.extras.get('t1_norm_span', float(np.ptp(base)))
+    return _attach_sem_chi2(result, y, sem, n_locked, float(span), weighted=True)

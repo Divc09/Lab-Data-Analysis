@@ -64,6 +64,10 @@ def deer_ratio(ws, path, detector=None, mode="signal", ref_path=None, ref_detect
     if info["reference_only"]:
         raise ValueError("The DEER file is reference-only (no signal); a DEER ratio would be fabricated.")
     xr, yr, sr, rinfo = _load(ws, ref_path, ref_detector or detector, mode, need_time=False)
+    from nvfit.units import compatibility, trace_units
+    xs,ys=compatibility(trace_units(ws.trace(path,detector,mode)),trace_units(ws.trace(ref_path,ref_detector or detector,mode)),label='DEER reference ratio')
+    xr,yr=xr*xs,yr*ys
+    if sr is not None: sr=sr*abs(ys)
     res = deer_tools.deer_ratio(x, y, xr, yr, s, sr)
     for k in ("x", "ratio", "sem"):
         res[k] = arr(res[k])

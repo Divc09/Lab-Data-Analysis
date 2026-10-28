@@ -9,6 +9,8 @@ from nvfit.bootstrap import bootstrap_fit
 from nvfit.fit_workflows import aligned_indices, aligned_sem
 
 from . import core
+from .ext_iterations import lock_model_choice
+from nvfit.prepared_fit import PreparedFit
 
 _RAMSEY_SPEC_NAME = {"RamseySimple": "Simple damped cosine", "RamseyHyperfine": "N14 hyperfine", "RamseyExtended": "Extended"}
 
@@ -23,9 +25,11 @@ def bootstrap(ws, path, detector, mode, proc, spec, n_boot=200):
     tr, x, y, exp_type, cfg, locks = core.fit_inputs(ws, path, detector, mode, proc, spec)
     cfg = dataclasses.replace(cfg, multistart=min(int(cfg.multistart), 4))
     spec["multistart"] = cfg.multistart
-    base, _ = core.fit_dispatch(tr, x, y, exp_type, cfg, locks, spec)
-    if base.model_name in _RAMSEY_SPEC_NAME:
-        spec["ramsey_model"] = _RAMSEY_SPEC_NAME[base.model_name]  # keep the same model across resamples
+    request = PreparedFit.create(x,y,core.FIT_FAMILY.get(exp_type,exp_type),cfg,locks,tr,spec.get('ramsey_model','Auto'))
+    base,_ = request.run(robust=bool(spec.get('robust')))
+    spec,_ = lock_model_choice(spec, {'model':base.model_name,'extras':base.extras})
+    cfg = dataclasses.replace(request.config, rabi_mode=spec.get('rabi_mode',cfg.rabi_mode),
+        t1_prep_mode=spec.get('t1_prep',request.config.t1_prep_mode), odmr_polarity=spec.get('odmr_polarity',cfg.odmr_polarity))
 
     matrix = None
     full = core._iteration_matrix(tr, mode)

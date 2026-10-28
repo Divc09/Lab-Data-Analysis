@@ -1,11 +1,19 @@
 // Batch workspace: wraps nvfit.pro_batch with live progress and a filterable results table.
 import { call } from './api.js';
-import { S, emit, openFile, loadData } from './state.js';
-import { runFit } from './analyze.js';
+import { S, emit, openFile, loadData, addCompareItem } from './state.js';
 import { h, mount, seg, select, input, field, check, toast, fmt, num, basename, clone } from './util.js';
 import { copyText } from './export.js';
+import { BATCH_STATUSES, comparableBatchRow, needsBatchRetry, batchTableText } from './batchstatus.js';
 
 let timer = null;
+
+export async function saveBatchSummary() {
+  const path = await call('dialog', { kind: 'save', title: 'Export batch summary', filename: 'batch_summary.csv', directory: S.batch.opts?.output_dir || '' });
+  if (!path) return;
+  await call('write_text', { path: /\.csv$/i.test(path) ? path : `${path}.csv`, text: batchTableText(S.batch.rows) });
+  toast('Saved batch summary', 'ok');
+}
+export const copyBatchSummary = () => copyText(batchTableText(S.batch.rows, '\t'), 'Batch summary copied');
 
 function defaults() {
   const folder = S.library.folder || '';
@@ -18,7 +26,8 @@ async function poll() {
   if (!B.job) return;
   try {
     B.status = await call('batch_status', { job: B.job }, { quiet: true });
-    if (B.status.state !== 'running') { clearInterval(timer); timer = null; B.rows = B.status.rows; toast(`Batch ${B.status.state}: ${B.rows.length} result row(s).`, B.status.state === 'finished' ? 'ok' : ''); }
+    B.rows=B.status.rows || [];B.manifestPath=B.status.manifest_path || B.manifestPath;
+    if (B.status.state !== 'running') { clearInterval(timer); timer = null; B.rows = B.status.rows; B.manifestPath=B.status.manifest_path; toast(`Batch ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.`, B.status.state === 'finished' ? 'ok' : ''); }
     emit();
   } catch (e) { clearInterval(timer); timer = null; }
 }
@@ -38,26 +47,26 @@ export function renderBatch(root) {
     field('Model', select([['', 'Auto per experiment type'], 'Rabi', 'Ramsey', 'SpinEcho', 'DynamicDecoupling', 'T1', 'ODMR', 'DEERFrequency', 'DEERDuration', 'DEERDecay', 'DEERPosition', 'TimeTraceDecay'], o.model, (v) => set({ model: v }))),
     field('Observable', select([['contrast', 'Contrast'], ['signal', 'Signal'], ['reference', 'Reference'], ['difference', 'Difference']], o.mode, (v) => set({ mode: v }))),
     h('div', { class: 'g2' }, field('Bin size', input(o.bin, (v) => set({ bin: Math.max(1, num(v) || 1) }))), field('Smoothing', input(o.smooth, (v) => set({ smooth: Math.max(1, num(v) || 1) }))),
-      field('Multistart', input(o.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }))), field('Figure DPI', input(o.dpi, (v) => set({ dpi: num(v) || 180 }))),
+      field('Multistart', input(o.multistart, (v) => set({ multistart: Math.max(1, num(v) || 12) }))), field('Figure DPI', input(o.dpi, (v) => set({ dpi: num(v) || 180 }))),
       field('D1 label', input(o.detector_labels.detector1, (v) => set({ detector_labels: { ...o.detector_labels, detector1: v } }))), field('D2 label', input(o.detector_labels.detector2, (v) => set({ detector_labels: { ...o.detector_labels, detector2: v } })))),
     check('Robust fitting (subset comparison)', o.robust, (v) => set({ robust: v })), check('ODMR multi-peak', o.odmr_multi, (v) => set({ odmr_multi: v })), check('Write Origin bundles', o.origin, (v) => set({ origin: v })),
-    h('div', { class: 'row' }, running ? h('button', { class: 'btn danger', style: 'flex:1;justify-content:center', onclick: () => call('batch_cancel', { job: B.job }) }, 'Cancel')
+    h('div', { class: 'row' }, running ? h('button', { class: 'btn danger', style: 'flex:1;justify-content:center', onclick: () => call('batch_cancel', { job: B.job }) }, 'Cancel after row')
       : h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: !o.input_dir || !o.output_dir, onclick: start }, 'Run batch'),
     h('button', { class: 'btn', onclick: async () => copyText(await call('batch_cli', { opts: o }), 'Command copied') }, 'Copy CLI command')),
     h('div', { class: 'note' }, 'Uses the same nvfit.pro_batch pipeline as the command line, so results match.'));
   const rows = B.rows || [];
-  const statuses = ['PASS', 'WARN', 'FAIL'];
+  const statuses = BATCH_STATUSES;
   const counts = Object.fromEntries(['all', ...statuses, 'other'].map((k) => [k, k === 'all' ? rows.length : k === 'other' ? rows.filter((r) => !statuses.includes(r.status)).length : rows.filter((r) => r.status === k).length]));
   const words = (B.text || '').toLowerCase().split(/\s+/).filter(Boolean);
   const shown = rows.filter((r) => (B.filter === 'all' || (B.filter === 'other' ? !statuses.includes(r.status) : r.status === B.filter)) && words.every((w) => Object.values(r).join(' ').toLowerCase().includes(w)));
   const st = B.status;
-  const pathOf = (r) => `${B.ranInput || o.input_dir}\\${r.relative_path || r.file}`;
+  const pathOf = (r) => r.source_path || `${B.ranInput || o.input_dir}\\${r.relative_path || r.file}`;
   const filterEl = input(B.text || '', (v) => { B.text = v; emit(); }, { placeholder: 'Filter rows', style: 'width:220px' });
   const main = h('main', { class: 'main' },
     h('div', { class: 'row wrap' }, h('h1', { style: 'margin:0;font-size:17px;font-weight:600' }, basename(o.input_dir) || 'Batch'),
       st ? h('span', { class: 'muted' }, `${st.done}/${st.total || '?'} · ${st.state}${st.error ? ': ' + st.error : ''}`) : h('span', { class: 'muted' }, 'Not run yet'),
       st ? h('div', { class: 'progress' }, h('div', { style: `width:${st.total ? (100 * st.done) / st.total : 0}%` })) : null),
-    h('div', { class: 'row wrap', style: 'gap:6px' }, [['all', 'All'], ['PASS', 'Pass'], ['WARN', 'Check'], ['FAIL', 'Fail'], ['other', 'Plot only / other']].map(([k, l]) => h('button', { class: `chip ${B.filter === k ? 'on' : ''}`, onclick: () => { B.filter = k; emit(); } }, `${l} ${counts[k]}`)),
+    h('div', { class: 'row wrap', style: 'gap:6px' }, [['all', 'All'], ['PASS', 'Fit pass'], ['WARN', 'Fit check'], ['FAIL', 'Fail'], ['PLOT_ONLY', 'Plot only'], ['UNCONVERGED', 'Unconverged'], ['FALLBACK', 'Fallback'], ['EXCLUDED', 'Excluded'], ['other', 'Other']].map(([k, l]) => h('button', { class: `chip ${B.filter === k ? 'on' : ''}`, onclick: () => { B.filter = k; emit(); } }, `${l} ${counts[k]}`)),
       h('span', { class: 'sp' }), filterEl),
     h('div', { class: 'card', style: 'flex:1;overflow:auto;min-height:200px' },
       rows.length ? h('table', { class: 'tbl bigtbl' }, h('tr', {}, ['File', 'Detector', 'Type', 'Status', 'Model', 'R²', 'Reason', ''].map((t) => h('th', {}, t))),
@@ -69,44 +78,31 @@ export function renderBatch(root) {
         : h('div', { class: 'empty', style: 'padding:40px' }, running ? 'Running…' : 'Results appear here as a table with one row per file and detector.')),
     st?.log?.length ? h('details', { class: 'card pad' }, h('summary', {}, `Log (${st.log.length} lines)`), h('pre', { class: 'mono', style: 'font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap' }, st.log.slice(-300).join('\n'))) : null,
     h('div', { class: 'row wrap' },
-      h('button', { class: 'btn', disabled: !rows.some((r) => r.status === 'PASS' || r.status === 'WARN'), title: 'Open the passing rows in Compare and refit each file/detector with this batch run\'s settings (batch summaries hold metrics, not curves)', onclick: sendToCompare }, 'Send fitted rows to Compare'),
+      h('button', { class: 'btn', disabled: !rows.some(comparableBatchRow), title: 'Import the saved curves and exact run settings for each converged fitted row', onclick: sendToCompare }, 'Send fitted rows to Compare'),
       h('button', { class: 'btn', disabled: !o.output_dir, onclick: () => call('open_path', { path: o.output_dir }) }, 'Open results folder'),
       h('button', { class: 'btn', disabled: !rows.length, onclick: () => call('open_path', { path: `${o.output_dir}\\batch_summary.csv` }) }, 'Open summary CSV'),
-      h('button', { class: 'btn', disabled: !o.output_dir, onclick: async () => { B.rows = await call('batch_summary', { output_dir: o.output_dir }); B.ranInput = o.input_dir; if (B.ranOpts?.output_dir !== o.output_dir) B.ranOpts = null; emit(); } }, 'Load previous results'),
-      h('button', { class: 'btn', disabled: running || !o.output_dir || !rows.some((r) => r.status === 'FAIL'), onclick: rerunFailed }, 'Re-run failed')));
+      h('button', { class: 'btn', disabled: !o.output_dir, onclick: async () => { B.rows=await call('batch_summary',{output_dir:o.output_dir});const run=await call('batch_run_record',{output_dir:o.output_dir});B.manifestPath=run?.manifest_path;B.ranInput=run?.options.input_dir || o.input_dir;B.ranOpts=run?.ui_options || null;B.status=run?{state:run.state,done:run.completed_count,total:run.requested_rows.length,unfinished_count:run.rows.filter(r=>r.state==='pending').length,discovery_complete:run.discovery_complete}:null;emit();} }, 'Load previous results'),
+      h('button', { class: 'btn', disabled: running || !rows.some(r=>needsBatchRetry(r) && r.row_id && r.manifest_path), title: 'Retry these row IDs using the saved run’s sources and options', onclick: rerunFailed }, 'Re-run problem rows'),
+      h('button',{class:'btn',disabled:running || !B.manifestPath || !(B.status?.unfinished_count || B.status?.discovery_complete===false),onclick:resumeUnfinished},'Resume unfinished rows')));
   mount(root, left, main);
 
-  // Batch summaries carry metrics (T1_ns, R², ...) but no curves, so Compare refits each row with the batch run's own
-  // settings (observable, bin, smoothing, model, multistart, robust, ODMR multi-peak) through the normal workspace fit.
+  // Import the stored curves/settings, preserving each detector and every dirty Analyze control.
   async function sendToCompare() {
-    const ok = rows.filter((x) => x.status === 'PASS' || x.status === 'WARN');
-    const run = B.ranOpts || o;
-    // Compare stores one result per file path, so a second detector row for the same
-    // file would silently replace the first result and overstate the sent count.
-    const seen = new Set();
-    let fitted = 0, failed = 0, skippedDetectors = 0;
-    for (const r of ok) {
-      const p = pathOf(r);
-      if (seen.has(p)) { skippedDetectors++; continue; }
+    const ok=rows.filter(comparableBatchRow);let imported=0,failed=0;
+    for(const row of ok) {
       try {
-        const f = await openFile(p, { primary: false });
-        const mode = f.info.observables.includes(run.mode) ? run.mode : f.mode;
-        if (f.mode !== mode || f.proc.bin !== run.bin || f.proc.smooth !== run.smooth) { f.mode = mode; Object.assign(f.proc, { bin: run.bin, smooth: run.smooth }); await loadData(f); }
-        Object.assign(f.fitSpec, { model: run.model || 'Auto', multistart: run.multistart, odmr_multi: !!run.odmr_multi, apply_both: false });
-        if (r.detector_id && f.info.detectors.includes(r.detector_id)) f.detector = r.detector_id;
-        const previousFits = f.fitHistory.length;
-        await runFit(f, { robust: !!run.robust, recordUndo: false });
-        if (f.fitHistory.length > previousFits && f.fit[f.detector]) {
-          seen.add(p);
-          if (!S.compare.set.includes(p)) S.compare.set.push(p);
-          S.compare.results[p] = f.fit[f.detector];
-          fitted++;
-        } else failed++;
-      } catch (e) { failed += 1; }
+        if(!row.manifest_path || !row.row_id)throw new Error('Legacy summary lacks a reproducible run record; start a new batch.');
+        const item=await call('batch_import',{manifest_path:row.manifest_path,row_id:row.row_id},{label:'Importing stored batch fit'});
+        const f=await openFile(item.path,{primary:false});
+        addCompareItem(f,{detector:item.detector,mode:item.mode,proc:item.proc,spec:item.spec,result:item.fit,linked:false,data:item.data});
+        imported++;
+      } catch(e){failed++;}
     }
-    toast(`Sent ${fitted} file(s) to Compare${failed ? `, ${failed} failed` : ''}${skippedDetectors ? `, ${skippedDetectors} additional detector row(s) skipped (Compare shows one detector per file)` : ''}.`, failed || skippedDetectors ? '' : 'ok');
-    S.view = 'compare'; emit();
+    S.compare.spec={model:'useOwn'};
+    toast(`Imported ${imported} stored analysis item(s)${failed ? `; ${failed} unavailable or legacy rows` : ''}.`,failed?'':'ok');
+    S.view='compare';emit();
   }
+
 }
 
 async function start() {
@@ -128,7 +124,8 @@ const rowKey = (r) => r.relative_path || r.file;
 // would collide). Older summaries lack it: dual-detector files get a __<detector_id> suffix, and
 // recursive runs flatten subfolders into the stem with "__" separators.
 async function openFigure(r) {
-  const dir = S.batch.opts.output_dir;
+  if(r.figure_path){await call('open_path',{path:r.figure_path});return;}
+  const dir = S.batch.ranOpts?.output_dir || S.batch.opts.output_dir;
   const stem = rowKey(r).replace(/\.[^./\\]+$/, '').split(/[\\/]/).join('__');
   const guesses = r.detector_id ? [`${stem}__${r.detector_id}_fit.png`, `${stem}_fit.png`] : [`${stem}_fit.png`];
   const names = r.output_stem ? [`${r.output_stem}_fit.png`] : guesses;
@@ -138,29 +135,23 @@ async function openFigure(r) {
   toast('Figure not found', 'err');
 }
 
-// Re-runs each failed file alone (single_file), sequentially, with merge_summary so the CSVs keep all rows.
+// Replays saved row IDs and frozen options; completed rows keep their archived outputs.
 async function rerunFailed() {
-  const B = S.batch, o = B.opts, base = B.ranInput || o.input_dir;
-  const failed = [...new Set((B.rows || []).filter((r) => r.status === 'FAIL').map(rowKey))];
-  if (!failed.length) return;
-  let cancelled = false;
-  B.rerunning = true; emit();
+  const B=S.batch, failed=(B.rows || []).filter(r=>needsBatchRetry(r) && r.row_id && r.manifest_path);
+  if(!failed.length)return;
+  B.rerunning=true;emit();
   try {
-    for (const key of failed) {
-      B.job = await call('batch_start', { opts: { ...o, input_dir: base, output_dir: o.output_dir, single_file: `${base}\\${key}`, merge_summary: true } }, { label: 'Starting re-run' });
-      B.status = { state: 'running', done: 0, total: 0, log: [] };
-      emit();
-      let st;
-      do {
-        await wait(700);
-        st = await call('batch_status', { job: B.job }, { quiet: true });
-        B.status = st; emit();
-      } while (st.state === 'running');
-      if (st.state === 'cancelled') { cancelled = true; break; }
-    }
-    B.rows = await call('batch_summary', { output_dir: o.output_dir }, { quiet: true }); emit();
-    toast(cancelled ? 'Re-run cancelled.' : 'Re-run finished.', cancelled ? '' : 'ok');
-  } finally {
-    B.rerunning = false; emit();
-  }
+    const manifest=B.manifestPath || failed[0].manifest_path;
+    B.job=await call('batch_rerun',{manifest_path:manifest,rows:failed.map(r=>r.row_id)},{label:'Rerunning saved batch rows'});
+    B.status={state:'running',done:0,total:failed.length,log:[]};emit();
+    do{await wait(700);B.status=await call('batch_status',{job:B.job},{quiet:true});emit();}while(B.status.state==='running');
+    B.rows=B.status.rows;B.manifestPath=B.status.manifest_path;
+    toast(`Re-run ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.${B.status.error ? ' '+B.status.error : ''}`,B.status.state==='finished'?'ok':'');
+  } finally {B.rerunning=false;emit();}
+}
+
+async function resumeUnfinished(){
+  const B=S.batch;B.job=await call('batch_resume',{manifest_path:B.manifestPath},{label:'Resuming recorded batch'});
+  B.status={state:'running',done:0,total:0,log:[]};
+  if(timer)clearInterval(timer);timer=setInterval(poll,700);emit();
 }

@@ -11,6 +11,9 @@ import csv
 import io
 import json
 import math
+import hashlib
+import uuid
+from copy import deepcopy
 import os
 import threading
 import time
@@ -24,6 +27,9 @@ import numpy as np
 from nvfit.analysis_tools import AnalysisStep, process_series
 from nvfit.app_state import fit_result_to_dict, json_safe
 from nvfit.fit_engine import FitResult
+from nvfit.prepared_fit import PreparedFit, evaluate_result
+from nvfit.analysis_identity import analysis_descriptor, result_envelope, source_path
+from nvfit.units import compatibility, trace_units, unit_scale
 from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
 from nvfit.io_mat import DETECTOR_LABELS, ExperimentDataset, ExperimentTrace, load_experiment_dataset
 from nvfit.iterations import iteration_matrix, selected_trace, selection_indices, iteration_sources, matrix_stats, combine_datasets
@@ -139,6 +145,39 @@ class Workspace:
         self._pool = ThreadPoolExecutor(max_workers=4)
         self.jobs: dict[str, dict] = {}
         self.combined: dict[str, dict] = {}
+        self._revisions: dict[str, tuple[tuple, dict]] = {}
+
+    def source_revision(self, path: str) -> dict:
+        if path.startswith('combined:'):
+            recipe = self.combined[path]
+            return {'recipe':recipe,'sources':{r['path']:self.source_revision(r['path']) for r in recipe['runs']}}
+        p = Path(path)
+        if not p.exists() and type(self).dataset is not Workspace.dataset:
+            # Explicit in-memory dataset providers have no filesystem timestamp.
+            dataset=self.dataset(path)
+            digest=hashlib.sha256();size=0
+            for detector,tr in sorted(dataset.detectors.items()):
+                digest.update(detector.encode())
+                for name in ('x_ns','y','iteration_contrast','iteration_signal','iteration_reference','z2d'):
+                    value=getattr(tr,name,None)
+                    if value is None:continue
+                    value=np.asarray(value,dtype=float);digest.update(str(value.shape).encode());digest.update(value.tobytes());size+=value.nbytes
+            return {'sha256':digest.hexdigest(),'size':size,'virtual':True}
+        stat = p.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        key = source_path(str(p.resolve()))
+        with self._lock:
+            hit = self._revisions.get(key)
+            if hit and hit[0] == stamp: return hit[1]
+        digest = hashlib.sha256()
+        with p.open('rb') as stream:
+            for block in iter(lambda:stream.read(1024*1024),b''): digest.update(block)
+        after = p.stat()
+        if (after.st_mtime_ns,after.st_size) != stamp:
+            raise ValueError(f'Source changed while reading: {p.name}; retry after acquisition finishes saving.')
+        revision = {'mtime_ns':str(stat.st_mtime_ns),'size':stat.st_size,'sha256':digest.hexdigest()}
+        with self._lock: self._revisions[key] = (stamp,revision)
+        return revision
 
     # -- datasets ---------------------------------------------------------
     def dataset(self, path: str, mode: str = "contrast") -> ExperimentDataset:
@@ -155,6 +194,8 @@ class Workspace:
             if hit and hit[0] == mtime:
                 return hit[1]
         ds = load_experiment_dataset(p, mode)
+        if Path(p).stat().st_mtime_ns != mtime:
+            raise ValueError(f'Source changed while loading: {Path(p).name}; retry after saving.')
         with self._lock:
             self._cache[key] = (mtime, ds)
             if len(self._cache) > 64:
@@ -337,12 +378,27 @@ def smoothing_window(n: int, requested: int) -> int:
     return w if w >= 3 else 1
 
 
+def analysis_for(ws, path, detector, mode, proc=None, settings=None, kind='fit'):
+    revision = ws.source_revision(path) if hasattr(ws,'source_revision') else None
+    dependencies = {}
+    baseline = (proc or {}).get('baseline') or {}
+    if baseline.get('path') and hasattr(ws,'source_revision'):
+        dependencies[source_path(baseline['path'])] = ws.source_revision(baseline['path'])
+    settings = {k:v for k,v in (settings or {}).items() if k != 'apply_both'}
+    return result_envelope(analysis_descriptor(path,detector,mode,proc),revision,settings,dependencies,kind)
+
+
 def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict | None = None) -> dict:
     ds = ws.dataset(path, mode)
     tr = ws.trace(path, detector, mode)
     proc = proc or {}
     info = describe(ds, tr)
+    analysis = analysis_for(ws,path,tr.detector_id,mode,proc,kind='data')
+    info['source_revision'] = analysis['source_revision']
+    if info['source_revision'] and 'mtime_ns' in info['source_revision']:
+        info['mtime'] = int(info['source_revision']['mtime_ns']) / 1e9
     out: dict[str, Any] = {"info": info, "detector": tr.detector_id, "mode": mode}
+    out['analysis'] = analysis
     if tr.scan_dim == "scan2d" and tr.z2d is not None:
         x2d, y2d = np.asarray(tr.x2d, float), np.asarray(tr.y2d, float)
         maps = {"value": tr.z2d}
@@ -370,7 +426,9 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
     if base.get("path") and os.path.normcase(base["path"]) != os.path.normcase(path):
         # Subtract another loaded file (same observable), interpolated onto this file's axis.
         btr = ws.trace(base["path"], base.get("detector") or detector, mode)
+        xscale, yscale = compatibility(trace_units(tr),trace_units(btr),label='Baseline subtraction')
         bx, by = np.asarray(btr.x_ns, float), np.asarray(btr.y, float)
+        bx, by = bx*xscale, by*yscale
         ok = np.isfinite(bx) & np.isfinite(by)
         order = np.argsort(bx[ok])
         bvals = np.interp(x, bx[ok][order], by[ok][order], left=np.nan, right=np.nan)
@@ -470,18 +528,12 @@ def _locks(spec: dict) -> dict | None:
 
 def _evaluate(result: FitResult, x: np.ndarray, x_data: np.ndarray) -> np.ndarray | None:
     """Evaluate the fitted model on ``x``; verified against the stored y_fit first."""
-    model = MODEL_REGISTRY.get(result.model_name)
-    if model is None:
-        return None
-    offset = 0.0
-    if isinstance(result.extras, dict) and result.extras.get("x_offset_ns") is not None:
-        offset = float(result.extras["x_offset_ns"])
     try:
-        check = np.asarray(model(x_data - offset, *result.params), float)
+        check = evaluate_result(result, x_data)
         ref = np.asarray(result.y_fit, float)
-        if check.shape != ref.shape or not np.allclose(check, ref, rtol=1e-6, atol=1e-9 * max(1.0, float(np.nanmax(np.abs(ref))))):
+        if check.shape != ref.shape or not np.allclose(check, ref, rtol=1e-6, atol=1e-9 * max(1.,float(np.nanmax(np.abs(ref))))):
             return None
-        return np.asarray(model(x - offset, *result.params), float)
+        return evaluate_result(result, x)
     except Exception:
         return None
 
@@ -505,6 +557,9 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     provenance = {**data["provenance"], "fit_target": "smoothed" if spec.get("fit_smoothed") else "raw_mean",
                   "fit_transformed": transformed, "smoothing_window": window,
                   "uncertainty_note": "Smoothing correlates samples and underestimates ordinary fit uncertainties; no corrected estimate is supplied. SEM weights are disabled." if window > 1 else ""}
+    review = proc.get("iteration_review")
+    if review and review.get("retained") == proc.get("iterations"):
+        provenance["iteration_review"] = review
     tr = replace(tr, metadata={**(tr.metadata or {}), "fit_provenance": provenance})
     if not transformed and not proc.get("steps") and int(proc.get("bin", 1) or 1) > 1:
         # Feed the existing weighting routines the SEM of binned iteration means on the actual fit grid.
@@ -517,10 +572,10 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     if hi is not None:
         keep &= x <= float(hi)
     x, y = x[keep], y[keep]
-    if spec.get("fit_smoothed"):
-        # Normalized T1 intentionally uses trace.y when lengths match; it must see the chosen smoothed target.
-        tr = replace(tr, x_ns=x.copy(), y=y.copy(), y_sem=None,
-                     iteration_contrast=None, iteration_signal=None, iteration_reference=None, iteration_valid=None)
+    sem = data['proc'].get('sem')
+    sem = np.asarray(sem,float) if sem is not None else None
+    usable_sem = sem is not None and sem.shape == keep.shape and not proc.get('steps') and not spec.get('fit_smoothed')
+    tr = replace(tr, x_ns=x.copy(), y=y.copy(), y_sem=sem[keep] if usable_sem else None)
     if len(x) < 5:
         raise ValueError("Fewer than 5 points in the fit range.")
     exp_type = spec.get("experiment") or tr.experiment_type
@@ -553,7 +608,7 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
         odmr_polarity=str(spec.get("odmr_polarity", "Auto")),
         odmr_peak_ranges=tuple(tuple(r) for r in spec.get("odmr_ranges", []) if r and None not in r),
         t1_prep_mode=str(spec.get("t1_prep", "Auto")),
-        t1_model_family=str(spec.get("t1_family", "Stretched exponential")),
+        t1_model_family=str(spec.get("t1_family", "Regular exponential")),
         custom_expr=str(spec.get("custom_expr", "")),
         custom_spec=spec.get("custom_spec"),
     )
@@ -563,64 +618,46 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
 def fit_dispatch(tr: ExperimentTrace, x: np.ndarray, y: np.ndarray, exp_type: str, cfg: FitWorkflowConfig, locks, spec: dict):
     """Run the model-family fit; returns (FitResult, ramsey candidate summaries | None)."""
     family = FIT_FAMILY.get(exp_type, exp_type)
-    candidates = None
-    if spec.get("robust"):
-        result = pro_batch._run_robust_fit(exp_type if exp_type != "DynamicDecoupling" else "SpinEcho", x, y,
-                                           n_starts=cfg.multistart, odmr_multipeak=cfg.odmr_multipeak)
-    elif family == "Ramsey":
-        sel = fit_ramsey_physics_first(x, y, sem=aligned_sem(tr, x) if cfg.sem_weights else None)
-        wanted = {"Simple damped cosine": "RamseySimple", "N14 hyperfine": "RamseyHyperfine", "Extended": "RamseyExtended"}.get(spec.get("ramsey_model", ""), None)
-        result = next((c for c in sel.candidates if c.model_name == wanted), sel.best) if wanted else sel.best
-        candidates = [{"model": c.model_name, "r2": c.r2, "bic": c.bic} for c in sel.candidates]
-    else:
-        result = fit_non_ramsey(exp_type, x, y, config=cfg, locks=locks,
-                                custom_spec=spec.get("custom_spec"), trace_experiment_type=tr.experiment_type, trace=tr)
-    return result, candidates
+    request = PreparedFit.create(x, y, family, cfg, locks, tr, spec.get('ramsey_model', 'Auto'))
+    return request.run(robust=bool(spec.get('robust')))
 
 
 def _conf_band(result: FitResult, dense_x: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
-    """1-sigma delta-method band of the fitted model: sigma(x)^2 = J(x) C J(x)^T.
-
-    J is a central-difference Jacobian of the registered model wrt the fitted parameters (same x_offset handling as
-    _evaluate); C comes from fit_engine._estimate_covariance with cost = 0.5*sum(r^2) (unweighted residuals y - model)
-    at the solution. Locked (zero-sensitivity) parameters contribute nothing; NaN if the covariance is unidentifiable."""
-    from nvfit.fit_engine import _estimate_covariance
-    model = MODEL_REGISTRY.get(result.model_name)
-    if model is None:
+    """1-sigma model-mean band from the fit's covariance and free parameters."""
+    if result.covariance is None:
         return None
     try:
-        p0 = np.asarray(result.params, float)
-        offset = float((result.extras or {}).get("x_offset_ns") or 0.0) if isinstance(result.extras, dict) else 0.0
-
-        def jac_at(xs: np.ndarray) -> np.ndarray:
-            cols = []
-            for i in range(len(p0)):
-                h = 1e-6 * max(abs(p0[i]), 1e-3)
-                hi, lo = p0.copy(), p0.copy()
-                hi[i] += h
-                lo[i] -= h
-                cols.append((np.asarray(model(xs - offset, *hi), float) - np.asarray(model(xs - offset, *lo), float)) / (2 * h))
-            return np.column_stack(cols)
-
-        j_fit = jac_at(np.asarray(x, float))
-        resid = np.asarray(y, float) - np.asarray(model(np.asarray(x, float) - offset, *p0), float)
-        cov = _estimate_covariance(j_fit, 0.5 * float(np.sum(resid ** 2)), dof=len(x) - len(p0))
-        j_d = jac_at(np.asarray(dense_x, float))
-        dead = ~(np.linalg.norm(j_fit, axis=0) > 0)
-        cov = np.where(np.isnan(cov) & (dead[:, None] | dead[None, :]), 0.0, cov)
-        j_d = np.where(dead[None, :], 0.0, j_d)
-        var = np.einsum("ij,jk,ik->i", j_d, cov, j_d)
-        return np.sqrt(np.where(var >= 0, var, np.nan))
+        covariance = np.asarray(result.covariance, float)
+        free = np.asarray(result.free_mask if result.free_mask is not None else [True]*len(result.params), bool)
+        if not np.all(np.isfinite(covariance[np.ix_(free, free)])):
+            return None
+        columns = []
+        for i, value in enumerate(result.params):
+            if not free[i]:
+                columns.append(np.zeros_like(dense_x, dtype=float)); continue
+            step = 1e-6 * max(abs(value), 1e-3)
+            hi, lo = result.params.copy(), result.params.copy()
+            hi[i] += step; lo[i] -= step
+            columns.append((evaluate_result(replace(result,params=hi), dense_x)-evaluate_result(replace(result,params=lo), dense_x))/(2*step))
+        jac = np.column_stack(columns)
+        variance = np.einsum('ij,jk,ik->i',jac,covariance,jac)
+        return np.sqrt(np.maximum(variance,0.))
     except Exception:
         return None
 
 
 def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict, spec: dict) -> dict:
     tr, x, y, exp_type, cfg, locks = fit_inputs(ws, path, detector, mode, proc, spec)
+    analysis = analysis_for(ws,path,tr.detector_id,mode,proc,spec)
     t0 = time.perf_counter()
     result, candidates = fit_dispatch(tr, x, y, exp_type, cfg, locks, spec)
     elapsed = time.perf_counter() - t0
 
+    return _fit_payload(tr,x,y,exp_type,result,candidates,elapsed,analysis)
+
+
+def _fit_payload(tr,x,y,exp_type,result,candidates=None,elapsed=0.,analysis=None):
+    mode=tr.mode
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
     profile = PROFILES.get(profile_name) or PROFILES.get("Rabi")
     status, reason = classify_status(r2=float(result.r2) if np.isfinite(result.r2) else -1.0,
@@ -641,6 +678,8 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         if bounds is not None:
             envelope = {"x": arr(dense_x), "upper": arr(bounds[0]), "lower": arr(bounds[1])}
     plot_y = extras.pop("plot_y", None)
+    band=_conf_band(result,dense_x,x,np.asarray(plot_y,float) if plot_y is not None else y) if dense_y is not None else None
+    uncertainty={**(result.uncertainty or {}),'band_available':band is not None,'band_note':'1-sigma uncertainty of model mean from retained fit covariance' if band is not None else 'Band unavailable: fit covariance or model evaluator missing/invalid'}
     params = []
     errs = np.asarray(result.errors, float)
     for i, name in enumerate(result.param_names):
@@ -649,7 +688,12 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         val = float(result.params[i])
         # A standard error many orders below the value usually means a degenerate covariance.
         reliable = math.isfinite(err) and err > 0 and (val == 0 or err / max(abs(val), 1e-300) > 1e-7)
+        fixed=result.free_mask is not None and not bool(result.free_mask[i])
         unit, desc = meta.units, meta.description
+        native_time=(tr.metadata or {}).get('x_unit') or ('s' if tr.experiment_type=='TimeTrace' else 'ns')
+        if tr.scan_dim=='time' and tr.experiment_type!='TimeTrace':
+            if unit=='ns':unit=native_time
+            if unit=='GHz':unit={'ps':'THz','ns':'GHz','us':'MHz','µs':'MHz','μs':'MHz','ms':'kHz','s':'Hz'}.get(native_time,'1/'+native_time)
         if result.model_name.startswith("T1"):
             if name == "T1":
                 unit = tr.metadata.get("x_unit") or "ns"
@@ -659,10 +703,11 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
                 unit = "normalized a.u." if normalized else ("dimensionless contrast" if mode == "contrast" else tr.metadata.get("value_unit") or "a.u.")
                 desc = f"{name} in normalized 1 - data space." if normalized else f"{name} in the measured {mode} space."
         params.append({"name": name, "symbol": meta.symbol, "unit": unit, "desc": desc,
-                       "value": val, "error": err if reliable else None,
+                       "value": val, "error": 0. if fixed else err if reliable else None,"locked":fixed,
                        "bound_hit": bool(result.bound_hits[i]) if i < len(result.bound_hits) else False})
     residuals = y - np.asarray(result.y_fit, float) if plot_y is None else np.asarray(plot_y, float) - np.asarray(result.y_fit, float)
     return clean({
+        "analysis": analysis,
         "model": result.model_name,
         "experiment": exp_type,
         "selection": result.selection_note,
@@ -677,9 +722,10 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
         "x": arr(x), "y_fit": arr(result.y_fit), "residuals": arr(residuals),
         "plot_y": arr(plot_y) if plot_y is not None else None,
         "plot_y_label": extras.pop("plot_y_label", None),
-        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(_conf_band(result, dense_x, x, np.asarray(plot_y, float) if plot_y is not None else y))} if dense_y is not None else None,
+        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(band)} if dense_y is not None else None,
         "envelope": envelope,
         "candidates": candidates,
+        "uncertainty": uncertainty,
         "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
         "elapsed_s": elapsed,
         "raw": fit_result_to_dict(result),
@@ -772,17 +818,36 @@ def compare_spots(ws: Workspace, a: dict, b: dict, mode: str) -> dict:
 
 
 def map_overlay(ws: Workspace, first: dict, second: dict, opts: dict) -> dict:
+    first_analysis=analysis_for(ws,first['path'],first['detector'],first.get('mode','contrast'),{'map_source':first.get('source','value')},kind='map')
+    second_analysis=analysis_for(ws,second['path'],second['detector'],second.get('mode','contrast'),{'map_source':second.get('source','value')},kind='map')
     t1, x1, y1, z1 = _map_arrays(ws, first["path"], first["detector"], first.get("mode", "contrast"), first.get("source", "value"))
     t2, x2, y2, z2 = _map_arrays(ws, second["path"], second["detector"], second.get("mode", "contrast"), second.get("source", "value"))
     if not compatible_axes(tuple(t1.scan_axes), tuple(t2.scan_axes)):
         raise ValueError("The maps are not in the same plane.")
     if axis_key(t1.scan_axes[0]) != axis_key(t2.scan_axes[0]):  # opposite stored order: transpose the second map
         x2, y2, z2 = y2, x2, z2.T
+    def map_unit(tr,axis):
+        units=(tr.metadata or {}).get('axis_units') or {}
+        if not isinstance(units,dict): units={}
+        return units.get(axis_key(axis),units.get(axis,(tr.metadata or {}).get('x_unit') or ''))
+    x2=x2*unit_scale(map_unit(t2,t1.scan_axes[0]),map_unit(t1,t1.scan_axes[0]))
+    y2=y2*unit_scale(map_unit(t2,t1.scan_axes[1]),map_unit(t1,t1.scan_axes[1]))
+    obs1=first.get('source','value');obs2=second.get('source','value')
+    obs1=first.get('mode','contrast') if obs1=='value' else obs1
+    obs2=second.get('mode','contrast') if obs2=='value' else obs2
+    if obs1!=obs2:raise ValueError('Map comparison requires matching source observables.')
+    value_unit=lambda tr:'dimensionless' if obs1=='contrast' else (tr.metadata or {}).get('value_unit') or 'a.u.'
+    z2=z2*unit_scale(value_unit(t2),value_unit(t1))
     ov = build_map_overlay((x1, y1, z1), (x2, y2, z2), shared=bool(opts.get("shared")),
                            background_percentile=float(opts.get("background", 10.0)),
                            palette=str(opts.get("palette", "Pink / teal")))
     png = _overlay_png(ov.x_edges, ov.y_edges, ov.rgba, swap=bool(opts.get("swap")))
+    request={'first':first,'second':second,'opts':opts}
+    analysis=result_envelope(first_analysis['descriptor'],first_analysis['source_revision'],request,
+        {source_path(second['path']):second_analysis['source_revision']},'map_overlay')
     return clean({"x_edges": arr(ov.x_edges), "y_edges": arr(ov.y_edges), "png": png, "ranges": ov.ranges,
+                  "request":request,"analysis":analysis,"analyses":[first_analysis,second_analysis],
+                  "units":{"x":map_unit(t1,t1.scan_axes[0]),"y":map_unit(t1,t1.scan_axes[1]),"value":value_unit(t1)},
                   "x_label": t1.scan_axes[0], "y_label": t1.scan_axes[1],
                   "cells": {"primary": arr(ov.primary), "secondary": arr(ov.secondary), "rgba": arr(ov.rgba)}})
 
@@ -903,52 +968,122 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def batch_run_record(output_dir):
+    from nvfit.batch_manifest import load_manifest
+    path=Path(output_dir)/'batch_manifest.json'
+    return load_manifest(path,validate_sources=False) if path.exists() else None
+
+
 def batch_start(ws: Workspace, opts: dict) -> str:
-    job_id = f"batch{int(time.time() * 1000)}"
-    job = {"id": job_id, "state": "running", "done": 0, "total": 0, "log": [], "rows": [], "error": None,
-           "output_dir": opts["output_dir"], "cancel": False}
-    ws.jobs[job_id] = job
-
-    def progress(idx, total, name, msg):
-        job["done"], job["total"] = idx + 1, total
-        job["log"].append(f"[{idx + 1}/{total}] {name}: {msg}")
-        if job["cancel"]:
-            raise KeyboardInterrupt("Batch cancelled")
-
+    opts=deepcopy(opts)
+    from nvfit.batch_manifest import load_manifest
+    replay=load_manifest(opts['manifest_path']) if opts.get('manifest_path') else None
+    output_dir=replay['options']['output_dir'] if replay else opts['output_dir']
+    job_id='batch'+uuid.uuid4().hex
+    job={'id':job_id,'state':'running','done':0,'total':0,'log':[],'rows':[],'error':None,'output_dir':output_dir,'cancel':False,'manifest_path':None}
+    with ws._lock:
+        if any(j['state']=='running' and os.path.normcase(j['output_dir'])==os.path.normcase(output_dir) for j in ws.jobs.values()):
+            raise ValueError('A batch is already writing this output folder.')
+        ws.jobs[job_id]=job
+    def progress(done,total,name,message):
+        job['done'],job['total']=done,total
+        job['log'].append(f'[{done}/{total}] {name}: {message}')
+        record=batch_run_record(output_dir)
+        if record:
+            job['manifest_path']=record['manifest_path']
+            job['unfinished_count']=sum(r['state']=='pending' for r in record['rows'])
+            job['discovery_complete']=record.get('discovery_complete',True)
+            job['rows']=[r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')]
     def work():
         try:
-            out = Path(opts["output_dir"])
-            merge = bool(opts.get("merge_summary"))
-            old_sum = _read_csv(out / "batch_summary.csv") if merge else []
-            old_val = _read_csv(out / "validation_report.csv") if merge else []
-            pro_batch.run_batch(
-                input_dir=Path(opts["input_dir"]), output_dir=Path(opts["output_dir"]),
-                mode=opts.get("mode", "contrast"), bin_size=int(opts.get("bin", 1)), smooth_window=int(opts.get("smooth", 1)),
-                single_file=Path(opts["single_file"]) if opts.get("single_file") else None,
-                model_override=opts.get("model") or None, multistart=int(opts.get("multistart", 12)),
-                robust=bool(opts.get("robust")), odmr_multipeak=bool(opts.get("odmr_multi")),
-                dpi=int(opts.get("dpi", 180)), write_origin_bundles=bool(opts.get("origin", True)),
-                recursive=bool(opts.get("recursive")), skip_checkpoints=bool(opts.get("skip_checkpoints")),
-                detector=opts.get("detector", "all"), detector_labels=opts.get("detector_labels"),
-                progress_callback=progress,
-            )
-            if merge:
-                job["rows"] = _merge_csv(out / "batch_summary.csv", old_sum)
-                _merge_csv(out / "validation_report.csv", old_val)
+            runtime={'progress_callback':progress,'cancel_requested':lambda:job['cancel']}
+            if replay:
+                result=pro_batch.replay_batch(opts['manifest_path'],selected_rows=opts.get('rows'),resume_unfinished=bool(opts.get('resume_unfinished')),**runtime)
             else:
-                job["rows"] = read_batch_summary(opts["output_dir"])
-            job["state"] = "finished"
+                result=pro_batch.run_batch(input_dir=Path(opts['input_dir']),output_dir=Path(output_dir),
+                    mode=opts.get('mode','contrast'),bin_size=int(opts.get('bin',1)),smooth_window=int(opts.get('smooth',1)),
+                    roi_min=opts.get('roi_min'),roi_max=opts.get('roi_max'),
+                    single_file=Path(opts['single_file']) if opts.get('single_file') else None,
+                    model_override=opts.get('model') or None,multistart=int(opts.get('multistart',12)),robust=bool(opts.get('robust')),
+                    odmr_multipeak=bool(opts.get('odmr_multi')),dpi=int(opts.get('dpi',180)),write_origin_bundles=bool(opts.get('origin',True)),
+                    recursive=bool(opts.get('recursive')),skip_checkpoints=bool(opts.get('skip_checkpoints')),detector=opts.get('detector','all'),
+                    detector_labels=opts.get('detector_labels'),ui_options=opts,**runtime)
+            if result:job.update(result)
+            else:job.update(state='finished',rows=read_batch_summary(output_dir))
         except KeyboardInterrupt:
-            job["state"] = "cancelled"
-            job["rows"] = read_batch_summary(opts["output_dir"])
+            job['state']='cancelled'
         except Exception as exc:
-            job["state"], job["error"] = "failed", str(exc)
-
-    threading.Thread(target=work, daemon=True).start()
+            job['state'],job['error']='failed',str(exc)
+        finally:
+            if job.get('manifest_path'):
+                record=load_manifest(job['manifest_path'],validate_sources=False)
+                job.update(done=record['completed_count'],total=len(record['requested_rows']),
+                    unfinished_count=sum(r['state']=='pending' for r in record['rows']),
+                    discovery_complete=record.get('discovery_complete',True),
+                    rows=[r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')])
+    threading.Thread(target=work,daemon=True).start()
     return job_id
 
 
+def batch_import(ws,manifest_path,row_key):
+    from nvfit.batch_manifest import load_manifest, fingerprint
+    manifest=load_manifest(manifest_path)
+    row=next((r for r in manifest['rows'] if r['row_id']==row_key),None)
+    if not row or not row.get('summary') or row['summary']['status'] not in ('PASS','WARN'):
+        raise ValueError('This row has no ordinary converged fit to import.')
+    output=next((o for o in row.get('outputs',[]) if o['path'].endswith('_result.json')),None)
+    if not output or fingerprint(output['path'])['sha256']!=output['revision']['sha256']:
+        raise ValueError('The stored result is missing or changed.')
+    saved=json.loads(Path(output['path']).read_text(encoding='utf-8'))
+    series=saved.get('series')
+    if not series:raise ValueError('This older run lacks stored curves; start a new batch before importing.')
+    options=manifest['options'];mode=saved['provenance']['mode'];path=row['source_path'];det=row['detector_id']
+    proc={'bin':options['bin_size'],'smooth':options['smooth_window'],'roi_min':options['roi_min'],'roi_max':options['roi_max'],
+          'iterations':None,'excluded':[],'exclusion_ranges':[],'steps':[]}
+    extras=saved.get('fit_extras') or {}
+    custom=manifest.get('auxiliary',{}).get('custom_model')
+    if custom:extras['custom_spec']=custom
+    spec={'model':'CustomModel' if custom else 'Auto','experiment':saved['experiment_type'],'multistart':options['multistart'],
+          'robust':options['robust'],'odmr_multi':options['odmr_multipeak'],'odmr_peaks':4,'odmr_auto_peaks':True,'odmr_polarity':'Auto',
+          'rabi_mode':'Single reliable Rabi','sem_weights':True,'sem_weights_all':False,
+          't1_prep':{'normalized_1_minus_data':'Normalize then 1-data','direct_decay':'Direct decay','direct':'Direct T1'}.get(extras.get('t1_prep_mode'),'Auto'),
+          't1_family':'Stretched exponential' if extras.get('t1_model_family')=='stretched' else 'Regular exponential',
+          'range_min':None,'range_max':None,'fit_smoothed':options['smooth_window']>1,'params':{},'custom_spec':custom,
+          'batch_options':options}
+    names=list(saved['params']);metrics=saved['metrics']
+    result=FitResult(model_name=saved['selected_model'],param_names=names,params=np.array([saved['params'][n] for n in names],float),
+        errors=np.array([saved['errors'].get(n) for n in names],float),y_fit=np.asarray(series['y_fit'],float),
+        r2=metrics['r2'],rmse=metrics['rmse'],aic=metrics['aic'],bic=metrics['bic'],durbin_watson=metrics['durbin_watson'],
+        bound_hits=[bool(saved['bound_hits'].get(n)) for n in names],success=metrics['success'],message=metrics['message'],
+        extras=extras,selection_note=saved['selection_note'],covariance=np.asarray(saved['covariance'],float) if saved.get('covariance') is not None else None,
+        free_mask=saved.get('free_mask'),uncertainty=saved.get('uncertainty') or {})
+    analysis=analysis_for(ws,path,det,mode,proc,spec)
+    analysis['imported_from']={'run_id':manifest['run_id'],'row_id':row_key,'manifest_path':manifest_path}
+    tr=ws.trace(path,det,mode)
+    fit=_fit_payload(tr,np.asarray(series['x'],float),np.asarray(series['input_y'],float),saved['experiment_type'],result,analysis=analysis)
+    fit.update(status=saved['status'],reason=saved['status_reason'],metrics=saved['nv_metrics'])
+    data=trace_payload(ws,path,det,mode,proc)
+    data['proc'].update(x=series['x'],y=series['input_y'],fit_x=series['x'],fit_y=series['input_y'],smooth=None)
+    return clean({'path':path,'detector':det,'mode':mode,'proc':proc,'spec':spec,'data':{det:data},'fit':fit})
+
+
+def batch_rerun(ws,manifest_path,rows):
+    if not rows:raise ValueError('Choose at least one row to rerun.')
+    return batch_start(ws,{'manifest_path':manifest_path,'rows':list(rows)})
+
+
+def batch_resume(ws,manifest_path):
+    from nvfit.batch_manifest import load_manifest
+    record=load_manifest(manifest_path)
+    pending=[r['row_id'] for r in record['rows'] if r['state'] in ('pending','not_requested')]
+    if not pending and record.get('discovery_complete',True):
+        raise ValueError('This run has no unfinished rows.')
+    return batch_start(ws,{'manifest_path':manifest_path,'rows':pending,'resume_unfinished':True})
+
+
 def read_batch_summary(output_dir: str) -> list[dict]:
+    record=batch_run_record(output_dir)
+    if record:return [r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')]
     path = Path(output_dir) / "batch_summary.csv"
     if not path.exists():
         return []
@@ -1014,6 +1149,24 @@ def svg_to_pdf_bytes(svg: str) -> bytes:
     return renderPDF.drawToString(drawing)
 
 
+def validate_analysis(ws, envelope):
+    from nvfit.analysis_identity import scientific_revision, canonical
+    try:
+        expected=result_envelope(envelope['descriptor'],envelope['source_revision'],envelope['settings'],envelope['dependencies'],envelope['kind'])
+        if expected['signature']!=envelope['signature'] or envelope.get('unverified'):
+            return {'fresh':False,'reason':'Unverified result signature'}
+        sources=dict(envelope.get('dependencies') or {})
+        path=envelope['descriptor']['source']
+        if path=='aggregate':sources.update(envelope['source_revision'])
+        else:sources[path]=envelope['source_revision']
+        for path,revision in sources.items():
+            if canonical(scientific_revision(ws.source_revision(path)))!=canonical(scientific_revision(revision)):
+                return {'fresh':False,'reason':f'Source changed: {path}'}
+        return {'fresh':True,'reason':''}
+    except (OSError,KeyError,ValueError) as exc:
+        return {'fresh':False,'reason':str(exc)}
+
+
 def export_results(ws: Workspace, req: dict) -> dict:
     if req.get("combined_recipe"):
         recipe = req["combined_recipe"]
@@ -1021,6 +1174,10 @@ def export_results(ws: Workspace, req: dict) -> dict:
         combine_datasets(ws.dataset, recipe, req.get("mode", "contrast"))
         with ws._lock:
             ws.combined[recipe["path"]] = recipe
+    for envelope in (req.get('analysis'),(req.get('fit') or {}).get('analysis'),(req.get('map_comparison') or {}).get('analysis')):
+        if envelope:
+            validation=validate_analysis(ws,envelope)
+            if not validation['fresh']:raise ValueError('Export source changed; reload before saving. '+validation['reason'])
     out_dir = Path(req["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = req["stem"]
@@ -1055,10 +1212,11 @@ def export_results(ws: Workspace, req: dict) -> dict:
         written.append(str(p))
     doc = {
         "app": f"SmartFitter {APP_VERSION}", "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "analysis":req.get("analysis"), "historical_results":req.get("historical_results"),
         "source": req.get("source"), "detector": req.get("detector"), "mode": req.get("mode"),
         "processing": req.get("processing"), "fit_spec": req.get("fit_spec"), "fit": req.get("fit"),
         "spots": req.get("spots"), "map_comparison": req.get("map_comparison"), "plot_state": req.get("plot_state"),
-        "provenance": req.get("provenance"), "iteration_fits": req.get("iteration_fits"), "combined_recipe": req.get("combined_recipe"),
+        "provenance": req.get("provenance"), "iteration_fits": req.get("iteration_fits"), "iteration_sensitivity": req.get("iteration_sensitivity"), "combined_recipe": req.get("combined_recipe"),
     }
     if req.get("json", True):
         p = out_dir / f"{stem}_result.json"
@@ -1155,8 +1313,8 @@ def export_results(ws: Workspace, req: dict) -> dict:
             w.writeheader()
             w.writerows(rows)
         written.append(str(p))
-    if req.get("map_comparison_csv") and req.get("map_comparison_request"):
-        mc = map_overlay(ws, *req["map_comparison_request"])
+    if req.get("map_comparison_csv") and (req.get("map_comparison") or req.get("map_comparison_request")):
+        mc = req.get('map_comparison') or map_overlay(ws, *req["map_comparison_request"])
         p = out_dir / f"{stem}__map_comparison.csv"
         xe, ye = mc["x_edges"], mc["y_edges"]
         prim, sec, rgba = mc["cells"]["primary"], mc["cells"]["secondary"], mc["cells"]["rgba"]

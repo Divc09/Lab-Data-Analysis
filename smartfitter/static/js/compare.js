@@ -1,6 +1,7 @@
+import { finiteExtent, maxAbs } from './numeric.js';
 // Compare workspace: overlay several files and track fitted values across them.
 import { call } from './api.js';
-import { S, emit, openFile, detLabel } from './state.js';
+import { S, emit, openFile, detLabel, compareFile, addCompareItem, refreshCompareItems, resultFreshness, recordResult, envelopeFor, reloadCompareItem } from './state.js';
 import { h, mount, seg, select, input, field, fmt, fmtPm, toast, modal, basename, tag, num, linreg, fmtTime, clone } from './util.js';
 import { PALETTES, baseStyle, friendlyAxis, MODE_LABEL } from './plotstyle.js';
 import { copyText, renderImage, copyImage } from './export.js';
@@ -9,7 +10,30 @@ import { isNormalizedT1, t1Normalization, toOriginal } from './fitdisplay.js';
 import { displayUnit, unitScale, displayValue, parameterUnit, prettyUnit } from './unitdisplay.js';
 
 let overlayEl, trendEl, alignNoteEl;
+export const hasCompareTrend = () => !!trendEl?.isConnected && !!trendEl._points?.length;
+export const hasCompareOverlay = () => !!overlayEl?.isConnected && !!overlayEl.data?.length;
+export const saveCompareTrend = () => saveCsv(trendEl?._points || []);
+export const copyCompareOverlay = () => renderImage({ data: overlayEl.data, layout: overlayEl.layout }, { width_in: 8.5, height_in: 5, dpi: 300 }).then(copyImage);
 const C = () => S.compare;
+const itemPath = (id) => compareFile(id)?.path || id;
+const itemLabel = (id) => {
+  const f=compareFile(id);if(!f)return basename(id);
+  const duplicates=C().set.filter(key=>{const o=compareFile(key);return o?.path===f.path && o.detector===f.detector && o.mode===f.mode;}).length>1;
+  const p=f.proc || {},detail=duplicates?` [bin ${p.bin || 1}, smooth ${p.smooth || 1}${p.excluded?.length?`, ${p.excluded.length} excluded`:''}${p.baseline?.path?', baseline':''}${p.steps?.length?`, ${p.steps.length} steps`:''}]`:'';
+  return `${basename(f.path).replace(/\.mat$/i,'')} · ${detLabel(f,f.detector)} · ${MODE_LABEL[f.mode] || f.mode}${detail}`;
+};
+const overlayLabel=(id)=>{
+  const f=compareFile(id);if(!f)return itemLabel(id);
+  const name=basename(f.path).replace(/\.mat$/i,'');
+  const variant=C().set.filter(key=>{const o=compareFile(key);return o?.path===f.path && o.detector===f.detector && o.mode===f.mode;}).length>1;
+  return `${name.length>22?name.slice(0,20)+'…':name} · ${detLabel(f,f.detector).replace(/^Detector /,'D')} · ${MODE_LABEL[f.mode] || f.mode}${variant?` · b${f.proc?.bin || 1}/s${f.proc?.smooth || 1}`:''}`;
+};
+
+const compareSpec = (f) => C().spec?.model === 'useOwn' ? clone(f.fitSpec) : {...clone(f.fitSpec),model:C().spec?.model || 'Auto',peaks:C().spec?.peaks || 1,range_min:C().spec?.range_min ?? null,range_max:C().spec?.range_max ?? null};
+const freshResult = (id) => { const f=compareFile(id),r=C().results[id]; return f && resultFreshness(f,r,f.detector,{...compareSpec(f),robust:!!r?.analysis?.settings?.robust}).fresh ? r : null; };
+const compareSignature = (id) => { const f=compareFile(id); return f ? envelopeFor(f,f.detector,compareSpec(f)).signature : ''; };
+const gfSignature = () => JSON.stringify(visibleSet().map(id=>compareSignature(id)));
+
 
 const GF_MODELS = {
   SpinEcho: ['y0', 'A', 'T2', 'n'], T1Exp: ['y0', 'A', 'T1'], T1Stretch: ['y0', 'A', 'T1', 'n'], T1NormExp: ['y0', 'A', 'T1'], T1NormStretch: ['y0', 'A', 'T1', 'n'],
@@ -17,7 +41,7 @@ const GF_MODELS = {
   GaussianPeaks: ['background', 'amplitude', 'center', 'sigma'], TimeTraceDecay: ['background', 'amplitude', 'tau_s'],
 };
 const GF_DEFAULT_SHARED = { SpinEcho: 'T2', T1Exp: 'T1', T1Stretch: 'T1', T1NormExp: 'T1', T1NormStretch: 'T1', RamseySimple: 'f', RabiCosine: 'f', ODMR: 'x0', GaussianPeaks: 'center', TimeTraceDecay: 'tau_s' };
-const visibleSet = () => C().set.filter((p) => S.files[p] && !C().hidden.includes(p));
+const visibleSet = () => C().set.filter((p) => compareFile(p) && !C().hidden.includes(p));
 const gfKey = () => visibleSet().join('|');
 
 function colorFor(i) { return PALETTES.lab[i % PALETTES.lab.length]; }
@@ -26,8 +50,8 @@ function colorFor(i) { return PALETTES.lab[i % PALETTES.lab.length]; }
 function normParams(x, y, how) {
   const fin = y.filter(Number.isFinite);
   if (!fin.length || how === 'none') return { off: 0, scale: 1 };
-  if (how === 'max') return { off: 0, scale: Math.max(...fin.map(Math.abs)) || 1 };
-  if (how === 'minmax') { const lo = Math.min(...fin), hi = Math.max(...fin); return { off: lo, scale: (hi - lo) || 1 }; }
+  if (how === 'max') return { off: 0, scale: maxAbs(fin) || 1 };
+  if (how === 'minmax') { const [lo, hi] = finiteExtent(fin); return { off: lo, scale: (hi - lo) || 1 }; }
   let a = 0;
   for (let i = 1; i < x.length; i++) if (Number.isFinite(y[i]) && Number.isFinite(y[i - 1])) a += Math.abs(0.5 * (y[i] + y[i - 1]) * (x[i] - x[i - 1]));
   return { off: 0, scale: a || 1 };
@@ -38,13 +62,13 @@ function alignShift(p) {
   const c = C(), how = c.align || 'none';
   if (how === 'none') return 0;
   if (how === 'peak') {
-    const d = S.files[p]?.data[S.files[p].detector];
+    const d = compareFile(p)?.data[compareFile(p).detector];
     if (!d?.proc) return null;
     let best = -Infinity, bx = null;
     d.proc.y.forEach((v, i) => { const a = v === null || !Number.isFinite(v) ? NaN : (c.norm === 'max' ? Math.abs(v) : v); if (a > best && Number.isFinite(d.proc.x[i])) { best = a; bx = d.proc.x[i]; } });
     return bx === null ? null : -bx;
   }
-  const r = c.results[p];
+  const r = freshResult(p);
   if (!r) return null;
   const par = (r.params || []).find((q) => ['center_1', 'x0', 'x0_1'].includes(q.name) && Number.isFinite(q.value));
   const v = par ? par.value : r.metrics?.center_freq_units;
@@ -52,7 +76,7 @@ function alignShift(p) {
 }
 
 function trendValues(path) {
-  const r = C().results[path];
+  const r = freshResult(path);
   if (!r) return {};
   const out = {};
   for (const p of r.params) { out[p.name] = { v: p.value, e: p.error }; if (p.name.startsWith('sigma_')) out[`FWHM${p.name.slice(5)}`] = { v: p.value * 2.354820045, e: p.error ? p.error * 2.354820045 : null }; }
@@ -63,31 +87,33 @@ function trendValues(path) {
 
 function xValue(path, i) {
   const c = C();
-  const info = S.library.peeks[path] || {};
+  const info = S.library.peeks[itemPath(path)] || compareFile(path)?.info || {};
   if (c.against === 'order') return i + 1;
   if (c.against === 'name') {
     const pref = c.namePrefix || '';
     const re = pref ? new RegExp(`${pref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-?\\d+(?:[._]\\d+)?)`) : /(-?\d+(?:[._]\d+)?)(?!.*\d)/;
-    const m = basename(path).replace(/\.mat$/i, '').match(re);
+    const m = basename(itemPath(path)).replace(/\.mat$/i, '').match(re);
     return m ? Number(m[1].replace('_', '.')) : NaN;
   }
-  if (c.against === 'meta') { const v = Number((S.files[path]?.info.metadata || {})[c.metaKey]); return Number.isFinite(v) ? v : NaN; }
+  if (c.against === 'meta') { const v = Number((compareFile(path)?.info.metadata || {})[c.metaKey]); return Number.isFinite(v) ? v : NaN; }
   return (info.mtime || 0) * 1000; // acquisition (file save) time
 }
 
 export function renderCompare(root) {
+  refreshCompareItems();
   const c = C();
   c.hidden = c.hidden || [];
   c.spec = c.spec || { model: 'Auto', peaks: 1 };
   c.sel = c.sel || null;
   c.align = c.align || 'none';
   alignNoteEl = h('div', { class: 'note' });
-  const set = c.set.filter((p) => S.files[p]);
-  if (c.global && c.global.key !== gfKey()) c.global = null; // the set (or visibility) changed
+  const set = c.set.filter((p) => compareFile(p));
+  for(const id of set) if(c.items[id]?.linked===false && !compareFile(id)?.data[compareFile(id).detector] && !c.items[id].loading) reloadCompareItem(id).then(()=>emit()).catch(()=>{});
+  if (c.global && (c.global.key !== gfKey() || c.global.signature !== gfSignature())) c.global = null; // the set (or visibility) changed
   // Global-fit model follows the set's experiment type until the user picks one (was always RabiCosine).
   const GF_FOR_TYPE = { T1: 'T1Exp', SpinEcho: 'SpinEcho', DynamicDecoupling: 'SpinEcho', DEERDecay: 'SpinEcho', Ramsey: 'RamseySimple', Rabi: 'RabiCosine', DEERDuration: 'RabiCosine',
     ODMR: 'ODMR', DEERFrequency: 'ODMR', LineScan: 'GaussianPeaks', TimeTrace: 'TimeTraceDecay' };
-  const setType = c.set.map((p) => S.files[p]?.info?.type).find(Boolean);
+  const setType = c.set.map((p) => compareFile(p)?.info?.type).find(Boolean);
   if (!c.gf || (!c.gf.userSet && GF_FOR_TYPE[setType] && c.gf.model !== GF_FOR_TYPE[setType])) {
     const model = GF_FOR_TYPE[setType] || 'RabiCosine';
     c.gf = { model, shared: [GF_DEFAULT_SHARED[model]] };
@@ -97,30 +123,32 @@ export function renderCompare(root) {
   const fitToCard = (el) => { new ResizeObserver(() => { if (el.data && el.clientWidth > 40 && el.clientHeight > 40) Plotly.Plots.resize(el); }).observe(el); return el; };
   overlayEl = overlayEl || fitToCard(h('div', { class: 'plot' }));
   trendEl = trendEl || fitToCard(h('div', { class: 'plot' }));
-  const fitted = set.filter((p) => c.results[p]);
+  const fitted = set.filter((p) => freshResult(p));
   const keys = [...new Set(fitted.flatMap((p) => Object.keys(trendValues(p))))];
   // prefer fitted parameters (they carry errors) over derived metrics such as T1_ns
   if (!c.param || !keys.includes(c.param)) c.param = keys.find((k) => /^(T1|T2|T2_star|tau|x0|center_1|tau_s)$/.test(k)) || keys.find((k) => /center_1|pi_time_ns$|T2_ns|T1_ns|T2_star_ns|center_freq|tau_s/.test(k)) || keys[0] || '';
   const left = h('aside', { class: 'library', style: 'padding:12px;gap:10px', 'data-drop': 'compareset' },
-    h('div', { class: 'row' }, h('span', { class: 'lbl' }, `Compare set · ${set.length} files`), h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: addFromLibrary }, 'Add files')),
-    h('div', { class: 'note' }, 'Tick to draw in the overlay; every fitted file feeds the trend. Files keep their own detector and observable.'),
+    h('div', { class: 'row' }, h('span', { class: 'lbl' }, `Compare set · ${set.length} analyses`), h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: addFromLibrary }, 'Add files')),
+    h('div', { class: 'note' }, 'Each row has its own detector and processing. Historical fits are excluded from curves and trends until refitted.'),
     h('div', { style: 'flex:1;overflow:auto;display:flex;flex-direction:column;gap:2px' }, set.map((p, i) => {
-      const f = S.files[p], r = c.results[p];
+      const f = compareFile(p), r = freshResult(p);
       const tv = trendValues(p)[c.param];
       const sh = c.align === 'none' ? null : alignShift(p);
       const shTxt = sh === null ? '' : ` · shift ${sh < 0 ? '−' : '+'}${fmt(Math.abs(sh), 6)}`;
-      return h('label', { class: 'frow', style: 'cursor:default' },
+      return h('div', { class: 'compare-analysis-row' },h('label', { class: 'row compare-analysis-title' },
         h('input', { type: 'checkbox', checked: !c.hidden.includes(p), onchange: (e) => { c.hidden = e.target.checked ? c.hidden.filter((q) => q !== p) : [...c.hidden, p]; emit(); } }),
         h('span', { style: `width:12px;height:12px;border-radius:3px;flex:none;background:${c.hidden.includes(p) ? '#3A4250' : colorFor(i)}` }),
-        h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip', title: p }, basename(p).replace(/\.mat$/i, '')),
-          h('div', { class: 'sub ellip' }, r ? `${c.param}: ${tv ? displayValue(tv.v, tv.e, trendNativeUnit([p], c.param)).withUnit : '–'} · R² ${fmt(r.r2, 3)}${r.status !== 'PASS' ? ' · ' + r.status : ''}${shTxt}` : `${detLabel(f, f.detector)} · ${MODE_LABEL[f.mode]}${shTxt}`)),
-        h('button', { class: 'ibtn', title: 'Remove', onclick: (e) => { e.preventDefault(); c.set = c.set.filter((q) => q !== p); emit(); } }, '×'));
+        h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip', title: itemPath(p) }, itemLabel(p)),
+          h('div', { class: 'sub ellip' }, r ? `${c.param}: ${tv ? displayValue(tv.v, tv.e, trendNativeUnit([p], c.param)).withUnit : '–'} · R² ${fmt(r.r2, 3)}${r.status !== 'PASS' ? ' · ' + r.status : ''}${shTxt}` : `${c.results[p] ? 'STALE — refit · ' : ''}${detLabel(f,f.detector)} · ${MODE_LABEL[f.mode]}${shTxt}`))),
+        h('div',{class:'row wrap compare-analysis-actions'},h('button', { class: 'btn sm', disabled: f.info.detectors.length < 2, title: 'Add the other detector independently', onclick: (e) => { e.preventDefault(); const other=f.info.detectors.find(d=>d!==f.detector); if(other)addCompareItem(S.files[f.path],{detector:other}); emit(); } }, '+ detector'),
+        h('button', { class: 'btn sm', title: 'Keep this processing variant independently of Analyze', onclick: async(e)=>{e.preventDefault(); const item=c.items[p];item.linked=false;item.proc=clone(f.proc);item.spec=clone(f.fitSpec);item.mode=f.mode; item.data={}; const result=await call('load',{path:f.path,detector:f.detector,mode:f.mode,proc:f.proc}); item.data[f.detector]=result; emit();} }, c.items[p]?.linked === false ? 'Captured' : 'Capture'),
+        h('button', { class: 'ibtn', title: 'Remove', onclick: (e) => { e.preventDefault(); c.set = c.set.filter((q) => q !== p); emit(); } }, '×')));
     })),
     set.length ? null : (() => {
       // One click from what is already open in Analyze (1D files only; maps compare in Analyze's RGB overlay).
-      const open = Object.keys(S.files).filter((p) => S.files[p]?.info?.dim !== 'scan2d');
+      const open = Object.keys(S.files).filter((p) => compareFile(p)?.info?.dim !== 'scan2d');
       return h('div', { style: 'display:flex;flex-direction:column;gap:8px' },
-        open.length ? h('button', { class: 'btn primary', onclick: () => { c.set = [...new Set([...c.set, ...open])]; emit(); } }, `Add the ${open.length} open file${open.length === 1 ? '' : 's'}`) : null,
+        open.length ? h('button', { class: 'btn primary', onclick: () => { open.forEach(p=>addCompareItem(S.files[p])); emit(); } }, `Add the ${open.length} open file${open.length === 1 ? '' : 's'}`) : null,
         h('div', { class: 'note' }, 'Or use Add files, right-click files in the Library ("Add to Compare set"), or send Batch results here.'));
     })());
 
@@ -136,13 +164,16 @@ export function renderCompare(root) {
       h('span', { class: 'lbl' }, 'Plot'), select(keys.length ? keys : [['', 'Fit files first']], c.param, (v) => { c.param = v; c.sel = null; emit(); }, { style: 'width:190px' }),
       h('span', { class: 'lbl' }, 'Against'), select([['time', 'Acquisition time'], ['order', 'File order'], ['name', 'Number in file name'], ['meta', 'Saved parameter']], c.against, (v) => { c.against = v; emit(); }, { style: 'width:170px' }),
       c.against === 'name' ? input(c.namePrefix || '', (v) => { c.namePrefix = v; emit(); }, { placeholder: 'prefix, e.g. Z', style: 'width:110px' }) : null,
-      c.against === 'meta' ? select(Object.keys(S.files[set[0]]?.info.metadata || {}), c.metaKey, (v) => { c.metaKey = v; emit(); }, { style: 'width:160px' }) : null,
+      c.against === 'meta' ? select(Object.keys(compareFile(set[0])?.info.metadata || {}), c.metaKey, (v) => { c.metaKey = v; emit(); }, { style: 'width:160px' }) : null,
       h('button', { class: 'btn', onclick: () => renderImage({ data: trendEl.data, layout: trendEl.layout }, { width_in: 6, height_in: 3.6, dpi: 300 }).then(copyImage) }, 'Copy')),
     h('section', { class: 'plotcard', style: 'flex:1;min-height:240px' }, trendEl));
 
   // Trend values in display units (e.g. T1 in µs/ms, not raw ns); plot, table, regression and CSV all use them.
-  const rawPts = fitted.map((p, i) => ({ p, x: xValue(p, set.indexOf(p)), ...(trendValues(p)[c.param] || {}) })).filter((q) => Number.isFinite(q.x) && Number.isFinite(q.v));
-  const tdu = displayUnit(Math.max(0, ...rawPts.map((q) => Math.abs(q.v))), trendNativeUnit(fitted, c.param));
+  const trendUnit = trendNativeUnit(fitted,c.param);
+  const incompatibleTrend=[];
+  const rawPts = fitted.map(p=>{const q=trendValues(p)[c.param] || {}, scale=unitScale(trendNativeUnit([p],c.param),trendUnit); if(scale===null){incompatibleTrend.push(itemLabel(p));return null;} return {p,x:xValue(p,set.indexOf(p)),v:q.v*scale,e:Number.isFinite(q.e)?q.e*Math.abs(scale):q.e};}).filter(q=>q && Number.isFinite(q.x) && Number.isFinite(q.v));
+
+  const tdu = displayUnit(maxAbs(rawPts.map((q) => q.v)), trendNativeUnit(fitted, c.param));
   c.trendUnit = prettyUnit(tdu.unit);
   const pts = rawPts.map((q) => ({ ...q, v: q.v * tdu.scale, e: Number.isFinite(q.e) ? q.e * tdu.scale : q.e }));
   const sel = c.sel ? pts.filter((q) => c.sel.includes(q.p)) : pts;
@@ -154,12 +185,12 @@ export function renderCompare(root) {
       field('Model', select([['Auto', 'Auto (each file\'s type)'], ['GaussianPeaks', 'Gaussian peaks'], ['useOwn', 'Each file\'s own Fit settings']], c.spec.model, (v) => { c.spec.model = v; emit(); })),
       c.spec.model === 'GaussianPeaks' ? field('Peaks', select([1, 2, 3, 4], c.spec.peaks, (v) => { c.spec.peaks = Number(v); emit(); })) : null,
       h('div', { class: 'g2' }, field('Range from', input(c.spec.range_min ?? '', (v) => { c.spec.range_min = num(v); }, { placeholder: 'all' })), field('to', input(c.spec.range_max ?? '', (v) => { c.spec.range_max = num(v); }, { placeholder: 'all' }))),
-      h('div', { class: 'note' }, 'The same model, range and processing are applied to every file; each keeps its own result.'),
-      h('button', { class: 'btn primary block', disabled: !set.length || c.fitting, onclick: fitAll }, c.fitting ? `Fitting ${c.fitting}` : `Fit all ${set.length} files`)),
+      h('div', { class: 'note' }, c.spec.model==='useOwn' ? 'Each analysis keeps its captured or current Fit settings and processing.' : 'Model and range apply to the set; each analysis keeps its own detector and processing.'),
+      h('button', { class: 'btn primary block', disabled: !set.length || c.fitting, onclick: fitAll }, c.fitting ? `Fitting ${c.fitting}` : `Fit / refit ${set.length} analyses`)),
     globalCard(),
     h('div', { class: 'card pad' }, h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, 'Trend table'), h('span', { class: 'sp' }), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => copyText(trendTable(pts), 'Trend table copied') }, 'Copy'), h('button', { class: 'btn sm', disabled: !pts.length, onclick: () => saveCsv(pts) }, 'Save CSV')),
       pts.length ? h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, h('th', {}, 'File'), h('th', {}, trendLabel()), h('th', {}, '±')),
-        pts.map((q) => h('tr', { class: `click ${c.sel?.includes(q.p) ? 'sel' : ''}`, onclick: () => toggleSel(q.p, pts) }, h('td', { class: 'txt ellip', style: 'max-width:140px', title: q.p }, c.against === 'time' ? fmtTime(q.x / 1000) : basename(q.p).slice(0, 18)), ...(() => { const [v, e] = displayValue(q.v, q.e, '').text.split(' ± '); return [h('td', {}, v), h('td', {}, e ?? '–')]; })())))
+        pts.map((q) => h('tr', { class: `click ${c.sel?.includes(q.p) ? 'sel' : ''}`, onclick: () => toggleSel(q.p, pts) }, h('td', { class: 'txt ellip', style: 'max-width:140px', title: q.p }, c.against === 'time' ? fmtTime(q.x / 1000) : itemLabel(q.p)), ...(() => { const [v, e] = displayValue(q.v, q.e, '').text.split(' ± '); return [h('td', {}, v), h('td', {}, e ?? '–')]; })())))
         : h('div', { class: 'note' }, 'Run Fit all to fill the table.')),
     reg ? h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:6px' }, h('span', { style: 'font-weight:600' }, `Linear trend · ${sel.length} points`),
       h('div', { class: 'mono', style: 'font-size:18px' }, `${fmt(reg.slope * perUnit, 4)}`, h('small', { class: 'muted', style: 'font-size:12px' }, ` ${c.param} per ${c.against === 'time' ? 'min' : 'unit'}`)),
@@ -168,6 +199,7 @@ export function renderCompare(root) {
   mount(root, left, main, right);
   drawOverlay(set);
   drawTrend(pts, reg);
+  if(incompatibleTrend.length) alignNoteEl.textContent += ` · Trend units incompatible: ${incompatibleTrend.join(', ')}`;
 }
 
 function globalCard() {
@@ -182,7 +214,7 @@ function globalCard() {
       h('input', { type: 'checkbox', checked: g.shared.includes(n), onchange: (e) => { g.shared = e.target.checked ? [...g.shared, n] : g.shared.filter((q) => q !== n); } }), h('span', { class: 'mono' }, n)))),
     h('div', { class: 'note' }, 'Fits all visible files at once; shared parameters take one common value. Nonlinear least squares (SEM-weighted when available); uncertainty estimates are approximate.'),
     h('button', { class: 'btn primary block', disabled: nvis < 2 || c.gfBusy, onclick: runGlobal }, c.gfBusy ? 'Fitting…' : `Run global fit on ${nvis} files`),
-    res ? h('div', { style: 'display:flex;flex-direction:column;gap:6px' },
+    res ? h('div', { style: 'display:flex;flex-direction:column;gap:6px' },h('div',{class:'note'},`Parameters use x in ${res.calculation_units?.x || 'native units'} and y in ${res.calculation_units?.y || 'native units'}.`),
       res.shared_names.length ? h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Shared'), h('th', {}, 'Value'), h('th', {}, '±')),
         res.shared_names.map((n) => h('tr', {}, h('td', { class: 'txt' }, n), h('td', {}, fmt(res.shared[n].value, 6)), h('td', {}, Number.isFinite(res.shared[n].error) ? fmt(res.shared[n].error, 2) : '–')))) : null,
       h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'File'), keyParams().map((n) => h('th', {}, n)), h('th', {}, 'R²')),
@@ -195,7 +227,7 @@ function globalCard() {
 }
 
 function globalTable(res) {
-  const rows = [['Model', res.model], ['Shared', res.shared_names.join(', ') || 'none'], ['reduced chi2', res.reduced_chi2], ['dAIC', res.delta_aic], ['dBIC', res.delta_bic], ['Verdict', res.verdict], [],
+  const rows = [['Model', res.model], ['Shared', res.shared_names.join(', ') || 'none'],['Calculation x unit',res.calculation_units?.x],['Calculation y unit',res.calculation_units?.y], ['reduced chi2', res.reduced_chi2], ['dAIC', res.delta_aic], ['dBIC', res.delta_bic], ['Verdict', res.verdict], [],
     ...res.shared_names.map((n) => [`shared ${n}`, res.shared[n].value, res.shared[n].error]), [],
     ['File', ...res.param_names.flatMap((n) => [n, `${n} error`]), 'R2']];
   res.datasets.forEach((d) => rows.push([basename(d.path), ...res.param_names.flatMap((n) => [d.params[n], d.errors[n]]), d.r2]));
@@ -204,11 +236,12 @@ function globalTable(res) {
 
 async function runGlobal() {
   const c = C(), vis = visibleSet();
-  const items = vis.map((p) => ({ path: p, detector: S.files[p].detector, mode: S.files[p].mode, proc: S.files[p].proc }));
+  const signature = gfSignature();
+  const items = vis.map((p) => ({ path: itemPath(p), detector: compareFile(p).detector, mode: compareFile(p).mode, proc: compareFile(p).proc }));
   c.gfBusy = true; emit();
   try {
     const res = await call('global_fit', { items, model: c.gf.model, shared: c.gf.shared, spec: {} }, { label: 'Global fit' });
-    c.global = { key: vis.join('|'), res };
+    if(signature === gfSignature()) {c.global = {key:vis.join('|'),signature,res};recordResult({},res);}
   } catch (e) { /* toast shown */ }
   c.gfBusy = false;
   emit();
@@ -225,8 +258,8 @@ function toggleSel(p, pts) {
 // Native unit of a trend key: a fit parameter's unit, or a metric's suffix (T1_ns -> ns, center_freq_GHz -> GHz).
 function trendNativeUnit(paths, key) {
   for (const p of paths) {
-    const q = C().results[p]?.params?.find((x) => x.name === key);
-    if (q && S.files[p]) return parameterUnit(q, S.files[p].info);
+    const q = freshResult(p)?.params?.find((x) => x.name === key);
+    if (q && compareFile(p)) return parameterUnit(q, compareFile(p).info);
   }
   return (/_(ns|us|ms|s|GHz|MHz|kHz|Hz)$/.exec(key) || [])[1] || '';
 }
@@ -235,7 +268,7 @@ const trendLabel = () => `${C().param}${C().trendUnit ? ` [${C().trendUnit}]` : 
 function trendTable(pts, sep = '\t') {
   const c = C();
   const esc = (v) => (sep === ',' && /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v);
-  return [['File', c.against === 'time' ? 'Time' : 'x', trendLabel(), 'error'].join(sep), ...pts.map((q) => [basename(q.p), c.against === 'time' ? new Date(q.x).toLocaleString() : q.x, q.v, q.e ?? ''].map(esc).join(sep))].join('\n');
+  return [['File','Analysis ID','Detector','Observable', c.against === 'time' ? 'Time' : 'x', trendLabel(), 'error'].join(sep), ...pts.map((q) => [itemLabel(q.p),q.p,compareFile(q.p)?.detector,compareFile(q.p)?.mode, c.against === 'time' ? new Date(q.x).toLocaleString() : q.x, q.v, q.e ?? ''].map(esc).join(sep))].join('\n');
 }
 
 async function saveCsv(pts) {
@@ -249,53 +282,57 @@ function drawOverlay(set) {
   const c = C();
   const vis = set.filter((p) => !c.hidden.includes(p));
   const data = [];
-  const layout = { separators: '.', margin: { l: 64, r: 16, t: 14, b: 50 }, font: { family: 'Arial', size: 12, color: '#1D2330' }, showlegend: true, legend: { x: 0.99, xanchor: 'right', y: 0.99, bgcolor: 'rgba(255,255,255,.9)', bordercolor: '#D9DDE4', borderwidth: 1 }, hovermode: 'closest' };
+  const layout = { separators: '.', margin: { l: 64, r: 16, t: 64, b: 50 }, font: { family: 'Arial', size: 12, color: '#1D2330' }, showlegend: true, legend: { orientation:'h',x:0,xanchor:'left',y:1.02,yanchor:'bottom',font:{size:10},bgcolor:'rgba(255,255,255,.9)' }, hovermode: 'closest' };
   let xLabel = '';
-  const unaligned = [], unmapped = [], yLabels = new Set();
+  const incompatible = [], unaligned = [], unmapped = [], yLabels = new Set();
   const n = vis.length;
   const cols = Math.ceil(Math.sqrt(n)) || 1, rows = Math.ceil(n / cols) || 1;
   // One shared display unit for x (auto ns -> µs -> ms like Analyze); each file converts from its own native unit.
-  const first = vis.map((p) => S.files[p]).find((f) => f?.data[f.detector]?.proc);
+  const first = vis.map((p) => compareFile(p)).find((f) => f?.data[f.detector]?.proc);
   const nativeU = first?.info.x_unit || '';
-  const toNative = (f) => unitScale(f.info.x_unit || '', nativeU) ?? 1;
+  const toNative = (f) => unitScale(f.info.x_unit || '', nativeU);
   let mag = 0;
-  for (const p of vis) { const f = S.files[p], xs = f?.data[f.detector]?.proc?.x || []; for (const v of xs) if (Number.isFinite(v)) mag = Math.max(mag, Math.abs(v * toNative(f))); }
+  for (const p of vis) { const f = compareFile(p), xs = f?.data[f.detector]?.proc?.x || []; for (const v of xs) if (Number.isFinite(v)) mag = Math.max(mag, Math.abs(v * toNative(f))); }
   const du = displayUnit(mag, nativeU);
   const X = (f, arr, sh) => arr.map((v) => (v === null ? NaN : (v + sh) * toNative(f) * du.scale));
   vis.forEach((p) => {
     const i = set.indexOf(p);
-    const f = S.files[p];
+    const f = compareFile(p);
     const d = f.data[f.detector];
     if (!d?.proc) return;
+    const yu=f.mode==='contrast'?'dimensionless':f.info.unit || 'a.u.',firstYu=first?.mode==='contrast'?'dimensionless':first?.info.unit || 'a.u.';
+    const yscale=unitScale(yu,firstYu);
+    if(toNative(f)===null || (first && (f.mode!==first.mode || (f.info.type==='TimeTrace')!==(first.info.type==='TimeTrace') || yscale===null))) {incompatible.push(itemLabel(p));return;}
     const yLabel = f.mode === 'contrast' ? 'Contrast [dimensionless]' : `${MODE_LABEL[f.mode] || f.mode || 'Signal'}${f.info.unit ? ` [${f.info.unit}]` : ''}`;
     yLabels.add(yLabel);
     const xBase = friendlyAxis(f.info.x_label, du.unit, f.info.type);
     xLabel = c.align === 'peak' ? `Δ${xBase} from peak` : c.align === 'fit' ? `Δ${xBase} from fit center` : xBase;
     let sh = alignShift(p);
-    if (sh === null) { unaligned.push(basename(p).replace(/\.mat$/i, '')); sh = 0; }
+    if (sh === null) { unaligned.push(itemLabel(p)); sh = 0; }
     const x = X(f, d.proc.x, sh);
-    const yRaw = d.proc.y.map((v) => (v === null ? NaN : v));
+    const yRaw = d.proc.y.map((v) => (v === null ? NaN : v*(c.norm==='none'?yscale:1)));
     const np_ = normParams(d.proc.x.map((v) => (v === null ? NaN : v + sh)), yRaw, c.norm); // native x: area normalization must not depend on the display unit
     let y = yRaw.map((v) => (v - np_.off) / np_.scale);
     const k = vis.indexOf(p);
     if (c.layout === 'waterfall') y = y.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
     const ax = c.layout === 'grid' && k ? String(k + 1) : '';
-    data.push({ type: 'scatter', mode: 'lines+markers', x, y, name: basename(p).replace(/\.mat$/i, ''), line: { color: colorFor(i), width: 1.4 }, marker: { size: 4, color: colorFor(i) }, xaxis: `x${ax}`, yaxis: `y${ax}` });
-    const r = c.results[p];
+    data.push({ type: 'scatter', mode: 'lines+markers', x, y, name: overlayLabel(p), line: { color: colorFor(i), width: 1.4 }, marker: { size: 4, color: colorFor(i) }, xaxis: `x${ax}`, yaxis: `y${ax}` });
+    const r = freshResult(p);
     const inverse = t1Normalization(r);
-    if (isNormalizedT1(r) && !inverse) unmapped.push(basename(p));
+    if (isNormalizedT1(r) && !inverse) unmapped.push(itemLabel(p));
     if (r && (r.dense || r.y_fit) && (!isNormalizedT1(r) || inverse)) {
       let fy = (r.dense?.y || r.y_fit).map((v) => (v === null ? NaN : v));
       if (inverse) fy = toOriginal(fy, inverse);
+      if(c.norm==='none')fy=fy.map(v=>v*yscale);
       fy = fy.map((v) => (v - np_.off) / np_.scale);
       if (c.layout === 'waterfall') fy = fy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
       data.push({ type: 'scatter', mode: 'lines', x: X(f, r.dense?.x || r.x, sh), y: fy, name: 'fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dot' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
-    const gd = c.global?.res.datasets.find((q) => q.path === p);
+    const gd = c.global?.res.datasets.find((q) => q.path === f.path && q.detector === f.detector);
     if (gd?.curve) {
-      let gy = gd.curve.y.map((v) => (v === null ? NaN : (v - np_.off) / np_.scale));
+      let gy = gd.curve.y.map((v) => (v === null ? NaN : (v*(c.norm==='none' ? (unitScale(c.global.res.calculation_units?.y || firstYu,firstYu) ?? NaN) : 1) - np_.off) / np_.scale));
       if (c.layout === 'waterfall') gy = gy.map((v) => v + k * (c.norm === 'none' ? 0 : 1.1));
-      data.push({ type: 'scatter', mode: 'lines', x: X(f, gd.curve.x, sh), y: gy, name: 'global fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dash' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
+      data.push({ type: 'scatter', mode: 'lines', x: X(f, gd.curve.x.map(v=>v*(unitScale(c.global.res.calculation_units?.x || f.info.x_unit,f.info.x_unit) ?? NaN)), sh), y: gy, name: 'global fit', showlegend: false, line: { color: colorFor(i), width: 2, dash: 'dash' }, xaxis: `x${ax}`, yaxis: `y${ax}` });
     }
     if (c.layout === 'grid') {
       const col = k % cols, row = Math.floor(k / cols);
@@ -308,7 +345,7 @@ function drawOverlay(set) {
     layout.xaxis = { title: { text: xLabel }, exponentformat: 'none', showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false };
     layout.yaxis = { title: { text: c.norm === 'none' ? ([...yLabels].join(' / ') || 'Signal') : `Normalized (${c.norm})${c.layout === 'waterfall' ? ', offset' : ''}` }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', zeroline: false, exponentformat: 'SI' };
   } else layout.showlegend = false;
-  alignNoteEl.textContent = [unaligned.length ? `not aligned: ${unaligned.join(', ')}` : '',
+  alignNoteEl.textContent = [incompatible.length ? `Incompatible units/observable; hidden: ${incompatible.join(', ')}` : '', unaligned.length ? `not aligned: ${unaligned.join(', ')}` : '',
     unmapped.length ? `Normalized fit hidden (no inverse metadata); refit for original units: ${unmapped.join(', ')}` : ''].filter(Boolean).join(' · ');
   Plotly.react(overlayEl, data, layout, { responsive: true, displayModeBar: false, scrollZoom: true, edits: { axisTitleText: true, legendPosition: true } });
 }
@@ -321,10 +358,10 @@ function drawTrend(pts, reg) {
   const xs = pts.map((q) => (isTime ? new Date(q.x) : q.x));
   const sel = c.sel || pts.map((q) => q.p);
   const data = [{ type: 'scatter', mode: 'markers', x: xs, y: pts.map((q) => q.v), error_y: { type: 'data', array: pts.map((q) => q.e || 0), visible: true, color: '#1D2330', thickness: 1.2, width: 4 },
-    marker: { size: 10, color: pts.map((q) => (sel.includes(q.p) ? '#7A4FD6' : '#FFFFFF')), line: { color: pts.map((q) => (passed(q.p) ? '#1D2330' : '#C0392B')), width: pts.map((q) => (passed(q.p) ? 1 : 2)) } }, text: pts.map((q) => `${basename(q.p)} · ${C().results[q.p]?.status ?? 'no status'}`), hovertemplate: '%{text}<br>%{y:.6g}<extra></extra>', customdata: pts.map((q) => q.p), name: c.param }];
+    marker: { size: 10, color: pts.map((q) => (sel.includes(q.p) ? '#7A4FD6' : '#FFFFFF')), line: { color: pts.map((q) => (passed(q.p) ? '#1D2330' : '#C0392B')), width: pts.map((q) => (passed(q.p) ? 1 : 2)) } }, text: pts.map((q) => `${itemLabel(q.p)} · ${C().results[q.p]?.status ?? 'no status'}`), hovertemplate: '%{text}<br>%{y:.6g}<extra></extra>', customdata: pts.map((q) => q.p), name: c.param }];
   if (reg) {
     const sx = pts.filter((q) => sel.includes(q.p)).map((q) => q.x);
-    const lo = Math.min(...sx), hi = Math.max(...sx);
+    const [lo, hi] = finiteExtent(sx);
     data.push({ type: 'scatter', mode: 'lines', x: isTime ? [new Date(lo), new Date(hi)] : [lo, hi], y: [reg.intercept + reg.slope * lo, reg.intercept + reg.slope * hi], line: { color: '#7A4FD6', dash: 'dash', width: 1.4 }, name: 'linear trend', hoverinfo: 'skip' });
   }
   const layout = { separators: '.', margin: { l: 70, r: 16, t: 10, b: 50 }, font: { family: 'Arial', size: 12 }, showlegend: false,
@@ -340,13 +377,13 @@ function drawTrend(pts, reg) {
 
 async function fitAll() {
   const c = C();
-  const set = c.set.filter((p) => S.files[p]);
+  const set = c.set.filter((p) => compareFile(p));
   for (const [i, p] of set.entries()) {
-    const f = S.files[p];
+    const f = compareFile(p);
     c.fitting = `${i + 1}/${set.length}`; emit();
     const spec = c.spec.model === 'useOwn' ? clone(f.fitSpec) : { ...clone(f.fitSpec), model: c.spec.model, peaks: c.spec.peaks, range_min: c.spec.range_min ?? null, range_max: c.spec.range_max ?? null };
-    if (f.info.type === 'LineScan' && spec.model === 'Auto') spec.model = 'GaussianPeaks';
-    try { c.results[p] = await call('fit', { path: p, detector: f.detector, mode: f.mode, proc: f.proc, spec }, { label: `Fitting ${basename(p)}` }); }
+
+    try { const result = await call('fit', { path: f.path, detector: f.detector, mode: f.mode, proc: f.proc, spec }, { label: `Fitting ${itemLabel(p)}` }); recordResult(f,result,{det:f.detector,settings:spec}); c.results[p]=result; }
     catch (e) { /* toast shown */ }
   }
   c.fitting = null;
@@ -355,13 +392,13 @@ async function fitAll() {
 
 async function addFromLibrary() {
   const lib = S.library;
-  const all = [...new Set([...Object.keys(S.files), ...lib.extra, ...(lib.listing?.files || []).map((f) => f.path)])].filter((p) => (lib.peeks[p] || S.files[p]?.info || {}).dim !== 'scan2d');
+  const all = [...new Set([...Object.keys(S.files), ...lib.extra, ...(lib.listing?.files || []).map((f) => f.path)])].filter((p) => (lib.peeks[p] || compareFile(p)?.info || {}).dim !== 'scan2d');
   const chosen = new Set();
   const list = h('div', { style: 'overflow:auto;max-height:52vh;padding:6px' }, all.map((p) => {
-    const info = lib.peeks[p] || S.files[p]?.info || {};
-    return h('label', { class: 'frow' }, h('input', { type: 'checkbox', checked: C().set.includes(p), onchange: (e) => (e.target.checked ? chosen.add(p) : chosen.delete(p)) }), tag(info.tag), h('span', { class: 'ellip' }, basename(p)));
+    const info = lib.peeks[p] || compareFile(p)?.info || {};
+    return h('label', { class: 'frow' }, h('input', { type: 'checkbox', checked: C().set.some(id=>itemPath(id)===p), onchange: (e) => (e.target.checked ? chosen.add(p) : chosen.delete(p)) }), tag(info.tag), h('span', { class: 'ellip' }, basename(p)));
   }));
   const m = modal(h('div', { style: 'display:flex;flex-direction:column' }, h('div', { style: 'padding:12px 14px;font-weight:600' }, 'Add files to the Compare set'), list,
     h('div', { class: 'row', style: 'padding:10px 14px;border-top:1px solid var(--line)' }, h('span', { class: 'note' }, '1D files from the Library and open files.'), h('span', { class: 'sp' }),
-      h('button', { class: 'btn primary', onclick: async () => { m.close(); for (const p of chosen) { await openFile(p, { primary: false }); if (!C().set.includes(p)) C().set.push(p); } emit(); } }, 'Add'))));
+      h('button', { class: 'btn primary', onclick: async () => { m.close(); for (const p of chosen) { const f=await openFile(p,{primary:false}); addCompareItem(f); } emit(); } }, 'Add'))));
 }
