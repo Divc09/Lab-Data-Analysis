@@ -218,9 +218,11 @@ def fit_rabi_envelope(
     rmse = float(np.sqrt(np.mean(resid**2)))
     dof = max(1, len(fit_amp) - len(opt))
     try:
-        from .fit_engine import _estimate_covariance
+        from .fit_engine import numeric_jacobian, robust_covariance
 
-        cov = _estimate_covariance(best.jac, 0.5 * ss_res, dof)  # raw residuals, not robust best.cost
+        # Same soft-L1 loss as the fit; the plain Jacobian, since SciPy's best.jac is rescaled by the loss.
+        jac = numeric_jacobian(lambda q: _rabi_envelope_model(fit_t, *q), opt)
+        cov, _ = robust_covariance(jac, resid * -1.0, dof, loss="soft_l1", f_scale=max(1e-9, 0.08 * y_span))
         errors = np.sqrt(np.maximum(np.diag(cov), 0.0))
     except Exception:
         errors = np.full_like(opt, np.nan, dtype=float)

@@ -88,6 +88,26 @@ def rabi_adaptive_pulse_area_model(t, c, a, T, beta, f0, chirp1, chirp2, delay):
     return c - a * env * np.cos(2.0 * np.pi * cycles)
 
 
+def rabi_adaptive_jac(t, c, a, T, beta, f0, chirp1, chirp2, delay):
+    """Analytic d model / d (c, a, T, beta, f0, chirp1, chirp2, delay) for rabi_adaptive_pulse_area_model.
+
+    Points before the delay (u = 0) do not depend on T, beta, the rate terms or the delay."""
+    x = np.asarray(t, dtype=float)
+    u = np.maximum(x - delay, 0.0)
+    on = u > 0
+    v = np.where(on, u / T, 0.0)
+    vb = np.where(on, v**beta, 0.0)
+    env = np.exp(-vb)
+    cycles = f0 * u + 0.5 * chirp1 * u * u + (chirp2 * u * u * u) / 3.0
+    cos, sin = np.cos(2.0 * np.pi * cycles), np.sin(2.0 * np.pi * cycles)
+    log_v = np.log(v, out=np.zeros_like(v), where=on)
+    osc = a * env * sin * 2.0 * np.pi
+    rate = f0 + chirp1 * u + chirp2 * u * u
+    d_du = np.where(on, a * env * (beta * vb / np.where(on, u, 1.0) * cos) + osc * rate, 0.0)
+    return np.column_stack([np.ones_like(x), -env * cos, -a * cos * env * beta * vb / T, a * cos * env * vb * log_v,
+                            osc * u, osc * 0.5 * u * u, osc * u**3 / 3.0, -d_du])
+
+
 def rabi_chirp_model(t, c, a, T, beta, f, alpha, phi):
     x = np.asarray(t, dtype=float)
     env = np.exp(-((np.abs(x / T)) ** beta))

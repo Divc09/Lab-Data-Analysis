@@ -41,6 +41,7 @@ Other:
 
 - Folder scans are cached in `%APPDATA%\SmartFitter\peek_cache.json`, so reopening large folders is faster.
 - Fit uncertainties: the covariance estimate in `nvfit/fit_engine.py` now scales the Jacobian by column and uses an SVD cutoff. Badly scaled parameters (e.g. Rabi T, β, delay) previously got unrealistically small errors. Unidentifiable parameters report NaN, shown as "n/a" in the app.
+- Fit ± values: fits use a robust soft-L1 loss (it keeps occasional glitches from dragging the result), and the ± is the matching robust covariance (Huber's H1 sandwich, as in statsmodels' RLM), computed from the plain model Jacobian. For an ordinary (linear-loss) fit it is exactly the usual least-squares error. The previous formula mixed SciPy's loss-rescaled Jacobian with the unweighted residual variance and overstated errors: in simulations of 26-point T1 scans its 1σ intervals covered the true T1 73-89 % of the time; the new ones cover 67-70 % (ideal 68 %). On 33 October 2026 T1 files the new ±T1 is a median 0.84× the iteration-jackknife error (previously 1.21×); the jackknife also includes iteration-to-iteration drift that a single averaged trace cannot show.
 - Auto fits 1D line scans with one Gaussian peak on a constant background, in Analyze, Compare and Batch. Choose GaussianPeaks with more peaks, a custom model, or `--model-override` for anything else.
 
 Iteration sensitivity (Analyze → Fit, or Process):

@@ -125,6 +125,62 @@ def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
     return cov
 
 
+def _loss_psi(residuals: np.ndarray, loss: str, f_scale: float) -> tuple[np.ndarray, np.ndarray]:
+    """psi(r) = d(loss)/dr and psi'(r) for SciPy's least_squares losses (rho applied to z = (r/f)^2)."""
+    r = np.asarray(residuals, dtype=float)
+    if loss == "linear":
+        return r, np.ones_like(r)
+    z = (r / f_scale) ** 2
+    if loss == "soft_l1":
+        return r / np.sqrt(1.0 + z), (1.0 + z) ** -1.5
+    if loss == "huber":
+        inside = z <= 1.0
+        return np.where(inside, r, f_scale * np.sign(r)), inside.astype(float)
+    if loss == "cauchy":
+        return r / (1.0 + z), (1.0 - z) / (1.0 + z) ** 2
+    if loss == "arctan":
+        return r / (1.0 + z**2), (1.0 - 3.0 * z**2) / (1.0 + z**2) ** 2
+    raise ValueError(f"Unsupported loss for covariance: {loss}")
+
+
+def numeric_jacobian(fun: Callable[[np.ndarray], np.ndarray], x: np.ndarray) -> np.ndarray:
+    """Central-difference d fun / d x with steps relative to each parameter's size."""
+    x = np.asarray(x, dtype=float)
+    cols = []
+    for i in range(x.size):
+        step = 1e-6 * abs(x[i]) if x[i] != 0 else 1e-8
+        hi, lo = x.copy(), x.copy()
+        hi[i] += step
+        lo[i] -= step
+        cols.append((np.asarray(fun(hi), float) - np.asarray(fun(lo), float)) / (2.0 * step))
+    return np.column_stack(cols) if cols else np.zeros((0, 0))
+
+
+def robust_covariance(jac: np.ndarray, residuals: np.ndarray, dof: int, loss: str = "linear",
+                      f_scale: float = 1.0) -> tuple[np.ndarray, dict[str, float | str]]:
+    """Parameter covariance for an M-estimator (Huber 1981, "H1"; the default of statsmodels' RLM).
+
+    ``jac`` is the plain (weighted, not loss-rescaled) Jacobian of the residuals at the solution. With
+    psi = d loss / dr:  cov = K^2 * [sum psi^2 / dof] / mean(psi')^2 * (J^T J)^-1,  K = 1 + (p/n) var(psi') / mean(psi')^2.
+    For the linear loss this is exactly s^2 (J^T J)^-1 with s^2 = RSS / dof (ordinary least squares).
+    SciPy's ``res.jac`` must not be used here: for robust losses it is already down-weighted by the loss, and mixing it
+    with an unweighted residual variance inflated errors by ~1.2-1.8x on lab data.
+    """
+    r = np.asarray(residuals, dtype=float)
+    n, p = r.size, int(np.asarray(jac).shape[1])
+    psi, dpsi = _loss_psi(r, loss, f_scale)
+    mean_d = float(np.mean(dpsi))
+    if loss == "linear" or not np.isfinite(mean_d) or mean_d <= 0.05:
+        # Linear loss, or so many points in the loss's flat region that the correction is unstable: plain OLS.
+        cov = _estimate_covariance(jac, 0.5 * float(np.sum(r**2)), dof)
+        return cov, {"method": "least squares", "loss": loss, "f_scale": float(f_scale)}
+    k = 1.0 + (p / max(n, 1)) * float(np.var(dpsi)) / mean_d**2
+    factor = k**2 / mean_d**2
+    cov = _estimate_covariance(jac, 0.5 * float(np.sum(psi**2)), dof) * factor
+    return cov, {"method": "robust sandwich (Huber H1)", "loss": loss, "f_scale": float(f_scale),
+                 "mean_psi_prime": mean_d, "k": k}
+
+
 def sem_to_weights(sem) -> np.ndarray | None:
     """Relative inverse-variance weights (1/sem^2, median-normalised) from per-point SEM.
 
@@ -241,12 +297,16 @@ def fit_model_multistart(
     y_fit = model_func(x, *p_opt)
     n_free = int(np.count_nonzero(free))
     dof = len(y) - n_free
-    # best.cost is the robust-loss sum for soft_l1 etc.; use the actual (weighted) residuals for s^2
-    raw_cost = 0.5 * float(np.sum(np.square(best.fun)))
     p_err = np.zeros(len(p_opt))  # locked parameters are exact, not estimated
     covariance = np.zeros((len(p_opt), len(p_opt)))
+    cov_info: dict[str, float | str] = {"method": "unavailable (no residual degrees of freedom)", "loss": loss}
     if dof >= 1:
-        cov = _estimate_covariance(best.jac, raw_cost, dof=dof)
+        # The plain residual Jacobian, not best.jac (which SciPy has already rescaled by the robust loss).
+        if jac_func is not None:
+            plain_jac = w_sqrt[:, None] * jac_func(x, *p_opt)[:, free]
+        else:
+            plain_jac = numeric_jacobian(lambda p: w_sqrt * model_func(x, *full(p)), best.x)
+        cov, cov_info = robust_covariance(plain_jac, best.fun, dof, loss=loss, f_scale=float(f_scale))
         covariance[np.ix_(free, free)] = cov
         p_err[free] = np.sqrt(np.maximum(np.diag(cov), 0.0))  # NaN propagates for unidentifiable parameters
     else:
@@ -280,8 +340,8 @@ def fit_model_multistart(
         free_mask=free.tolist(),
         model_func=model_func,
         uncertainty={
-            "method": "optimizer Jacobian; relative residual scale",
-            "loss": loss,
+            **cov_info,
+            "scale": "relative (estimated from the residuals)",
             "weighted": weighted,
             "dof": dof,
             "n_observations": len(y),

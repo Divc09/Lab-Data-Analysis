@@ -182,12 +182,20 @@ def suggest_points(result, x, target_y, parameter: str, count: int = 10, x_min: 
     if n <= p:
         raise ValueError("The fit has no spare degrees of freedom to estimate the noise; add points first.")
     sigma2 = float(np.sum(resid**2) / (n - p))
-    info = jac.T @ jac / sigma2
     try:
-        cov = np.linalg.inv(info)
+        cov = np.linalg.inv(jac.T @ jac / sigma2)
     except np.linalg.LinAlgError:
         raise ValueError("The parameters are not identifiable from the current points (singular information matrix).")
     k = free.index(names.index(parameter))
+    # Calibrate the per-point noise so "now" reproduces the fit's own ± (robust loss, SEM weights); the plain
+    # least-squares value is used only when the fit reports no error.
+    fit_err = float(result.errors[names.index(parameter)])
+    ols_err = math.sqrt(max(cov[k, k], 0.0))
+    calibrated = math.isfinite(fit_err) and fit_err > 0 and ols_err > 0
+    if calibrated:
+        scale = (fit_err / ols_err) ** 2
+        sigma2 *= scale
+        cov *= scale
     current = math.sqrt(max(cov[k, k], 0.0))
     lo = float(np.min(x)) if x_min is None else float(x_min)
     hi = float(np.max(x)) if x_max is None else float(x_max)
@@ -224,9 +232,8 @@ def suggest_points(result, x, target_y, parameter: str, count: int = 10, x_min: 
         "note": "Linearized at the current fit. Assumes the model is right and each new point has the residual noise of "
                 "the existing points (same averaging per point). Repeats mean measuring that position more than once. "
                 "'Spread like the current scan' adds the same number of points proportionally to the existing grid. "
-                "σ here is the ordinary least-squares error. The fit's ± uses the robust soft-L1 loss, whose Jacobian "
-                "down-weights large residuals while the noise level comes from the raw residuals, so it is usually "
-                "larger (1.3-1.8x on the test files); compare the percentage improvements rather than the absolute σ.",
+                + ("The per-point noise is calibrated so that σ now equals the fit's reported ±."
+                   if calibrated else "The fit reported no error for this parameter, so σ is the plain least-squares value."),
     }
 
 

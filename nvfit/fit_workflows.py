@@ -23,6 +23,7 @@ from .models import (
     odmr_multi_lorentzian,
     odmr_multi_lorentzian_jac,
     rabi_adaptive_pulse_area_model,
+    rabi_adaptive_jac,
     rabi_chirp_jac,
     rabi_phase_ramp_jac,
     rabi_chirp_model,
@@ -744,6 +745,7 @@ def _fit_rabi_adaptive(
     result = fit_model_multistart(
         model_name="RabiAdaptive",
         model_func=rabi_adaptive_pulse_area_model,
+        jac_func=rabi_adaptive_jac,
         x=x_fit,
         y=y,
         param_names=names,
