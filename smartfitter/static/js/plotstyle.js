@@ -6,7 +6,42 @@ export const PALETTES = {
   lab: ['#1F5FBF', '#E06A1B', '#0E8A7E', '#B5307A', '#7A4FD6', '#6B7380', '#C9A227', '#111111'],
   okabe: ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#56B4E9', '#D55E00', '#F0E442', '#000000'],
   gray: ['#111111', '#555555', '#888888', '#AAAAAA', '#333333', '#777777', '#999999', '#CCCCCC'],
+  tableau: ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F', '#EDC948', '#B07AA1', '#FF9DA7', '#9C755F', '#BAB0AC'],
+  tol: ['#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB', '#111111'],
+  dark2: ['#1B9E77', '#D95F02', '#7570B3', '#E7298A', '#66A61E', '#E6AB02', '#A6761D', '#666666'],
+  set1: ['#E41A1C', '#377EB8', '#4DAF4A', '#984EA3', '#FF7F00', '#A65628', '#F781BF', '#999999'],
 };
+// Line-trace scales for overlaid iterations: two-colour ramps, early light -> late dark, both ends readable on white.
+export const ITER_SCALES = {
+  blues: '#a6c8e6,#08306b',
+  reds: '#f4a9a0,#7f0000',
+  greens: '#a8dba0,#00441b',
+  purples: '#cbc3e3,#3f007d',
+  'blue→red': '#2166ac,#b2182b',
+};
+// Ordered scales for comparison series, sampled first file -> last file; pale ends trimmed so lines stay readable on white.
+export const SERIES_SCALES = {
+  viridis: '#440154,#3b528b,#21918c,#5ec962,#a5db36', plasma: '#0d0887,#7e03a8,#cc4778,#f89540', magma: '#000004,#51127c,#b73779,#fc8961',
+  inferno: '#000004,#56106e,#bb3754,#f98e09', cividis: '#00224e,#434e6c,#7c7b78,#bcaf6f', turbo: '#30123b,#4686fb,#1ae4b6,#faba39,#7a0403',
+  coolwarm: '#3b4cc0,#8db0fe,#f49a7b,#b40426', ...ITER_SCALES,
+};
+// Colour at t in [0, 1] interpolated linearly between comma-separated hex stops.
+export function rampColor(stopList, t) {
+  const stops = stopList.split(',').map((c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)));
+  const u = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(u)), w = u - i;
+  return `rgb(${stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * w)).join(',')})`;
+}
+// Discrete colours for any palette name; a scale is sampled at 8 evenly spaced points.
+export function paletteColors(name) {
+  if (PALETTES[name]) return PALETTES[name];
+  if (SERIES_SCALES[name]) return Array.from({ length: 8 }, (_, i) => rampColor(SERIES_SCALES[name], i / 7));
+  return PALETTES.lab;
+}
+export const PALETTE_OPTIONS = [
+  ['lab', 'Lab default (blue, orange, teal, magenta)'], ['okabe', 'Colour-blind safe (Okabe–Ito)'], ['tol', 'Colour-blind safe (Tol bright)'],
+  ['tableau', 'Tableau 10'], ['dark2', 'Dark2'], ['set1', 'Set1'], ['gray', 'Grayscale'],
+  ...Object.keys(SERIES_SCALES).map((k) => [k, `Ordered scale · ${k} (first → last file)`]),
+];
 
 export const PRESETS = {
   presentation: { font: 'Arial', base: 14, width_in: 8.5, height_in: 5.5, line: 1.6, marker: 6 },

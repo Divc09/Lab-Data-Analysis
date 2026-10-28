@@ -1,7 +1,7 @@
 // Main Analyze comparison controls; presentation belongs to the primary plot, not the source files.
 import { S, emit, commit, detLabel, syncOverlay, removeOverlay, currentResult, plotFile } from './state.js';
 import { h, field, input, select, check, clone, toast } from './util.js';
-import { PALETTES, baseStyle, resultLines } from './plotstyle.js';
+import { SERIES_SCALES, paletteColors, rampColor, baseStyle, resultLines } from './plotstyle.js';
 import { displayValue, unitOptions, unitScale, parameterUnit } from './unitdisplay.js';
 import { openOverlayPicker } from './overlaypicker.js';
 import { copyText } from './export.js';
@@ -16,14 +16,17 @@ export function comparisonFiles(f) {
 export function filePresentation(f, o) {
   const st = baseStyle(f.style), primary = o.path === f.path;
   const slot = primary ? 0 : (S.overlaySlots[o.path] ?? (S.overlaySlots[o.path] = Object.keys(S.overlaySlots).length));
-  const pal = PALETTES[st.palette] || PALETTES.lab;
+  const pal = paletteColors(st.palette), scale = SERIES_SCALES[st.palette];
   const colors = st.palette === 'lab' ? ['#1BAF7A', pal[1], ...pal.slice(3)] : pal.slice(1);
   const [dk, fk] = fileKeys(f, o.path), ds = st.series[dk] || {}, fs = st.series[fk] || {};
   const cfg = st.comparison?.[o.path] || {};
-  return { label: o.info.name.replace(/\.mat$/i, ''), color: primary ? pal[0] : (colors[slot] || '#6B7380'),
+  // Ordered scales colour by position in the legend order, so reordering files re-sorts the gradient.
+  const order = scale ? comparisonFiles(f).map((x) => x.path) : null;
+  const color = scale ? rampColor(scale, order.indexOf(o.path) / Math.max(1, order.length - 1)) : primary ? pal[0] : (colors[slot] || '#6B7380');
+  return { label: o.info.name.replace(/\.mat$/i, ''), color,
     marker: primary ? 'circle' : ['diamond', 'square', 'triangle-up', 'cross', 'x', 'triangle-down'][slot % 6],
     mode: f.styleMode === 'pts' ? 'markers' : f.styleMode === 'line' ? 'lines' : 'lines+markers',
-    dash: primary ? 'solid' : ['solid', 'dot', 'dashdot', 'longdash'][Math.floor(slot / colors.length) % 4], fitDash: 'dash',
+    dash: primary || scale ? 'solid' : ['solid', 'dot', 'dashdot', 'longdash'][Math.floor(slot / colors.length) % 4], fitDash: 'dash',
     ...cfg, data: (primary ? f.layers.data : true) && ds.visible !== false, fit: (primary ? f.layers.fit : f.display?.overlayFits !== false) && fs.visible !== false,
     legend: ds.legend !== false, result: cfg.result !== false, precision: cfg.precision || 2, units: cfg.units || 'auto',
   };

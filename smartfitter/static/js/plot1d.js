@@ -1,6 +1,6 @@
 // 1D figure builder (pulse experiments, line scans) and time-trace figure builder.
 import { S, detLabel, plotFile } from './state.js';
-import { PALETTES, baseStyle, baseLayout, axisLayout, legendLayout, scatterTrace, resultsAnnotation, userDecorations, friendlyAxis, MODE_LABEL, seriesStyle } from './plotstyle.js';
+import { paletteColors, baseStyle, baseLayout, axisLayout, legendLayout, scatterTrace, resultsAnnotation, userDecorations, friendlyAxis, MODE_LABEL, seriesStyle } from './plotstyle.js';
 
 import { displaySpace, displaySeries, isNormalizedT1, isDirectT1, toOriginal, toNormalized, normScale } from './fitdisplay.js';
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
@@ -60,7 +60,7 @@ export function figure1D(f, { forExport = false } = {}) {
   const xd = resolveXAxis(f, comparisonFiles(f).map(plotFile));
   f = plotFile(f);
   const st = baseStyle(f.style);
-  const pal = PALETTES[st.palette] || PALETTES.lab;
+  const pal = paletteColors(st.palette);
   const L = f.layers;
   const det = f.detector;
   const d = f.data[det];
@@ -435,7 +435,7 @@ export function rolling(x, y, w) {
 export function figureTT(f) {
   f = plotFile(f);
   const st = baseStyle(f.style);
-  const pal = PALETTES[st.palette] || PALETTES.lab;
+  const pal = paletteColors(st.palette);
   const tt = f.tt;
   const scale = tt.unit === 'min' ? 1 / 60 : 1;
   const dets = tt.layout === 'single' ? [f.detector] : f.info.detectors;

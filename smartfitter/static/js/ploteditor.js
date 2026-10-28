@@ -2,7 +2,7 @@
 import { call } from './api.js';
 import { S, emit, commit } from './state.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, num, toast, clone } from './util.js';
-import { PALETTES, PRESETS, baseStyle, seriesStyle, resultLines } from './plotstyle.js';
+import { PALETTE_OPTIONS, paletteColors, PRESETS, baseStyle, seriesStyle, resultLines } from './plotstyle.js';
 import { currentFigure, plotDiv, kindOf } from './analyze.js';
 import { seriesOptions, filePresentation, updateFilePresentation, comparisonFiles } from './seriescontrol.js';
 import { unitOptions, xDisplay, displayValue } from './unitdisplay.js';
@@ -44,7 +44,7 @@ export function openSeriesEditor(f, key, x, y) {
   const draw = () => {
     const def = seriesList(f).find((s) => s.key === key) || { name: key, color: '#1F5FBF' };
     const s = { ...seriesStyle(baseStyle(f.style), key, { name: def.name, color: def.color }), ...(f.style.series?.[key] || {}) };
-    const pal = PALETTES[baseStyle(f.style).palette] || PALETTES.lab;
+    const pal = paletteColors(baseStyle(f.style).palette);
     const set = (patch) => { updSeries(f, key, patch); draw(); };
     const mode = s.mode || def.type || 'lines+markers';
     const hasLine = !String(mode).startsWith('markers'), hasMarker = String(mode).includes('markers');
@@ -304,7 +304,7 @@ function seriesTab(f) {
         } }, direction < 0 ? '↑' : '↓'))));
     }),
       h('div', { class: 'note' }, 'Click a colour swatch for line, marker and width options.')),
-    field('Colour palette', select([['lab', 'Lab default (blue, orange, teal, magenta)'], ['okabe', 'Colour-blind safe (Okabe–Ito)'], ['gray', 'Grayscale']], st.palette, (v) => { commit('palette'); f.style.palette = v; emit(); })),
+    field('Colour palette', select(PALETTE_OPTIONS, st.palette, (v) => { commit('palette'); f.style.palette = v; emit(); })),
     kindOf(f) === '1d' ? field('Uncertainty display', seg([['band', 'Band'], ['bars', 'Error bars']], f.errorMode, (v) => { f.errorMode = v; f.layers.band = true; emit(); })) : null,
     h('div', { class: 'g2' }, field('Default line width', input(st.line, (v) => { commit('line width'); f.style.line = num(v) ?? 1.6; emit(); }, { numeric: true })), field('Default marker size', input(st.marker, (v) => { commit('marker size'); f.style.marker = num(v) ?? 6; emit(); }, { numeric: true }))));
 }
