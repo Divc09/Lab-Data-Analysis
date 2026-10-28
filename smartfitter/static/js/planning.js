@@ -178,13 +178,17 @@ function sensitivitySection(f, fit) {
       s.shot_noise ? h('div', { class: 'note' }, s.shot_noise.note) : h('div', { class: 'note' }, `Shot-noise limit: ${s.rate_source}.`)));
 }
 
+// Its own card in the Fit tab, directly under the Result card (open until the user collapses it).
 export function planningCard(f, fit) {
-  if (!fit || fit.success === false || f.info.dim === 'scan2d') return null;
-  const spec = specFor(f);
-  const parts = [convergenceSection(f, spec), pointsSection(f, fit, spec), sensitivitySection(f, fit)].filter(Boolean);
-  if (!parts.length) return null;
+  if (!fit || f.info.dim === 'scan2d') return null;
   const v = plan(f).view;
-  return h('details', { open: !!v.open, ontoggle: (e) => { v.open = e.target.open; } }, h('summary', {}, 'Plan the measurement'),
+  const spec = specFor(f);
+  const parts = fit.success === false
+    ? [h('div', { class: 'note' }, 'The optimizer did not converge for this fit. Planning needs a converged fit: adjust the model or range and run the fit again.')]
+    : [convergenceSection(f, spec), pointsSection(f, fit, spec), sensitivitySection(f, fit)].filter(Boolean);
+  return h('details', { class: 'card pad', open: v.open !== false, ontoggle: (e) => { v.open = e.target.open; } },
+    h('summary', { style: 'font-weight:600' }, 'Plan the measurement',
+      h('span', { class: 'dim', style: 'font-weight:400' }, ` · when is it done · where to measure next${fit.odmr_sensitivity ? ' · sensitivity' : ''}`)),
     h('div', { style: 'display:flex;flex-direction:column;gap:12px;margin-top:8px' }, parts));
 }
 

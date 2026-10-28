@@ -1010,7 +1010,7 @@ function fitTab(f) {
     h('button', { class: 'btn primary', style: 'flex:1;justify-content:center', disabled: busy, onclick: () => runFitScoped(f) }, busy ? h('span', { class: 'spinner' }) : null, all ? `Run fit · ${series.length} files` : 'Run fit', h('span', { class: 'kbd' }, 'Ctrl F')),
     h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: busy, title: 'Fits subsets of the data and keeps the candidate that best describes the full trace', onclick: () => runFitScoped(f, { robust: true }) }, 'Robust fit', h('span', { class: 'kbd' }, 'Ctrl Shift F'))));
   if (kindOf(f) === '1d') out.append(iterationFitActions(f));
-  const primaryResults = fit ? [resultCard(f, fit), paramCard(f, fit)].filter(Boolean) : [];
+  const primaryResults = fit ? [resultCard(f, fit), planningCard(f, fit), paramCard(f, fit)].filter(Boolean) : [];
   if (fit) out.append(...primaryResults, sci.bootstrapCard(f, fit, () => {
     const hs = f.fitHistory.find((e) => e.res === fit);
     const spec = clone(hs ? hs.spec : f.fitSpec); spec.robust = false;
@@ -1048,7 +1048,6 @@ function resultCard(f, fit) {
     peakReviewCard(fit, f),
     rabiCalibrationCard(fit),
     modelSelectionCard(fit),
-    planningCard(f, fit),
     h('details', {}, h('summary', {}, 'All derived values'), h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(fit.metrics || {}).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v' }, typeof v === 'number' ? fmt(v, 6) : String(v))])),
       h('pre', { class: 'note', style: 'white-space:pre-wrap;font-family:var(--mono);font-size:11px' }, fit.message)),
     h('div', { class: 'row' }, h('button', { class: 'btn', style: 'flex:1;justify-content:center', onclick: () => copyText(slidesTable(f, fit), 'Results copied as a table for slides') }, 'Copy for slides'),
