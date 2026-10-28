@@ -13,15 +13,16 @@ export const CMAP_GRADIENT = {
   inferno: '#000004,#56106e,#bb3754,#f98e09,#fcffa4', plasma: '#0d0887,#7e03a8,#cc4778,#f89540,#f0f921', turbo: '#30123b,#4686fb,#1ae4b6,#faba39,#7a0403',
   parula: '#352a87,#148ab4,#3fbc73,#c6d63c,#f9a721', coolwarm: '#3b4cc0,#8db0fe,#dddddd,#f49a7b,#b40426', RdBu: '#67001f,#f4a582,#f7f7f7,#92c5de,#053061', gray: '#000000,#ffffff',
 };
-// Line-trace scales for many overlaid iterations: dense stops, light/yellow ends trimmed so every line reads on a white plot.
+// Line-trace scales for overlaid iterations: two-colour ramps, early light -> late dark, both ends readable on white.
 export const ITER_SCALES = {
-  plasma: '#0d0887,#41049d,#6a00a8,#8f0da4,#b12a90,#cc4778,#e16462,#f1834b,#f99a3e',
-  rainbow: '#3a2c99,#2c5fb0,#1f8aa8,#1f9e73,#5aa52c,#a7a313,#e08e0b,#d9531e,#b2182b',
-  viridis: '#440154,#482878,#3e4989,#31688e,#26828e,#1f9e89,#35b779,#6ece58,#9fd335',
-  inferno: '#1b0c41,#4a0c6b,#781c6d,#a52c60,#cf4446,#ed6925,#f98c0a,#f8a91a',
-  'blue→red': '#08306b,#2166ac,#4393c3,#7b6fb0,#9e4f8f,#c43c5c,#d6604d,#b2182b',
+  blues: '#a6c8e6,#08306b',
+  reds: '#f4a9a0,#7f0000',
+  greens: '#a8dba0,#00441b',
+  purples: '#cbc3e3,#3f007d',
+  'blue→red': '#2166ac,#b2182b',
 };
-export const DEFAULT_ITER_SCALE = 'plasma';
+// Green stays clear of the lab palette's blue data and orange fit lines.
+export const DEFAULT_ITER_SCALE = 'greens';
 // Colour at t in [0, 1] interpolated linearly between the scale's stops.
 export function cmapColor(name, t) {
   const stops = (ITER_SCALES[name] || CMAP_GRADIENT[name] || CMAP_GRADIENT.viridis).split(',').map((c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)));

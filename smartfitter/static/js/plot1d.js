@@ -6,7 +6,7 @@ import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized }
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
 import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
 import { uniformSampling, magnitudeSpectrum } from './spectrum.js';
-import { cmapColor, CMAP_GRADIENT, ITER_SCALES, DEFAULT_ITER_SCALE } from './plot2d.js';
+import { cmapColor, ITER_SCALES, DEFAULT_ITER_SCALE } from './plot2d.js';
 
 const nonNull = (a) => (a || []).map((v) => (v === null ? NaN : v));
 
@@ -100,9 +100,8 @@ export function figure1D(f, { forExport = false } = {}) {
   const its = d.iterations;
   const hasSteps = (f.proc?.steps || []).some((s) => s.enabled !== false);
   const norm = shown.normalization;
-  // 'gray' keeps the single series colour; any other scale (default plasma) colours traces by iteration number.
-  const iterPick = f.iterationView?.cmap || DEFAULT_ITER_SCALE;
-  const iterCmap = iterPick !== 'gray' && (ITER_SCALES[iterPick] || CMAP_GRADIENT[iterPick]) ? iterPick : null;
+  // 'gray' keeps the single series colour; any other scale colours traces by iteration number.
+  const iterCmap = f.iterationView?.cmap === 'gray' ? null : ITER_SCALES[f.iterationView?.cmap] ? f.iterationView.cmap : DEFAULT_ITER_SCALE;
   const iterationY = (a) => TY(space === 'normalized' && norm ? toNormalized(nonNull(a), norm) : nonNull(a));
   if (its && (L.iter || L.meanSd) && !hasSteps && space !== 'fit' && (!transformed || norm)) {
     const ix = TX(nonNull(its.x || d.raw.x));
