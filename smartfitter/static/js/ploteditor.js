@@ -1,10 +1,10 @@
 // Plot editor: in-place series popover, full editor drawer, and syncing of on-plot edits.
 import { call } from './api.js';
-import { S, emit, commit } from './state.js';
+import { S, emit, commit, currentResult } from './state.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, num, toast, clone } from './util.js';
 import { PALETTE_OPTIONS, paletteColors, PRESETS, baseStyle, seriesStyle, resultLines } from './plotstyle.js';
 import { currentFigure, plotDiv, kindOf } from './analyze.js';
-import { seriesOptions, filePresentation, updateFilePresentation, comparisonFiles } from './seriescontrol.js';
+import { seriesOptions, filePresentation, updateFilePresentation, comparisonFiles, seriesDetector, defaultLegendKeys, updateAllPresentations } from './seriescontrol.js';
 import { unitOptions, xDisplay, displayValue } from './unitdisplay.js';
 
 // Colour field: a picker for quick choices beside the text box, which still takes any CSS colour
@@ -331,7 +331,35 @@ function legendTab(f) {
         h('div', { class: 'g2' }, field('Anchor x (0–1 of plot)', input(L.x ?? '', (v) => set({ x: num(v), y: L.y ?? 0.99 }), { numeric: true, placeholder: 'preset' })),
           field('Anchor y (0–1 of plot)', input(L.y ?? '', (v) => set({ x: L.x ?? 0.01, y: num(v) }), { numeric: true, placeholder: 'preset' }))),
         h('div', { class: 'note' }, 'Dragging the legend on the plot sets the anchor; choosing a Position above clears it.'))),
-    h('div', { class: 'note' }, 'Double-click legend text on the plot to rename it; Alt-click opens full trace styling. Per-file result values, precision and units are in Series → Style & legend.'));
+    allEntries(f),
+    h('div', { class: 'note' }, 'Double-click legend text on the plot to rename it; Alt-click an entry to change just that one.'));
+}
+
+// Legend content for every plotted file at once; Alt-click (or Series → Style & legend) still overrides one file.
+function allEntries(f) {
+  const files = comparisonFiles(f), cfgs = files.map((o) => filePresentation(f, o)), first = cfgs[0];
+  const all = (patchFor, label) => updateAllPresentations(f, patchFor, label);
+  const fileLines = files.map((o) => resultLines(currentResult(o, seriesDetector(f, o)), o.info));
+  const selected = files.map((o, i) => cfgs[i].params ?? defaultLegendKeys(fileLines[i], o));
+  const params = [...new Map(fileLines.flat().map((l) => [l.key, l.label])).entries()];
+  const units = [...new Map(fileLines.flat().flatMap((l) => unitOptions(l.unit)).filter(([u]) => u !== 'auto' && u !== 'native').map((v) => [v[0], v])).values()];
+  const same = (k) => cfgs.every((c) => c[k] === first[k]);
+  return h('details', { open: !!f.display.editorDetails?.legendAll, ontoggle: (e) => { f.display.editorDetails ||= {}; f.display.editorDetails.legendAll = e.target.open; } },
+    h('summary', {}, files.length > 1 ? `All entries (${files.length} files)` : 'All entries'),
+    h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
+      check('Fit results in legend', cfgs.every((c) => c.result), (result) => all(() => ({ result }), 'legend results')),
+      params.length ? field('Legend parameters', h('div', { class: 'row wrap' }, params.map(([key, label]) => {
+        const on = files.every((o, i) => !fileLines[i].some((l) => l.key === key) || selected[i].includes(key));
+        return check(label, on, (v) => all((o) => { const i = files.indexOf(o); return { params: v ? [...new Set([...selected[i], key])] : selected[i].filter((k) => k !== key) }; }, 'legend parameters'));
+      }))) : h('div', { class: 'note' }, 'Fit the files to choose which results the legend lists.'),
+      h('div', { class: 'g2' },
+        field('Precision (error digits)', input(same('precision') ? first.precision : '', (v) => all(() => ({ precision: Math.max(1, Math.min(8, num(v) || 2)) }), 'legend precision'), { numeric: true, placeholder: 'mixed' })),
+        field('Result units', select([['auto', 'Auto'], ['native', 'Native'], ...units], same('units') ? first.units : 'auto', (u) => all(() => ({ units: u }), 'legend units')))),
+      field('Template', input(same('template') && first.template ? first.template : '{label}{results}', (template) => all(() => ({ template }), 'legend template'), { title: '{label}, {results}, {model}, {detector}' })),
+      field('Fit line', seg(DASH, same('fitDash') ? first.fitDash : '', (fitDash) => all(() => ({ fitDash }), 'fit line style'))),
+      h('div', { class: 'row wrap' },
+        h('button', { class: 'btn sm', title: 'Drop labels typed on the plot so every entry follows the template again', onclick: () => all(() => ({}), 'reset legend labels') }, 'Clear renamed labels'),
+        h('button', { class: 'btn sm', title: 'Every file goes back to the default parameters, precision, units and template', onclick: () => all(() => ({ params: undefined, precision: undefined, units: undefined, template: undefined, result: undefined }), 'reset legend content') }, 'Reset to defaults'))));
 }
 
 export function parseTickTable(text) {

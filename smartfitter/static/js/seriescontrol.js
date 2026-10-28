@@ -49,7 +49,7 @@ export function freezeFollowers(f) {
 const PROC_SHARED = ['bin', 'smooth', 'roi_min', 'roi_max', 'steps'];
 export const procDiffers = (f, o) => PROC_SHARED.some((k) => JSON.stringify(f.proc?.[k] ?? null) !== JSON.stringify(o.proc?.[k] ?? null));
 // Default legend parameters: the headline result, the stretch exponent n when the model fitted one, then R².
-const defaultLegendKeys = (lines, o) => [...lines.filter((l) => !l.defaultOff && l.key !== 'r2').slice(0, o.info.type === 'ODMR' ? 2 : 1),
+export const defaultLegendKeys = (lines, o) => [...lines.filter((l) => !l.defaultOff && l.key !== 'r2').slice(0, o.info.type === 'ODMR' ? 2 : 1),
   ...lines.filter((l) => l.key === 'stretch_n' || l.key === 'r2')].map((l) => l.key);
 export function legendLabel(f, o) {
   const cfg = filePresentation(f, o), fit = currentResult(o,seriesDetector(f,o));
@@ -73,6 +73,18 @@ export function updateFilePresentation(f, o, patch) {
   }
   for (const key of ['mode', 'marker', 'dash']) if (patch[key]) f.style.series[dk] = { ...(f.style.series[dk] || {}), [key]: patch[key] };
   if (patch.fitDash) f.style.series[fk] = { ...(f.style.series[fk] || {}), dash: patch.fitDash };
+  emit();
+}
+// Legend editor "All entries": the same presentation patch for every plotted file, as one undo step.
+export function updateAllPresentations(f, patchFor, label = 'all legend entries') {
+  commit(label);
+  f.style.comparison ||= {}; f.style.series ||= {};
+  for (const o of comparisonFiles(f)) {
+    const patch = patchFor(o), [dk, fk] = fileKeys(f, o.path);
+    f.style.comparison[o.path] = { ...(f.style.comparison[o.path] || {}), ...patch };
+    if (patch.fitDash) f.style.series[fk] = { ...(f.style.series[fk] || {}), dash: patch.fitDash };
+    else for (const key of [dk, fk]) if (f.style.series[key]) delete f.style.series[key].name;
+  }
   emit();
 }
 export function setFileVisible(f, o, which, value) {
