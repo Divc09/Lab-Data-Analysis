@@ -12,7 +12,7 @@ const MODES = [['metric', 'AutoFind metric (detector choice from log)'], ['det1'
 // 'live' = autoFindLivePlot's log10(max(v,1)); it blanks everything below 1, i.e. the background of the dimensionless metrics.
 const SCALES = [['live', 'Scale: log10 max(v,1) (live)'], ['log', 'Scale: log10 v (v ≤ 0 blank)'], ['linear', 'Scale: linear (raw values)']];
 const SCALE_LABEL = { live: 'log10 max(value, 1)', log: 'log10 value', linear: 'value (linear)' };
-const ST = { root: '', runs: [], source: '', run: null, view: 'map', mode: 'metric', scale: 'live', contours: false, selected: [], busy: '', errors: [],
+const ST = { root: '', runs: [], source: '', run: null, view: 'map', mode: 'metric', scale: 'linear', contours: false, selected: [], busy: '', errors: [],
   pursuit: null, pursuitData: [], refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
 const cache = new Map();
 const plots = new Map();
@@ -359,7 +359,7 @@ export function renderAutoFind(root) {
       h('label', { class: 'row', style: 'gap:4px', title: ST.mode === 'ratio' ? 'Draw strongRatio / weakRatio contours' : 'Contours need the line-normalized ratio metric' }, h('input', { type: 'checkbox', checked: ST.contours, disabled: ST.mode !== 'ratio', onchange: (e) => { ST.contours = e.target.checked; emit(); } }), 'contours')),
     // Provenance and caveats stay one click away instead of pushing the plot down.
     (() => {
-      const notes = ['Replotted saved evidence; positions um, times s (or labelled min/h), detector units read from perSecond. Default colour is log10 max(value,1) like autoFindLivePlot; for dimensionless metrics (ratios near 1) that blanks the background, so use log10 or linear to see it. No new particle/bleaching verdict is inferred.', ...(ST.run?.warnings || [])];
+      const notes = ['Replotted saved evidence; positions um, times s (or labelled min/h), detector units read from perSecond. Default colour is linear (raw values); "log10 max(v,1) (live)" matches autoFindLivePlot but blanks the background of dimensionless metrics (ratios near 1). No new particle/bleaching verdict is inferred.', ...(ST.run?.warnings || [])];
       return h('details', { class: 'af-notes', open: !!ST.notesOpen, ontoggle: (e) => { ST.notesOpen = e.target.open; } },
         h('summary', { class: 'dim', style: 'cursor:pointer;margin:6px 0' }, `Provenance & caveats (${notes.length})`), ...notes.map(note));
     })(),
