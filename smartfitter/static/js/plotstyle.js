@@ -29,7 +29,8 @@ export const SERIES_SCALES = {
 export function rampColor(stopList, t) {
   const stops = stopList.split(',').map((c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)));
   const u = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(u)), w = u - i;
-  return `rgb(${stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * w)).join(',')})`;
+  // Hex, not rgb(): colour inputs and hexA() only accept #rrggbb.
+  return `#${stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * w).toString(16).padStart(2, '0')).join('')}`;
 }
 // Discrete colours for any palette name; a scale is sampled at 8 evenly spaced points.
 export function paletteColors(name) {

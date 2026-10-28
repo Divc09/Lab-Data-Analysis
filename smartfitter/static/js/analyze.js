@@ -14,8 +14,8 @@ import { plotConfig, resultLines, baseStyle, MODE_LABEL, friendlyAxis } from './
 import { renderImage, copyImage, copyText } from './export.js';
 import { openSeriesEditor, editorPanel, applyPlotlyEdit, inlinePlotEditor, styleTools as styleToolsBox } from './ploteditor.js';
 import * as sci from './science.js';
-import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries, fitAllSeries, fitFamily, fitPlan } from './seriescontrol.js';
-import { xDisplay, displayValue, unitOptions, parameterUnit } from './unitdisplay.js';
+import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries, fitAllSeries, fitFamily, fitPlan, freezeFollowers } from './seriescontrol.js';
+import { xDisplay, displayValue, unitOptions, parameterUnit, unitScale } from './unitdisplay.js';
 import { iterationCard, iterationFitActions, iterationProvenance, iterationCSV, openCombineDialog, fitTargetLabel } from './iterations.js';
 import { planningCard } from './planning.js';
 
@@ -64,6 +64,25 @@ export async function setProc(f, patch, label = 'processing') {
   f.iterationFitsStale = true;
   await loadData(f);
   emit();
+}
+
+// One-time copy of the main file's processing to compared files; nothing stays linked. Iterations, exclusions and
+// baselines are inherent to each data set and never copied. A data range is native x, so it skips files in other units.
+export async function applyProcToCompared(f, keys, label) {
+  const others = comparisonFiles(f).filter((o) => o !== f);
+  if (!others.length) return;
+  commit(`${label} to compared files`);
+  const skipped = [];
+  for (const o of others) {
+    const ks = keys.filter((k) => !k.startsWith('roi_') || unitScale(f.info.x_unit || '', o.info.x_unit || '') === 1);
+    if (ks.length < keys.length) skipped.push(o.info.name);
+    Object.assign(o.proc, Object.fromEntries(ks.map((k) => [k, clone(f.proc[k] ?? null)])));
+    if (Object.keys(o.fit).length) o.fitStale = true;
+    o.iterationFitsStale = true;
+    try { await loadData(o); } catch (e) { toast(`${o.info.name}: ${e.message}`, 'err'); }
+  }
+  emit();
+  toast(`Applied ${label} to ${others.length} compared file${others.length > 1 ? 's' : ''}${skipped.length ? `; data range skipped for ${skipped.join(', ')} (different x units)` : ''}.`);
 }
 
 export async function runFit(f, { robust = false, recordUndo = true } = {}) {
@@ -230,9 +249,14 @@ function header(f) {
     ctlr);
 }
 
+// These chips also drive compared files whose Display layers follow the main plot; Alt-click changes the main file only.
+const SHARED_LAYERS = ['band', 'smooth', 'iter'];
+const sharedLayerClick = (f, e) => { if (e.altKey && S.overlays.length) { commit('layer on main file only'); freezeFollowers(f); } };
+const sharedLayerTitle = (f, title) => S.overlays.length ? `${title ? `${title}\n` : ''}Applies to compared files too · Alt-click: main file only` : title;
 function layerChip(f, key, label, sw, opts = {}) {
-  return h('button', { class: `chip ${f.layers[key] ? 'on' : ''}`, disabled: opts.disabled, title: opts.title || '',
-    onclick: () => { f.layers[key] = !f.layers[key]; f.layersTouched = true; emit(); } },
+  const shared = SHARED_LAYERS.includes(key);
+  return h('button', { class: `chip ${f.layers[key] ? 'on' : ''}`, disabled: opts.disabled, title: shared ? sharedLayerTitle(f, opts.title || '') : opts.title || '',
+    onclick: (e) => { if (shared) sharedLayerClick(f, e); f.layers[key] = !f.layers[key]; f.layersTouched = true; emit(); } },
   sw ? h('span', { class: 'sw', style: `background:${sw};${opts.tall ? 'height:8px' : ''}` }) : null, label);
 }
 
@@ -283,8 +307,8 @@ function toolbar(f) {
       layerChip(f, 'data', 'Data', '#5A9BEA'), fit ? layerChip(f, 'fit', 'Fit', '#F08A3C') : null,
       d?.proc?.sem ? layerChip(f, 'band', f.errorMode === 'bars' ? '± SEM bars' : '± SEM', '#3D5E8C', { tall: true, title: 'Standard error of the mean across iterations' }) : null,
       fit ? layerChip(f, 'res', 'Residuals') : null, layerChip(f, 'smooth', 'Smoothed', '#222'),
-      its?.count > 1 ? h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, title: 'Show individual iterations (choose which in Process)',
-        onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its.selected.length)) : null,
+      its?.count > 1 ? h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, title: sharedLayerTitle(f, 'Show individual iterations (choose which in Process)'),
+        onclick: (e) => { sharedLayerClick(f, e); f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its.selected.length)) : null,
       layerChip(f, 'legend', 'Legend'), fit ? layerChip(f, 'results', 'Results box') : null,
       moreLayers(f, fit));
   }
@@ -1245,6 +1269,11 @@ function procTab(f) {
     field('Bin size', input(f.proc.bin, (v) => setProc(f, { bin: Math.max(1, Math.round(num(v) || 1)) }), { numeric: true })),
     field(kindOf(f) === 'tt' ? 'Smoothing (points)' : 'Smoothing window', input(f.proc.smooth, (v) => { const smooth = Math.max(1, Math.round(num(v) || 1)); f.layers.smooth = smooth > 1; setProc(f, { smooth }); }, { numeric: true }))));
   out.append(h('div', { class: 'g2' }, field('Data from', input(f.proc.roi_min ?? '', (v) => setProc(f, { roi_min: num(v) }), { numeric: true, placeholder: 'start' })), field('to', input(f.proc.roi_max ?? '', (v) => setProc(f, { roi_max: num(v) }), { numeric: true, placeholder: 'end' }))));
+  const nCompared = kindOf(f) === '1d' ? comparisonFiles(f).length - 1 : 0;
+  if (nCompared) out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Apply to the ${nCompared} compared file${nCompared > 1 ? 's' : ''}`),
+    h('div', { class: 'row wrap', style: 'gap:4px' }, [[['bin'], 'Bin', 'bin size'], [['smooth'], 'Smoothing', 'smoothing'], [['roi_min', 'roi_max'], 'Data range', 'data range'], [['steps'], 'Transforms', 'transforms'],
+      [['bin', 'smooth', 'roi_min', 'roi_max', 'steps'], 'All of these', 'processing']].map(([keys, text, label]) =>
+      h('button', { class: 'btn sm', title: `Copy this file's ${label} to every compared file (one-time; iterations, exclusions and baseline stay per file)`, onclick: () => applyProcToCompared(f, keys, label) }, text)))));
   const nEx = f.proc.excluded.length + f.proc.exclusion_ranges.length;
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Excluded points'),
     nEx ? h('div', { class: 'row wrap' }, h('span', { class: 'mono' }, `${f.proc.excluded.length} point(s)`), h('button', { class: 'btn sm', onclick: () => setProc(f, { excluded: [], exclusion_ranges: [] }, 'restore points') }, 'Restore all'))

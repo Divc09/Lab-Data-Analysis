@@ -23,14 +23,31 @@ export function filePresentation(f, o) {
   // Ordered scales colour by position in the legend order, so reordering files re-sorts the gradient.
   const order = scale ? comparisonFiles(f).map((x) => x.path) : null;
   const color = scale ? rampColor(scale, order.indexOf(o.path) / Math.max(1, order.length - 1)) : primary ? pal[0] : (colors[slot] || '#6B7380');
+  // Display layers (SEM, smoothed, iterations) follow the main plot's chips unless this file is set to its own.
+  // Sessions saved before this switch existed with a per-file uncertainty keep it as their own setting.
+  const display = primary ? 'follow' : cfg.display || (cfg.err !== undefined ? 'own' : 'follow');
+  const layers = display === 'own' ? { err: cfg.err || 'none', smooth: !!cfg.smooth, iter: !!cfg.iter }
+    : { err: f.layers.band ? (f.errorMode === 'bars' ? 'bars' : 'band') : 'none', smooth: !!f.layers.smooth, iter: !!f.layers.iter };
   return { label: o.info.name.replace(/\.mat$/i, ''), color,
     marker: primary ? 'circle' : ['diamond', 'square', 'triangle-up', 'cross', 'x', 'triangle-down'][slot % 6],
     mode: f.styleMode === 'pts' ? 'markers' : f.styleMode === 'line' ? 'lines' : 'lines+markers',
     dash: primary || scale ? 'solid' : ['solid', 'dot', 'dashdot', 'longdash'][Math.floor(slot / colors.length) % 4], fitDash: 'dash',
     ...cfg, data: (primary ? f.layers.data : true) && ds.visible !== false, fit: (primary ? f.layers.fit : f.display?.overlayFits !== false) && fs.visible !== false,
     legend: ds.legend !== false, result: cfg.result !== false, precision: cfg.precision || 2, units: cfg.units || 'auto',
+    display, ...layers,
   };
 }
+// Alt-click on a layer chip: compared files that follow the main plot keep what they show now, so only the main file changes.
+export function freezeFollowers(f) {
+  f.style.comparison ||= {};
+  for (const o of comparisonFiles(f)) {
+    if (o === f) continue;
+    const cfg = filePresentation(f, o);
+    if (cfg.display === 'follow') f.style.comparison[o.path] = { ...(f.style.comparison[o.path] || {}), display: 'own', err: cfg.err, smooth: cfg.smooth, iter: cfg.iter };
+  }
+}
+const PROC_SHARED = ['bin', 'smooth', 'roi_min', 'roi_max', 'steps'];
+export const procDiffers = (f, o) => PROC_SHARED.some((k) => JSON.stringify(f.proc?.[k] ?? null) !== JSON.stringify(o.proc?.[k] ?? null));
 export function legendLabel(f, o) {
   const cfg = filePresentation(f, o), fit = currentResult(o,seriesDetector(f,o));
   const lines = resultLines(fit, o.info);
@@ -145,7 +162,12 @@ export function seriesOptions(f, o) {
       field('Fit line', select(['solid', 'dash', 'dot', 'dashdot', 'longdash'], cfg.fitDash, (fitDash) => set({ fitDash })))),
     o !== f ? h('div', { class: 'g2' },
       field('Y axis', select([['left', 'Left (shared)'], ['right', 'Right (own scale)']], cfg.axis || 'left', (axis) => set({ axis }), { title: 'Right: this series gets an independent right-hand y axis' })),
-      field('Uncertainty', select([['none', 'None'], ['band', '±1 SEM band'], ['bars', '±1 SEM bars']], cfg.err || 'none', (err) => set({ err }), { title: 'Per-series uncertainty display (this file\'s own SEM)' }))) : null,
+      field('Display layers', select([['follow', 'Follow main plot'], ['own', 'This file’s own']], cfg.display, (display) => set({ display, err: cfg.err, smooth: cfg.smooth, iter: cfg.iter }),
+        { title: 'Follow: the ± SEM, Smoothed and Iterations chips above the plot apply to this file too' }))) : null,
+    o !== f ? h('div', { class: 'row wrap' },
+      field('Uncertainty', select([['none', 'None'], ['band', '±1 SEM band'], ['bars', '±1 SEM bars']], cfg.err, (err) => set({ display: 'own', err, smooth: cfg.smooth, iter: cfg.iter }), { title: 'This file\'s own SEM; changing it sets Display layers to this file\'s own' })),
+      check('Smoothed', cfg.smooth, (smooth) => set({ display: 'own', err: cfg.err, smooth, iter: cfg.iter }), { title: 'Uses this file\'s own smoothing window (Process tab)' }),
+      check('Iterations', cfg.iter, (iter) => set({ display: 'own', err: cfg.err, smooth: cfg.smooth, iter }), { title: 'This file\'s selected iterations, pale in its colour' })) : null,
     o !== f && cfg.axis === 'right' ? field('Right axis title', input(f.style.yRight?.title || '', (v) => { commit('right axis title'); f.style.yRight = { ...(f.style.yRight || {}), title: v || undefined }; emit(); }, { placeholder: 'auto (or double-click it on the plot)' })) : null,
     field('Fit settings', select([['current', 'Current primary settings'], ['own', 'This file’s own settings']], cfg.fitSettings || 'current', (fitSettings) => set({ fitSettings }))),
     o !== f ? h('button', { class: 'btn sm', onclick: () => { set({ fitSettings: 'own' }); import('./analyze.js').then((m) => m.openFitSettingsDialog(o)); } }, 'Edit this file’s fit settings…') : null,
@@ -212,7 +234,8 @@ export function seriesPanel(f) {
           input(cfg.label, (label) => updateFilePresentation(f, o, { label }), { 'aria-label': `Legend label ${o.info.name}`, title: `${o.path}${o === f ? ' · primary' : ''}` }),
           check('Data', cfg.data, (v) => setFileVisible(f, o, 'data', v), { 'aria-label': `Data ${o.info.name}` }),
           check('Fit', cfg.fit, (v) => setFileVisible(f, o, 'fit', v), { disabled: !fit, 'aria-label': `Fit ${o.info.name}` }),
-          h('span', { class: 'fit-plan', title: planTitle }, plan.model, h('span', { class: 'dim' }, o === f ? ' · Fit tab' : cfg.fitSettings === 'own' ? ' · own' : ' · primary’s')),
+          h('span', { class: 'fit-plan', title: planTitle }, plan.model, h('span', { class: 'dim' }, o === f ? ' · Fit tab' : cfg.fitSettings === 'own' ? ' · own' : ' · primary’s'),
+            o !== f && procDiffers(f, o) ? h('span', { class: 'dim', title: `Processing differs from the main file (bin ${o.proc.bin}, smooth ${o.proc.smooth}). Process tab → Apply to compared files copies the main file's.` }, ' · own processing') : null),
           h('button', { class: 'btn sm', title: planTitle, disabled: o.fitting || f.compareFitting, onclick: () => fitSeries(f, o) }, o.fitting ? 'Fitting…' : fit ? 'Refit' : 'Fit'),
           h('button', { class: 'btn sm', disabled: i === 0, title: 'Move up (legend/draw order)', 'aria-label': `Move up ${o.info.name}`, onclick: () => moveFile(f, o, -1) }, '↑'),
           h('button', { class: 'btn sm', disabled: i === files.length - 1, title: 'Move down (legend/draw order)', 'aria-label': `Move down ${o.info.name}`, onclick: () => moveFile(f, o, 1) }, '↓'),

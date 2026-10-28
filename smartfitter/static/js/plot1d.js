@@ -103,16 +103,19 @@ export function figure1D(f, { forExport = false } = {}) {
   const hasSteps = (f.proc?.steps || []).some((s) => s.enabled !== false);
   const norm = shown.normalization;
   // 'gray' keeps the single series colour; any other scale colours traces by iteration number.
-  const iterCmap = f.iterationView?.cmap === 'gray' ? null : ITER_SCALES[f.iterationView?.cmap] ? f.iterationView.cmap : DEFAULT_ITER_SCALE;
+  // With compared files showing their iterations too, each file's iterations are pale lines in that file's colour.
+  const comparing = S.overlays.some((p) => p !== f.path && S.files[p] && filePresentation(f, S.files[p]).iter);
+  const iterCmap = comparing || f.iterationView?.cmap === 'gray' ? null : ITER_SCALES[f.iterationView?.cmap] ? f.iterationView.cmap : DEFAULT_ITER_SCALE;
   const iterationY = (a) => TY(space === 'normalized' && norm ? toNormalized(nonNull(a), norm) : nonNull(a));
   if (its && (L.iter || L.meanSd) && !hasSteps && space !== 'fit' && (!transformed || norm)) {
     const ix = TX(nonNull(its.x || d.raw.x));
     const sel = its.selected ?? f.proc?.iterations ?? f.iterSel ?? its.values.map((_, i) => i);
     const vals = its.processed_values || its.values;
     if (L.iter) {
-      const s = seriesStyle(st, 'iter', { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: iterCmap ? 1.2 : 1, opacity: iterCmap ? 0.85 : 0.6 });
+      const s = seriesStyle(st, 'iter', comparing ? { name: `Selected iterations (${sel.length})`, color: primaryStyle.color, width: 1, opacity: 0.3 }
+        : { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: iterCmap ? 1.2 : 1, opacity: iterCmap ? 0.85 : 0.6 });
       sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: ix, y: iterationY(vals[k]),
-        line: { color: iterCmap ? cmapColor(iterCmap, k / Math.max(1, vals.length - 1)) : s.color, width: s.width, dash: iterCmap ? 'solid' : ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
+        line: { color: iterCmap ? cmapColor(iterCmap, k / Math.max(1, vals.length - 1)) : s.color, width: s.width, dash: iterCmap || comparing ? 'solid' : ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
         name: s.name, legendgroup: 'iter', showlegend: j === 0 && s.legend, hovertemplate: `iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: 'iter', iteration: k + 1 }, visible: s.visible === false ? 'legendonly' : true }));
       if (iterCmap && sel.length) traces.push(iterColorbar(iterCmap, vals.length, st));
     }
@@ -163,6 +166,17 @@ export function figure1D(f, { forExport = false } = {}) {
       const m = new Map((od.proc.x || []).map((v, i) => [v, od.proc.sem[i]]));
       osem = os.x.map((v) => { const s = m.get(v); return s == null ? NaN : s / (space === 'normalized' ? normScale(os.normalization) : 1); });
     }
+    // Iterations and smoothed curve use this file's own selection and smoothing window, drawn in its colour.
+    const ois = od.iterations, onorm = os.normalization, oSteps = (o.proc?.steps || []).some((s) => s.enabled !== false);
+    const oY = (a) => TY(space === 'normalized' && onorm ? toNormalized(nonNull(a), onorm) : nonNull(a));
+    if (cfg.iter && cfg.data && ois && !oSteps && space !== 'fit' && (space === 'original' || onorm)) {
+      const vals = ois.processed_values || ois.values, oix = TX(nonNull(ois.x || od.raw.x), o.info.x_unit || '');
+      (ois.selected ?? vals.map((_, i) => i)).forEach((k) => traces.push({ type: 'scatter', mode: 'lines', x: oix, y: oY(vals[k]), line: { color: cfg.color, width: 1 }, opacity: 0.3,
+        name: `${cfg.label} · iterations`, legendgroup: p, showlegend: false, hovertemplate: `${cfg.label} · iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: `oviter:${p}`, iteration: k + 1 }, ...yx }));
+    }
+    if (cfg.smooth && cfg.data && od.proc.smooth && (space === 'original' || onorm)) traces.push(scatterTrace(st, `ovsmooth:${p}`,
+      { name: `${cfg.label} · smoothed (${od.proc.smoothing_window ?? o.proc.smooth} pt)`, color: cfg.color, mode: 'lines', width: 2.4 }, TX(nonNull(od.proc.x), o.info.x_unit || ''), oY(od.proc.smooth),
+      { showlegend: false, legendgroup: p, opacity: 0.75, ...yx }));
     if (osem && cfg.err === 'band' && cfg.data) traces.push({ type: 'scatter', x: [...ox, ...[...ox].reverse()], y: [...oy.map((v, i) => v + osem[i]), ...oy.map((v, i) => v - osem[i]).reverse()],
       fill: 'toself', fillcolor: hexA(cfg.color, 0.15), line: { width: 0 }, name: `${cfg.label} ±1 SEM`, showlegend: false, hoverinfo: 'skip', legendgroup: p, meta: { key: `ovband:${p}` }, ...yx });
     traces.push(scatterTrace(st, `ov:${p}`, { name: label, color: cfg.color, mode: cfg.mode, marker: cfg.marker, dash: cfg.dash }, ox, oy,
@@ -194,7 +208,7 @@ export function figure1D(f, { forExport = false } = {}) {
     const sourceIndices = transformed ? new Map(d.proc.x.map((v, i) => [v, i])) : null;
     traces.push(scatterTrace(st, 'data', { name: primaryName, color: primaryStyle.color, mode: primaryStyle.mode, marker: primaryStyle.marker, dash: primaryStyle.dash }, x, y, { customdata: xr.map((v, i) => sourceIndices?.get(v) ?? i), ...extra }));
   }
-  if (L.smooth && d.proc.smooth && (space === 'original' || (space === 'normalized' && norm))) traces.push(scatterTrace(st, 'smooth', { name: `Smoothed (${d.proc.smoothing_window ?? f.proc.smooth} pt)`, color: '#222222', mode: 'lines', width: 1.6 }, TX(nonNull(d.proc.x)), iterationY(d.proc.smooth)));
+  if (L.smooth && d.proc.smooth && (space === 'original' || (space === 'normalized' && norm))) traces.push(scatterTrace(st, 'smooth', { name: `Smoothed (${d.proc.smoothing_window ?? f.proc.smooth} pt)`, color: comparisonFiles(f).length > 1 ? primaryStyle.color : '#222222', mode: 'lines', width: 1.6 }, TX(nonNull(d.proc.x)), iterationY(d.proc.smooth)));
   // fit
   if (fit && L.fit && shown.fitY) {
     const fx = TX(nonNull(fit.dense?.x || fit.x)), fy = TY(shown.fitY);
