@@ -13,6 +13,12 @@ export const CMAP_GRADIENT = {
   inferno: '#000004,#56106e,#bb3754,#f98e09,#fcffa4', plasma: '#0d0887,#7e03a8,#cc4778,#f89540,#f0f921', turbo: '#30123b,#4686fb,#1ae4b6,#faba39,#7a0403',
   parula: '#352a87,#148ab4,#3fbc73,#c6d63c,#f9a721', coolwarm: '#3b4cc0,#8db0fe,#dddddd,#f49a7b,#b40426', RdBu: '#67001f,#f4a582,#f7f7f7,#92c5de,#053061', gray: '#000000,#ffffff',
 };
+// Colour at t in [0, 1] interpolated linearly between the CMAP_GRADIENT stops.
+export function cmapColor(name, t) {
+  const stops = (CMAP_GRADIENT[name] || CMAP_GRADIENT.viridis).split(',').map((c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)));
+  const u = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(u)), w = u - i;
+  return `rgb(${stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * w)).join(',')})`;
+}
 // Plotly's Greys runs white->black; flip so "gray" means black->white like Matplotlib.
 const NEEDS_FLIP = { gray: true, RdBu: true };
 

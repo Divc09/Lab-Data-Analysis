@@ -6,6 +6,7 @@ import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized }
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
 import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
 import { uniformSampling, magnitudeSpectrum } from './spectrum.js';
+import { cmapColor, CMAP_GRADIENT } from './plot2d.js';
 
 const nonNull = (a) => (a || []).map((v) => (v === null ? NaN : v));
 
@@ -15,6 +16,13 @@ export function fftAvailability(f) {
   if (!processed.ok) return processed;
   const shown = displaySeries(f, f.detector, displaySpace(f), f.fit[f.detector]);
   return uniformSampling(shown?.x, shown?.y);
+}
+
+// Legend-free colourbar mapping iteration number (1..count) to the trace colour scale.
+function iterColorbar(cmap, count, st) {
+  return { type: 'scatter', mode: 'markers', x: [null], y: [null], showlegend: false, hoverinfo: 'skip', meta: { key: 'iterScale' },
+    marker: { color: [1, count], cmin: 1, cmax: Math.max(2, count), colorscale: [0, 0.25, 0.5, 0.75, 1].map((t) => [t, cmapColor(cmap, t)]), showscale: true,
+      colorbar: { title: { text: 'Iteration', side: 'right' }, thickness: 10, len: 0.45, y: 0.5, x: 1.01, xpad: 4, outlinewidth: 0, tickfont: { size: Math.max(9, st.base - 3) } } } };
 }
 
 function modeFor(f, styleMode) {
@@ -92,6 +100,8 @@ export function figure1D(f, { forExport = false } = {}) {
   const its = d.iterations;
   const hasSteps = (f.proc?.steps || []).some((s) => s.enabled !== false);
   const norm = shown.normalization;
+  // 'gray' (default) keeps the single series colour; any other scale colours traces by iteration number.
+  const iterCmap = f.iterationView?.cmap !== 'gray' && CMAP_GRADIENT[f.iterationView?.cmap] ? f.iterationView.cmap : null;
   const iterationY = (a) => TY(space === 'normalized' && norm ? toNormalized(nonNull(a), norm) : nonNull(a));
   if (its && (L.iter || L.meanSd) && !hasSteps && space !== 'fit' && (!transformed || norm)) {
     const ix = TX(nonNull(its.x || d.raw.x));
@@ -99,8 +109,10 @@ export function figure1D(f, { forExport = false } = {}) {
     const vals = its.processed_values || its.values;
     if (L.iter) {
       const s = seriesStyle(st, 'iter', { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: 1, opacity: 0.6 });
-      sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: ix, y: iterationY(vals[k]), line: { color: s.color, width: s.width, dash: ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
+      sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: ix, y: iterationY(vals[k]),
+        line: { color: iterCmap ? cmapColor(iterCmap, k / Math.max(1, vals.length - 1)) : s.color, width: s.width, dash: iterCmap ? 'solid' : ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
         name: s.name, legendgroup: 'iter', showlegend: j === 0 && s.legend, hovertemplate: `iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: 'iter', iteration: k + 1 }, visible: s.visible === false ? 'legendonly' : true }));
+      if (iterCmap && sel.length) traces.push(iterColorbar(iterCmap, vals.length, st));
     }
     if (L.meanSd && d.proc.sd && sel.length > 1) {
       const mean = iterationY(d.proc.y), sd = nonNull(d.proc.sd).map((v) => space === 'normalized' ? v / norm.span : v);
@@ -120,7 +132,9 @@ export function figure1D(f, { forExport = false } = {}) {
         fy = toOriginal(fy, { lo: rn.t1_norm_lo, span: rn.t1_norm_span });
       }
       if (space === 'normalized') { if (!norm) continue; fy = toNormalized(fy, norm); }
-      traces.push({ type: 'scatter', mode: 'lines', x: TX(nonNull(r.dense?.x || r.x)), y: TY(fy), line: { color: '#5B6474', width: 1.4, dash: ['dash', 'dot', 'dashdot'][row.index % 3] },
+      const nIt = its?.values.length || result.rows.length;
+      traces.push({ type: 'scatter', mode: 'lines', x: TX(nonNull(r.dense?.x || r.x)), y: TY(fy),
+        line: { color: iterCmap ? cmapColor(iterCmap, row.index / Math.max(1, nIt - 1)) : '#5B6474', width: 1.4, dash: ['dash', 'dot', 'dashdot'][row.index % 3] },
         name: `Individual fits${result.fit_spec.fit_smoothed ? ' · SMOOTHED' : ''}`, legendgroup: 'iterFits', showlegend: row === result.rows.find((r) => r.fit),
         hovertemplate: `iteration ${row.iteration} · ${row.status}<br>%{x:.5g} ${xd.unit}, %{y:.5g}<extra></extra>`, meta: { key: 'iterFits', iteration: row.iteration } });
     }
@@ -293,7 +307,7 @@ export function figure1D(f, { forExport = false } = {}) {
 
 // ---- presentation extras: inset zoom (xaxis4/yaxis4) and broken x axis (xaxis5) ----
 const mainAx = (t) => (!t.xaxis || t.xaxis === 'x') && (!t.yaxis || t.yaxis === 'y');
-const NO_INSET = new Set(['band', 'conf', 'meanSd', 'iter', 'iterFits', 'pins', 'res', 'fft']);
+const NO_INSET = new Set(['band', 'conf', 'meanSd', 'iter', 'iterScale', 'iterFits', 'pins', 'res', 'fft']);
 
 function applyInset(f, st, traces, layout, shapes, annotations, dom, xEnd) {
   const ins = f.style?.inset;
