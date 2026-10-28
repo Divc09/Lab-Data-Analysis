@@ -51,7 +51,7 @@ from nvfit.profiles import PROFILES, classify_status
 from nvfit.rabi_utils import rabi_envelope_bounds
 from nvfit.ramsey import fit_ramsey_physics_first
 from nvfit.scan_spots import detect_fluorescent_spots
-from nvfit import pro_batch
+from nvfit import planning, pro_batch
 
 from .params import param_meta
 
@@ -1084,6 +1084,25 @@ def _rabi_calibration(tr, result, metrics: dict, x: np.ndarray, status: str, ana
     }
 
 
+def _odmr_sensitivity(tr, result, x, residuals) -> dict | None:
+    """Magnetic sensitivity of an ODMR fit, with a time-per-point estimate the user can override."""
+    if not result.model_name.startswith("ODMR"):
+        return None
+    meta = tr.metadata or {}
+    rate = None
+    if meta.get("per_second") and tr.reference is not None:
+        ref = np.asarray(tr.reference, float)
+        rate = float(np.nanmean(ref)) if np.isfinite(ref).any() else None
+    try:
+        out = planning.odmr_sensitivity(result, x, residuals, meta.get("x_unit") or "", tr.mode, rate)
+    except Exception as exc:
+        return {"error": str(exc)}
+    if out and "error" not in out:
+        out["timing"] = planning.acquisition_timing(tr.source_path, meta.get("completed_iterations"), len(np.asarray(tr.x_ns)))
+        out["rate_source"] = "mean reference counts/s of the file" if rate else "no count rate (file not saved per second)"
+    return out
+
+
 def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analysis=None):
     mode = tr.mode
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
@@ -1202,6 +1221,7 @@ def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analy
             "identifiability": _identifiability(result, x),
             "peak_review": _odmr_peak_review(result, x, residuals),
             "rabi_calibration": _rabi_calibration(tr, result, metrics, x, status, analysis) if result.model_name.startswith("Rabi") else None,
+            "odmr_sensitivity": _odmr_sensitivity(tr, result, x, residuals),
             "uncertainty": uncertainty,
             "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
             "elapsed_s": elapsed,

@@ -51,6 +51,13 @@ Iteration sensitivity (Analyze → Fit, or Process):
 - The popup provides **Error bars** and **Rescale plot** controls, a scrollable table, compact source labels with full provenance on hover, and an automatically recorded exclusion reason. The Fit/Process panel retains its scroll position during updates.
 - Diagnostics and exclusion reasons persist in sessions and JSON exports; **Export sensitivity CSV** saves the parameter comparison and source iteration identities. Changed settings/source files mark old diagnostics stale. These correlated refits do not provide independent uncertainty estimates or justify exclusion on their own.
 
+Plan the measurement (Analyze → Fit → Result → **Plan the measurement**; `nvfit/planning.py`):
+
+- **When is it done?** refits the mean of the first 2, 3, … N selected iterations and projects how many iterations reach a target error, assuming errors fall as 1/√N. Lifetimes, widths, amplitudes and frequencies take a % target; centres and offsets (x0, y0, phase, …) take an absolute target in their own unit. The measured exponent of error vs N is shown; a ⚠ means the error is not shrinking with averaging (drift, model mismatch or a poorly constrained parameter), so more iterations may not help. Time left uses the time per iteration you enter, or an estimate from the start stamp in the file name to the last save (includes overhead). **Rerun when the file updates** repeats the check after each watched checkpoint refit.
+- **Where to measure next** ranks scan positions by how much one more point (same averaging as the existing ones) would reduce the chosen parameter's error, using the linearized fit (greedy, repeats allowed), and compares it with adding the same number of points spread like the current scan. **Copy list** copies the positions in the file's native x unit. For decays the search reaches up to 5× the fitted lifetime (at most 10× the scan) unless you set **Up to**.
+- **Magnetic sensitivity** (ODMR fits): δB per point = residual noise ÷ (γe × steepest fitted slope), γe = 28.024 GHz/T, and η = δB × √(time per point) in T/√Hz, next to the CW shot-noise limit 4/(3√3) · FWHM / (γe C √R) (Dréau et al., PRB 84, 195204, 2011) with R the mean reference count rate. Time per point defaults to the wall-clock estimate, so the measured η is conservative.
+- All three are planning estimates around the current fit (model assumed right, noise like the current residuals), not validated predictions.
+
 ## Highlights
 
 - Loads legacy MATLAB `savedData` files and newer single- or dual-detector snapshot exports.

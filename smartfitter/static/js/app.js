@@ -885,6 +885,7 @@ async function watchTick() {
         // The shown fit describes the previous contents until it is refitted.
         f.fitStale = true;
         if (S.settings.auto_refit !== false && !f.fitting) { try { await runFit(f, { recordUndo: false }); } catch (e) { /* reported in the error tray; fit stays stale */ } }
+        if (f.plan?.view?.auto) import('./planning.js').then((m) => m.runConvergence(f, { quiet: true }));
         emit();
       }
     }

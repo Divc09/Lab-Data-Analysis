@@ -17,6 +17,7 @@ import * as sci from './science.js';
 import { seriesPanel, comparisonRows, comparisonCSV, comparisonFiles, filePresentation, fileKeys, setFileVisible, fitSeries, fitAllSeries, fitFamily, fitPlan } from './seriescontrol.js';
 import { xDisplay, displayValue, unitOptions, parameterUnit } from './unitdisplay.js';
 import { iterationCard, iterationFitActions, iterationProvenance, iterationCSV, openCombineDialog, fitTargetLabel } from './iterations.js';
+import { planningCard } from './planning.js';
 
 let legendTimer = null;
 let lastMapHover = null; // last heatmap cell under the mouse (for the right-click menu)
@@ -1047,6 +1048,7 @@ function resultCard(f, fit) {
     peakReviewCard(fit, f),
     rabiCalibrationCard(fit),
     modelSelectionCard(fit),
+    planningCard(f, fit),
     h('details', {}, h('summary', {}, 'All derived values'), h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(fit.metrics || {}).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v' }, typeof v === 'number' ? fmt(v, 6) : String(v))])),
       h('pre', { class: 'note', style: 'white-space:pre-wrap;font-family:var(--mono);font-size:11px' }, fit.message)),
     h('div', { class: 'row' }, h('button', { class: 'btn', style: 'flex:1;justify-content:center', onclick: () => copyText(slidesTable(f, fit), 'Results copied as a table for slides') }, 'Copy for slides'),
