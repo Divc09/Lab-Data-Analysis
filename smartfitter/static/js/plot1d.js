@@ -6,7 +6,7 @@ import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized }
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
 import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
 import { uniformSampling, magnitudeSpectrum } from './spectrum.js';
-import { cmapColor, CMAP_GRADIENT } from './plot2d.js';
+import { cmapColor, CMAP_GRADIENT, ITER_SCALES, DEFAULT_ITER_SCALE } from './plot2d.js';
 
 const nonNull = (a) => (a || []).map((v) => (v === null ? NaN : v));
 
@@ -21,7 +21,7 @@ export function fftAvailability(f) {
 // Legend-free colourbar mapping iteration number (1..count) to the trace colour scale.
 function iterColorbar(cmap, count, st) {
   return { type: 'scatter', mode: 'markers', x: [null], y: [null], showlegend: false, hoverinfo: 'skip', meta: { key: 'iterScale' },
-    marker: { color: [1, count], cmin: 1, cmax: Math.max(2, count), colorscale: [0, 0.25, 0.5, 0.75, 1].map((t) => [t, cmapColor(cmap, t)]), showscale: true,
+    marker: { color: [1, count], cmin: 1, cmax: Math.max(2, count), colorscale: Array.from({ length: 17 }, (_, i) => [i / 16, cmapColor(cmap, i / 16)]), showscale: true,
       colorbar: { title: { text: 'Iteration', side: 'right' }, thickness: 10, len: 0.45, y: 0.5, x: 1.01, xpad: 4, outlinewidth: 0, tickfont: { size: Math.max(9, st.base - 3) } } } };
 }
 
@@ -100,15 +100,16 @@ export function figure1D(f, { forExport = false } = {}) {
   const its = d.iterations;
   const hasSteps = (f.proc?.steps || []).some((s) => s.enabled !== false);
   const norm = shown.normalization;
-  // 'gray' (default) keeps the single series colour; any other scale colours traces by iteration number.
-  const iterCmap = f.iterationView?.cmap !== 'gray' && CMAP_GRADIENT[f.iterationView?.cmap] ? f.iterationView.cmap : null;
+  // 'gray' keeps the single series colour; any other scale (default plasma) colours traces by iteration number.
+  const iterPick = f.iterationView?.cmap || DEFAULT_ITER_SCALE;
+  const iterCmap = iterPick !== 'gray' && (ITER_SCALES[iterPick] || CMAP_GRADIENT[iterPick]) ? iterPick : null;
   const iterationY = (a) => TY(space === 'normalized' && norm ? toNormalized(nonNull(a), norm) : nonNull(a));
   if (its && (L.iter || L.meanSd) && !hasSteps && space !== 'fit' && (!transformed || norm)) {
     const ix = TX(nonNull(its.x || d.raw.x));
     const sel = its.selected ?? f.proc?.iterations ?? f.iterSel ?? its.values.map((_, i) => i);
     const vals = its.processed_values || its.values;
     if (L.iter) {
-      const s = seriesStyle(st, 'iter', { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: 1, opacity: 0.6 });
+      const s = seriesStyle(st, 'iter', { name: `Selected iterations (${sel.length})`, color: '#8C95A4', width: iterCmap ? 1.2 : 1, opacity: iterCmap ? 0.85 : 0.6 });
       sel.forEach((k, j) => traces.push({ type: 'scatter', mode: 'lines', x: ix, y: iterationY(vals[k]),
         line: { color: iterCmap ? cmapColor(iterCmap, k / Math.max(1, vals.length - 1)) : s.color, width: s.width, dash: iterCmap ? 'solid' : ['solid', 'dot', 'dash'][k % 3] }, opacity: s.opacity,
         name: s.name, legendgroup: 'iter', showlegend: j === 0 && s.legend, hovertemplate: `iteration ${k + 1}: %{y:.5g}<extra></extra>`, meta: { key: 'iter', iteration: k + 1 }, visible: s.visible === false ? 'legendonly' : true }));

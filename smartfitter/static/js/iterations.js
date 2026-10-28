@@ -7,6 +7,7 @@ import { displayValue, parameterUnit, displayUnit, unitOptions, unitScale } from
 import { filePresentation } from './seriescontrol.js';
 import { baseStyle, baseLayout, axisLayout, plotConfig } from './plotstyle.js';
 import { sensitivityActions } from './sensitivity.js';
+import { ITER_SCALES, DEFAULT_ITER_SCALE } from './plot2d.js';
 
 export function parseIterationRange(text, count) {
   if (!text.trim()) return [];
@@ -79,7 +80,7 @@ export function iterationCard(f) {
     h('div', { class: 'row wrap' }, check('Show iteration traces', f.layers.iter, (v) => { commit('iteration traces'); f.layers.iter = v; emit(); }),
       check('Mean ± SD', f.layers.meanSd, (v) => { commit('iteration spread'); f.layers.meanSd = v; emit(); }),
       h('label', { class: 'row', style: 'gap:4px', title: 'Colour iteration traces and individual fits by iteration number (early → late)' }, 'Colour',
-        select(['gray', 'viridis', 'plasma', 'turbo', 'cividis', 'magma', 'inferno', 'parula'], f.iterationView?.cmap || 'gray',
+        select([...Object.keys(ITER_SCALES), 'gray'], f.iterationView?.cmap || DEFAULT_ITER_SCALE,
           (v) => { commit('iteration colours'); (f.iterationView ||= {}).cmap = v; emit(); }, { style: 'width:92px;height:28px', 'aria-label': 'Iteration colour scale' }))),
     h('details', {}, h('summary', {}, 'Exclude-outlier help / source iterations'),
       h('div', { class: 'note' }, 'Sensitivity checks automatically uncheck iterations whose omission changes the selected parameter by at least the configured percentage, and refit the main plot. Recheck any iteration here to restore it to the mean; run a fit again to update the fit after a manual selection change. The sensitivity rule and excluded sources are recorded with the fit. Low R² or a large change alone does not prove an outlier.'),
