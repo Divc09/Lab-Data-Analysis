@@ -1,6 +1,6 @@
 // Main Analyze comparison controls; presentation belongs to the primary plot, not the source files.
 import { S, emit, commit, detLabel, syncOverlay, removeOverlay, currentResult, plotFile } from './state.js';
-import { h, field, input, select, check, clone, toast } from './util.js';
+import { h, field, input, select, check, clone, toast, fmt } from './util.js';
 import { SERIES_SCALES, paletteColors, rampColor, baseStyle, resultLines } from './plotstyle.js';
 import { displayValue, unitOptions, unitScale, parameterUnit } from './unitdisplay.js';
 import { openOverlayPicker } from './overlaypicker.js';
@@ -48,11 +48,14 @@ export function freezeFollowers(f) {
 }
 const PROC_SHARED = ['bin', 'smooth', 'roi_min', 'roi_max', 'steps'];
 export const procDiffers = (f, o) => PROC_SHARED.some((k) => JSON.stringify(f.proc?.[k] ?? null) !== JSON.stringify(o.proc?.[k] ?? null));
+// Default legend parameters: the headline result, the stretch exponent n when the model fitted one, then R².
+const defaultLegendKeys = (lines, o) => [...lines.filter((l) => !l.defaultOff && l.key !== 'r2').slice(0, o.info.type === 'ODMR' ? 2 : 1),
+  ...lines.filter((l) => l.key === 'stretch_n' || l.key === 'r2')].map((l) => l.key);
 export function legendLabel(f, o) {
   const cfg = filePresentation(f, o), fit = currentResult(o,seriesDetector(f,o));
   const lines = resultLines(fit, o.info);
-  const keys = cfg.params ?? lines.filter((l) => !l.defaultOff && l.key !== 'r2').slice(0, o.info.type === 'ODMR' ? 2 : 1).map((l) => l.key);
-  const results = cfg.result ? keys.map((k) => lines.find((l) => l.key === k)).filter(Boolean).map((l) => `${l.label} = ${displayValue(l.value, l.err, l.unit, cfg).withUnit}`).join('; ') : '';
+  const keys = cfg.params ?? defaultLegendKeys(lines, o);
+  const results = cfg.result ? keys.map((k) => lines.find((l) => l.key === k)).filter(Boolean).map((l) => l.key === 'r2' ? `R² = ${fmt(l.value, 4)}` : `${l.label} = ${displayValue(l.value, l.err, l.unit, cfg).withUnit}`).join('; ') : '';
   const target = fit?.provenance?.fit_target === 'smoothed' ? ` [SMOOTHED ${fit.provenance.smoothing_window} pt]` : '';
   return (cfg.template || '{label}{results}').replaceAll('{label}', cfg.label).replaceAll('{results}', results ? ` — ${results}` : '').replaceAll('{model}', fit?.model || '').replaceAll('{detector}', detLabel(o, seriesDetector(f, o))) + target;
 }
@@ -153,7 +156,7 @@ export function moveFile(f, o, direction) {
 export function seriesOptions(f, o) {
   const cfg = filePresentation(f, o), set = (patch) => updateFilePresentation(f, o, patch);
   const fit = currentResult(o,seriesDetector(f,o)), lines = resultLines(fit, o.info);
-  const selected = cfg.params ?? lines.filter((l) => !l.defaultOff && l.key !== 'r2').slice(0, o.info.type === 'ODMR' ? 2 : 1).map((l) => l.key);
+  const selected = cfg.params ?? defaultLegendKeys(lines, o);
   const resultUnits = [['auto', 'Auto'], ['native', 'Native (per parameter)'], ...new Map((lines.length ? lines : [{ unit: o.info.x_unit }]).flatMap((l) => unitOptions(l.unit)).filter(([u]) => u !== 'auto' && u !== 'native').map((v) => [v[0], v])).values()];
   return h('div', { class: 'series-options' },
     h('div', { class: 'g2' }, field('Data style', select([['lines+markers', 'Line + points'], ['markers', 'Points'], ['lines', 'Line']], cfg.mode, (mode) => set({ mode }))),
