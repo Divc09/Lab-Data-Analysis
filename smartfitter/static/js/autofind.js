@@ -3,6 +3,7 @@ import { finiteExtent } from './numeric.js';
 import { call } from './api.js';
 import { S, emit, openFile } from './state.js';
 import { h, mount, select, fmt, toast } from './util.js';
+import { copyText } from './export.js';
 
 const COLORS = { coarse: '#757575', confirm: '#757575', refine: '#eb6834', z: '#2a78d6', fine: '#1baf7a', patch: '#1baf7a', repeat: '#2a78d6', other: '#757575' };
 const DASH = { coarse: 'solid', confirm: 'dot', refine: 'solid', fine: 'solid', patch: 'dash', repeat: 'dashdot', other: 'dot' };
@@ -13,7 +14,7 @@ const MODES = [['metric', 'AutoFind metric (detector choice from log)'], ['det1'
 const SCALES = [['live', 'Scale: log10 max(v,1) (live)'], ['log', 'Scale: log10 v (v ≤ 0 blank)'], ['linear', 'Scale: linear (raw values)']];
 const SCALE_LABEL = { live: 'log10 max(value, 1)', log: 'log10 value', linear: 'value (linear)' };
 const ST = { root: '', runs: [], source: '', run: null, view: 'map', mode: 'metric', scale: 'linear', contours: false, selected: [], busy: '', errors: [],
-  pursuit: null, pursuitData: [], refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
+  pursuit: null, pursuitData: [], particle: 0, refine: '', fine: '', ztag: '', exportDir: '', exportResult: null, progress: '', epoch: 0, compare: [], colors: new Map() };
 const cache = new Map();
 const plots = new Map();
 const note = (text) => h('div', { class: 'hint', style: 'white-space:normal;margin:8px 0;line-height:1.5' }, text);
@@ -75,9 +76,10 @@ async function chooseRun(source) {
   const r = await call('autofind_run', { source });
   if (request !== runRequest) return;
   // A view/metric switch cancels raster work, not the selected run itself.
-  ST.source = source; ST.run = r; ST.pursuit = null; ST.pursuitData = [];
+  ST.source = source; ST.run = r; ST.pursuit = null; ST.pursuitData = []; ST.particle = 0;
   emit();
   if (ST.view === 'pursuit' && r.pursuits.length) await choosePursuit(r.pursuits[0].id);
+  else if (ST.view === 'particles') await showParticles();
   else if (ST.view === 'map') await loadMaps(source, ST.epoch);
 }
 async function loadMaps(source, epoch = ST.epoch) {
@@ -108,6 +110,15 @@ async function changeView(view) {
   if (view === 'map' && ST.run) await loadMaps(ST.source, epoch);
   if (view === 'compare') await buildCompare(epoch);
   if (view === 'pursuit' && ST.run?.pursuits.length && !ST.pursuit) await choosePursuit(ST.run.pursuits[0].id);
+  if (view === 'particles' && ST.run) await showParticles();
+}
+// Particle i's pursuit plots first (choosePursuit bumps the epoch), then the overview rasters.
+async function showParticles(i = ST.particle) {
+  ST.particle = i;
+  const row = particleRows(ST.run)[i];
+  if (row?.pursuit) await choosePursuit(row.pursuit.id);
+  else { ST.pursuit = null; ST.pursuitData = []; emit(); }
+  await loadMaps(ST.source, ST.epoch);
 }
 async function openScan(source, id) {
   const r = source === ST.source ? ST.run : ST.compare.find((r) => r.source === source);
@@ -293,20 +304,62 @@ function xyPanel(kind, id, assign) {
       layout(`${m.scan.label}`, { coloraxis: { ...range([m]), colorbar: { title: { text: SCALE_LABEL[ST.scale] }, thickness: 10 } }, xaxis: { ...layout('').xaxis, title: { text: `${m.axes[0]} (um)` } }, yaxis: { ...layout('').yaxis, title: { text: `${m.axes[1]} (um)` } } }), 350),
     note(m?.metric_label || ''), m?.scan ? button('Open scan in Analyze', () => openScan(ST.source, m.scan.id), !m.scan.path || m.scan.evidence_unavailable) : null);
 }
+function zPanel(height = 420) {
+  const z = ST.pursuitData.filter((m) => m.scan.type === 'z' && zLabel(m) === ST.ztag && m.values);
+  const zseries = z.map((m) => ({ type: 'scatter', mode: 'lines+markers', x: m.z, y: m.values, name: m.scan.label, meta: { source: ST.source, scanId: m.scan.id }, marker: { size: 7, symbol: m.scan.label.includes('_rev') ? 'square' : 'circle' },
+    line: { width: 2, dash: m.scan.label.includes('_rev') ? 'dash' : m.scan.label.includes('fine') ? 'dot' : 'solid', color: m.scan.label.includes('_rev') ? PALETTE[1] : PALETTE[0] }, hovertemplate: `${m.scan.label}<br>z %{x:.6g} um<br>%{y:.6g}<extra></extra>` }));
+  return h('div', { style: 'flex:1;min-width:300px' }, select(zTags().map((t) => [t, `Z search ${t}: all passes`]), ST.ztag, (v) => { ST.ztag = v; emit(); }),
+    zseries.length ? plot('pursuit z passes', zseries, layout('Forward / reverse z (no sign flip)', { xaxis: { title: { text: 'z (um); lower z = stage higher' }, exponentformat: 'none', hoverformat: '.7g' }, yaxis: { title: { text: 'AutoFind metric (see label below)' }, gridcolor: '#e1e0d9' }, hovermode: 'x unified', margin: { l: 62, r: 15, b: 135, t: 55 }, legend: { orientation: 'h', y: -0.5, font: { size: 9 } } }), height) : note('No z scan was recorded for this candidate (the pursuit ended before a z search).'), zseries.length ? note(z[0]?.metric_label || '') : null);
+}
+// Particles: every logged particle with its exact stage position, a MATLAB move command, and its plots on one screen.
+const um4 = (v) => typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : 'NaN';
+const samePos = (a, b) => a?.length >= 3 && b?.length >= 3 && a.slice(0, 3).every((v, i) => Math.abs(v - b[i]) < 1e-9);
+function particleRows(run) {
+  return (run?.particles || []).map((p, i) => ({ i, p, pursuit: run.pursuits.find((g) => samePos(g.particle?.position, p.position)) }));
+}
+// Same order as autoFindStageAcq moveTo: z first if the target z is higher than now, then x, y, then z.
+// Unlike moveTo there is no zLimits guard, so the panel says to check z before running it.
+function moveCommand(pos) {
+  const [x, y, z] = pos.slice(0, 3).map(um4);
+  return `t = [${x} ${y} ${z}]; zi = strcmpi(ex.PIstage.axisSum(:,1),'z'); if t(3) >= ex.PIstage.axisSum{zi,2}, ex.PIstage = absoluteMove(ex.PIstage,'z',t(3)); end; `
+    + `ex.PIstage = absoluteMove(ex.PIstage,'x',t(1)); ex.PIstage = absoluteMove(ex.PIstage,'y',t(2)); ex.PIstage = absoluteMove(ex.PIstage,'z',t(3));`;
+}
+function particlesView() {
+  const run = ST.run, rows = particleRows(run);
+  if (!rows.length) return note('No particles in this run’s log (L.particles is empty). Rejected candidates are on the Stitched map and Candidate pursuit views.');
+  const sel = rows[ST.particle] || rows[0], pos = sel.p.position;
+  const tsv = [['particle', 'pursuit', 'definitive', 'x_um', 'y_um', 'z_um', 'ratio', 'sigma', 'zFWHM_um'].join('\t'),
+    ...rows.map((r) => [r.i + 1, r.pursuit?.id || '', r.p.definitive ? 1 : 0, ...r.p.position.slice(0, 3).map(um4), r.p.ratio, r.p.sigma, r.p.zFWHM].join('\t'))].join('\n');
+  const maps = mapsOf(ST.source).filter((m) => m.values);
+  const ring = { type: 'scatter', mode: 'markers', x: [pos[0]], y: [pos[1]], marker: { symbol: 'circle-open', size: 22, color: '#d03b3b', line: { width: 3 } },
+    name: `Selected particle ${sel.i + 1}`, hovertemplate: `Particle ${sel.i + 1}<br>%{x:.4f}, %{y:.4f} um<extra></extra>` };
+  const overview = maps.length || run.particles.length ? plot('particle overview map', [...maps.map((m) => heatmap(m, run.source)), ...markerTraces(run, mapsOf(ST.source)), ring],
+    layout(`${run.run_id} — all particles`, { coloraxis: { ...range(maps), colorbar: { title: { text: SCALE_LABEL[ST.scale] }, thickness: 10 } }, uirevision: `${ST.source}:particles`, margin: { l: 62, r: 20, b: 50, t: 45 }, showlegend: false }), 350) : note('No coarse raster loaded yet.');
+  return h('div', {},
+    h('div', { class: 'row', style: 'gap:6px;margin:4px 0' }, h('h3', { style: 'margin:0' }, `${rows.length} particle${rows.length === 1 ? '' : 's'} (logged L.particles)`), button('Copy all coordinates (TSV)', () => copyText(tsv, 'Particle coordinates copied'))),
+    table(['#', 'Pursuit', 'Status', 'x (um)', 'y (um)', 'z (um)', 'Blob contrast', 'sigma', 'z FWHM (um)', ''], rows.map((r) => [
+      `${r === sel ? '▶ ' : ''}${r.i + 1}`, r.pursuit?.id || 'unlinked', r.p.definitive ? 'definitive' : 'not definitive', ...r.p.position.slice(0, 3).map(um4),
+      `${fmt(r.p.ratio)}x`, fmt(r.p.sigma), fmt(r.p.zFWHM),
+      h('div', { class: 'row', style: 'gap:4px' }, button('Show', () => showParticles(r.i)), button('Copy move', () => copyText(moveCommand(r.p.position), `Move command for particle ${r.i + 1} copied`)))])),
+    h('div', { style: 'margin:10px 0 4px;font-weight:600' }, `Move stage to particle ${sel.i + 1} (MATLAB, needs ex in the workspace)`),
+    h('div', { class: 'row', style: 'gap:6px;align-items:flex-start' },
+      h('pre', { style: 'flex:1;min-width:0;margin:0;padding:6px 8px;white-space:pre-wrap;word-break:break-all;user-select:all;border:1px solid var(--line);border-radius:4px;font-size:11px' }, moveCommand(pos)),
+      button('Copy', () => copyText(moveCommand(pos), 'Move command copied'))),
+    note('Logged L.particles.position in absolute stage um (not re-measured). Move order matches autoFindStageAcq moveTo, but this command has no z-limit guard: check z against your safe range before running.'),
+    h('div', { style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:10px;margin-top:8px' },
+      h('div', { style: 'min-width:0' }, overview),
+      ...(sel.pursuit && ST.pursuit?.id === sel.pursuit.id
+        ? [xyPanel('refine', ST.refine, (v) => { ST.refine = v; }), zPanel(350), xyPanel('fine / repeat', ST.fine, (v) => { ST.fine = v; })]
+        : [note(sel.pursuit ? 'Loading this particle’s pursuit scans…' : 'No pursuit scans matched this particle’s files, so only the overview is shown.')])));
+}
 function pursuitView() {
   const p = ST.pursuit;
   const chooser = select(ST.run.pursuits.map((g) => [g.id, `${g.id}: ${g.verdict}`]), p?.id || '', (v) => action('Loading pursuit', () => choosePursuit(v)));
   if (!p) return h('div', {}, chooser, note('No pursued candidate available. Recomputed coarse candidates are shown on the map.'));
-  const z = ST.pursuitData.filter((m) => m.scan.type === 'z' && zLabel(m) === ST.ztag && m.values);
-  const zseries = z.map((m) => ({ type: 'scatter', mode: 'lines+markers', x: m.z, y: m.values, name: m.scan.label, meta: { source: ST.source, scanId: m.scan.id }, marker: { size: 7, symbol: m.scan.label.includes('_rev') ? 'square' : 'circle' },
-    line: { width: 2, dash: m.scan.label.includes('_rev') ? 'dash' : m.scan.label.includes('fine') ? 'dot' : 'solid', color: m.scan.label.includes('_rev') ? PALETTE[1] : PALETTE[0] }, hovertemplate: `${m.scan.label}<br>z %{x:.6g} um<br>%{y:.6g}<extra></extra>` }));
   return h('div', {}, chooser, h('h3', {}, `${p.id} — ${p.verdict}`), note(p.reason),
     note(p.bleaching === null ? 'No particle-level bleaching flag saved. Logged z-pass bleaching messages, if present, are shown below; no new bleaching diagnosis is inferred.' : `Particle bleaching flag in log: ${p.bleaching ? 'true' : 'false'}.`),
     h('div', { style: 'display:flex;gap:12px;flex-wrap:wrap' },
-      xyPanel('refine', ST.refine, (v) => { ST.refine = v; }),
-      h('div', { style: 'flex:1;min-width:300px' }, select(zTags().map((t) => [t, `Z search ${t}: all passes`]), ST.ztag, (v) => { ST.ztag = v; emit(); }),
-        zseries.length ? plot('pursuit z passes', zseries, layout('Forward / reverse z (no sign flip)', { xaxis: { title: { text: 'z (um); lower z = stage higher' }, exponentformat: 'none', hoverformat: '.7g' }, yaxis: { title: { text: 'AutoFind metric (see label below)' }, gridcolor: '#e1e0d9' }, hovermode: 'x unified', margin: { l: 62, r: 15, b: 135, t: 55 }, legend: { orientation: 'h', y: -0.5, font: { size: 9 } } }), 420) : note('No z scan was recorded for this candidate (the pursuit ended before a z search).'), zseries.length ? note(z[0]?.metric_label || '') : null),
-      xyPanel('fine / repeat', ST.fine, (v) => { ST.fine = v; })),
+      xyPanel('refine', ST.refine, (v) => { ST.refine = v; }), zPanel(), xyPanel('fine / repeat', ST.fine, (v) => { ST.fine = v; })),
     plot('pursuit ratio history', [{ type: 'scatter', mode: 'lines+markers', x: p.ratios.map((r) => r.t), y: p.ratios.map((r) => r.ratio), marker: { color: PALETTE[0], size: 8 }, line: { color: PALETTE[0], width: 2 }, text: p.ratios.map((r) => r.source), hovertemplate: '%{text}<br>%{x:.5g} s<br>ratio %{y:.5g}x<extra></extra>' }],
       layout('Blob contrast versus time (rounded message values if exact history absent)', { xaxis: { title: { text: 'Elapsed time (s)' } }, yaxis: { title: { text: 'Blob contrast (dimensionless)' }, gridcolor: '#e1e0d9' }, hovermode: 'x unified' }), 310),
     (p.bleaching_events || []).length ? plot('logged z-pass bleaching events', [{ type: 'scatter', mode: 'markers', x: p.bleaching_events.map((e) => e.t), y: p.bleaching_events.map(() => 'logged z-pass bleaching'), marker: { color: PALETTE[1], symbol: 'triangle-down', size: 10 }, text: p.bleaching_events.map((e) => e.message), hovertemplate: '%{text}<br>%{x:.5g} s<extra></extra>' }],
@@ -352,7 +405,7 @@ export function renderAutoFind(root) {
       } }), button(r.run_id, () => chooseRun(r.source))), note(`${r.name}\n${r.scans} scans · ${r.tiles} tiles · ${fmt(r.duration_s)} s${r.has_log ? '' : ' · no log'}`))),
     note('Each log is a separate run, including logs sharing one folder. Indexing does not load raster data.'));
   const main = h('main', { style: 'flex:1;min-width:0;overflow:auto;padding:14px' },
-    h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' }, ...[['map', 'Stitched map'], ['timeline', 'Timeline'], ['pursuit', 'Candidate pursuit'], ['compare', 'Multi-run comparison']].map(([k, label]) =>
+    h('div', { class: 'row', style: 'flex-wrap:wrap;gap:8px' }, ...[['map', 'Stitched map'], ['particles', 'Particles'], ['timeline', 'Timeline'], ['pursuit', 'Candidate pursuit'], ['compare', 'Multi-run comparison']].map(([k, label]) =>
       h('button', { class: `btn sm ${ST.view === k ? 'primary' : ''}`, onclick: () => action(label, () => changeView(k)) }, label)),
       select(MODES, ST.mode, (v) => action('Metric', () => changeMode(v)), { style: 'width:220px;height:28px', title: 'Map metric', 'aria-label': 'Map metric' }),
       select(SCALES, ST.scale, (v) => { ST.scale = v; emit(); }, { style: 'width:230px;height:28px', title: 'Colour scale: log10 or linear (raw values)', 'aria-label': 'Colour scale' }),
@@ -363,7 +416,7 @@ export function renderAutoFind(root) {
       return h('details', { class: 'af-notes', open: !!ST.notesOpen, ontoggle: (e) => { ST.notesOpen = e.target.open; } },
         h('summary', { class: 'dim', style: 'cursor:pointer;margin:6px 0' }, `Provenance & caveats (${notes.length})`), ...notes.map(note));
     })(),
-    ST.run ? (ST.view === 'map' ? mapView() : ST.view === 'timeline' ? timelineView() : ST.view === 'pursuit' ? pursuitView() : compareView()) : note('Open a run folder or its parent, Discover, then select a run.'),
+    ST.run ? (ST.view === 'map' ? mapView() : ST.view === 'timeline' ? timelineView() : ST.view === 'pursuit' ? pursuitView() : ST.view === 'particles' ? particlesView() : compareView()) : note('Open a run folder or its parent, Discover, then select a run.'),
     h('hr'), h('h3', {}, 'Export figure set'),
     h('div', { class: 'row', style: 'gap:6px;flex-wrap:wrap' }, textInput(ST.exportDir, (v) => { ST.exportDir = v; }, 'Output folder (outside acquisition data)'),
       button('Browse output', async () => { const p = await call('dialog', { kind: 'open_folder', title: 'Choose figure export directory', directory: ST.exportDir || '' }); if (p) ST.exportDir = p; }), h('button', { class: 'btn sm', disabled: !ST.source, onclick: () => action('Export figure set', exportSet, { preempt: false }) }, 'Export figure set')),
