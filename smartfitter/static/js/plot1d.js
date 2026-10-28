@@ -44,8 +44,11 @@ export function xTitle(f) {
 
 // Returns { data, layout } for Plotly plus helpers the view needs.
 export function figure1D(f, { forExport = false } = {}) {
-  f = plotFile(f);
+  // Resolve the display unit on the real file state: resolveXAxis records the unit in f.display and rescales
+  // stored coordinates (pins, decorations, axis limits). On plotFile's shallow copy the record was lost while the
+  // shared coordinate objects were still rescaled, so every redraw shrank e.g. pinned points toward x = 0.
   const xd = resolveXAxis(f, comparisonFiles(f).map(plotFile));
+  f = plotFile(f);
   const st = baseStyle(f.style);
   const pal = PALETTES[st.palette] || PALETTES.lab;
   const L = f.layers;

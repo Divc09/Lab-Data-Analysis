@@ -350,3 +350,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* Always-visible identity of the shown result, above the inspector tabs. */
 .result-head { padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; font-size: 12px; min-width: 0; }
 .pill.STALE { background: var(--warnBg); color: var(--warn); }
+
+/* Plot editor: column headings over the series rows; checkboxes centred under them. */
+.srow-head { border-top: none; padding-bottom: 2px; font-size: 10.5px; color: var(--text3); text-transform: uppercase; letter-spacing: .04em; }
+.srow > input[type=checkbox] { justify-self: center; }

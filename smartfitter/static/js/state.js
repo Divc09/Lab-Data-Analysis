@@ -69,7 +69,8 @@ function newFileState(path, info, settings) {
 export async function openFile(path, { primary = true } = {}) {
   let f = S.files[path];
   if (!f) {
-    const peek = await call('load', { path, mode: 'contrast' }, { label: `Loading ${path.split(/[\\/]/).pop()}`, retry: () => openFile(path, { primary }) });
+    // Header only; loadData then fetches the plot data once per detector.
+    const peek = await call('load_info', { path, mode: 'contrast' }, { label: `Loading ${path.split(/[\\/]/).pop()}`, retry: () => openFile(path, { primary }) });
     f = newFileState(path, peek.info, S.settings);
     S.files[path] = f;
     await loadData(f);

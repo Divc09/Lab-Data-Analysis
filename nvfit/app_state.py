@@ -15,8 +15,14 @@ from .io_mat import ExperimentTrace
 from .profiles import FitProfile
 
 
+class CleanList(list):
+    """A list already in JSON-safe form (plain floats, None for non-finite); passed through without a re-walk."""
+
+
 def json_safe(value: Any) -> Any:
     """Return a deterministic JSON-compatible representation."""
+    if isinstance(value, CleanList):
+        return value
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):

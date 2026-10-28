@@ -717,29 +717,21 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
     # Data.failedPoints is the retry count of a collection that then succeeded (experiment.m getData
     # errors out on a real failure and stores nothing), so a nonzero entry is still a valid point.
 
-    signal = np.full(nsteps, np.nan, dtype=float)
-    reference = np.full(nsteps, np.nan, dtype=float)
-    points_with_data = 0
-
-    for i in range(nsteps):
-        if values.ndim == 1 and iterations.size > i and np.isfinite(iterations[i]) and iterations[i] <= 0:
-            continue
-        max_iter = iter_capacity
-        if values.ndim == 2 and iterations.size > i and np.isfinite(iterations[i]) and iterations[i] > 0:
-            max_iter = min(max_iter, int(iterations[i]))
-        sig_vals: list[float] = []
-        ref_vals: list[float] = []
-        current_cells = [values[i]] if values.ndim == 1 else [values[i, j] for j in range(max_iter)]
-        for j, cell in enumerate(current_cells):
-            pair = np.asarray(cell, dtype=float).ravel()
-            if pair.size < 2 or not np.isfinite(pair[0]) or not np.isfinite(pair[1]):
-                continue
-            ref_vals.append(float(pair[0]))
-            sig_vals.append(float(pair[1]))
-        if sig_vals and ref_vals:
-            signal[i] = float(np.mean(sig_vals))
-            reference[i] = float(np.mean(ref_vals))
-            points_with_data += 1
+    ref, sig = _cell_pairs(values)
+    its = np.full(nsteps, np.nan)
+    its[: min(nsteps, iterations.size)] = iterations[:nsteps]
+    if values.ndim == 1:
+        keep = np.isfinite(ref) & ~(np.isfinite(its) & (its <= 0))
+        reference, signal = np.where(keep, ref, np.nan), np.where(keep, sig, np.nan)
+    else:
+        # Cells beyond a row's recorded iteration count are not part of the run yet.
+        limit = np.where(np.isfinite(its) & (its > 0), np.minimum(iter_capacity, np.nan_to_num(its)), iter_capacity).astype(int)
+        keep = np.isfinite(ref) & (np.arange(values.shape[1])[None, :] < limit[:, None])
+        count = keep.sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            reference = np.where(count > 0, np.where(keep, ref, 0.0).sum(axis=1) / count, np.nan)
+            signal = np.where(count > 0, np.where(keep, sig, 0.0).sum(axis=1) / count, np.nan)
+    points_with_data = int(np.count_nonzero(np.isfinite(reference)))
 
     meta = {
         "reduction": "mean_valid_iterations",
@@ -749,6 +741,40 @@ def _reduce_new_format_values(data, nsteps: int) -> tuple[np.ndarray, np.ndarray
     return signal, reference, meta
 
 
+_PAIR_CACHE: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+
+def _cell_pairs(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reference and signal of every raw cell as float matrices (NaN where a cell has no finite pair).
+
+    Each cell of Data.values holds [reference, signal]. They are read once per parsed file and shared by every
+    observable and detector built from it (the loaders only read the parsed file).
+    """
+    hit = _PAIR_CACHE.get(id(values))
+    if hit is not None and hit[0] is values:
+        return hit[1], hit[2]
+    flat = values.ravel()
+    ref = np.full(flat.size, np.nan)
+    sig = np.full(flat.size, np.nan)
+    for k, cell in enumerate(flat):
+        if isinstance(cell, np.ndarray) and cell.dtype.kind in "fiu" and cell.size >= 2:
+            pair = cell.ravel()
+        else:
+            try:
+                pair = np.asarray(cell, dtype=float).ravel()
+            except (TypeError, ValueError):
+                continue
+            if pair.size < 2:
+                continue
+        ref[k], sig[k] = pair[0], pair[1]
+    finite = np.isfinite(ref) & np.isfinite(sig)
+    ref, sig = np.where(finite, ref, np.nan).reshape(values.shape), np.where(finite, sig, np.nan).reshape(values.shape)
+    _PAIR_CACHE[id(values)] = (values, ref, sig)
+    while len(_PAIR_CACHE) > 8:
+        _PAIR_CACHE.pop(next(iter(_PAIR_CACHE)))
+    return ref, sig
+
+
 def _extract_complete_iteration_contrast_stats(
     data,
     nsteps: int,
@@ -756,24 +782,12 @@ def _extract_complete_iteration_contrast_stats(
     values = np.asarray(getattr(data, "values", None), dtype=object)
     if values.ndim != 2 or values.shape[0] < nsteps:
         return None, None, None, None, None, None, {"complete_iterations": 0}
-    values = values[:nsteps, :]
     # Nonzero Data.failedPoints entries are retry counts of successful collections, not failures.
-
-    contrast = np.full(values.shape, np.nan, dtype=float)
-    signal = np.full(values.shape, np.nan, dtype=float)
-    reference = np.full(values.shape, np.nan, dtype=float)
-    valid = np.zeros(values.shape, dtype=bool)
-    for i in range(values.shape[0]):
-        for j in range(values.shape[1]):
-            pair = np.asarray(values[i, j], dtype=float).ravel()
-            if pair.size < 2 or not np.isfinite(pair[0]) or not np.isfinite(pair[1]):
-                continue
-            ref, sig = float(pair[0]), float(pair[1])
-            reference[i, j] = ref
-            signal[i, j] = sig
-            valid[i, j] = True
-            if ref != 0:
-                contrast[i, j] = (ref - sig) / ref
+    all_ref, all_sig = _cell_pairs(values)
+    reference, signal = all_ref[:nsteps, :].copy(), all_sig[:nsteps, :].copy()
+    valid = np.isfinite(reference)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        contrast = np.where(valid & (reference != 0), (reference - signal) / reference, np.nan)
 
     good_cols = [j for j in range(contrast.shape[1]) if np.all(np.isfinite(contrast[:, j]))]
     if not good_cols:
@@ -1098,29 +1112,23 @@ def _snapshot_acquired_cell_count(data: object) -> int:
         return 0
     iterations = np.asarray(getattr(data, "iteration", []), dtype=float)
     failed = np.asarray(getattr(data, "failedPoints", np.zeros(values.shape, dtype=int)))
-    count = 0
-    for index in np.ndindex(values.shape):
-        if failed.shape == values.shape and int(failed[index]) != 0:
-            continue
-        acquired = True
-        if iterations.shape == values.shape:
-            acquired = bool(np.isfinite(iterations[index]) and iterations[index] > 0)
-        elif iterations.size == values.shape[0]:
-            row_iteration = float(iterations.ravel()[index[0]])
-            acquired = bool(np.isfinite(row_iteration) and row_iteration > 0)
-            if values.ndim == 2:
-                acquired = acquired and index[1] < int(row_iteration)
-        elif iterations.size == 1:
-            acquired = bool(np.isfinite(iterations.ravel()[0]) and iterations.ravel()[0] > 0)
-        if not acquired:
-            continue
-        try:
-            pair = np.asarray(values[index], dtype=float).ravel()
-        except (TypeError, ValueError):
-            continue
-        if pair.size >= 2 and np.isfinite(pair[0]) and np.isfinite(pair[1]):
-            count += 1
-    return count
+    acquired = np.isfinite(_cell_pairs(values)[0])
+    if failed.shape == values.shape:
+        acquired &= failed.astype(float) == 0
+    if iterations.shape == values.shape:
+        acquired &= np.isfinite(iterations) & (iterations > 0)
+    elif iterations.size == values.shape[0]:
+        rows = iterations.ravel()
+        row_ok = np.isfinite(rows) & (rows > 0)
+        if values.ndim == 2:
+            limit = np.where(row_ok, np.nan_to_num(rows), 0).astype(int)
+            acquired &= row_ok[:, None] & (np.arange(values.shape[1])[None, :] < limit[:, None])
+        else:
+            acquired &= row_ok
+    elif iterations.size == 1:
+        first = iterations.ravel()[0]
+        acquired &= bool(np.isfinite(first) and first > 0)
+    return int(np.count_nonzero(acquired))
 
 
 def _is_time_trace_snapshot(raw: dict[str, Any]) -> bool:
@@ -1773,10 +1781,12 @@ def load_mat_file(path: str | Path) -> dict[str, Any]:
     return loadmat(Path(path), struct_as_record=False, squeeze_me=True)
 
 
-def load_experiment_dataset(path: str | Path, mode: DataMode = "contrast") -> ExperimentDataset:
+def load_experiment_dataset(path: str | Path, mode: DataMode = "contrast", raw: dict[str, Any] | None = None) -> ExperimentDataset:
+    """``raw`` may pass an already parsed file (load_mat_file) so other observables of one file skip re-reading it;
+    the loaders only read it."""
     mat_path = Path(path)
     mode = _canonical_mode(mode)
-    raw = load_mat_file(mat_path)
+    raw = load_mat_file(mat_path) if raw is None else raw
     metadata: dict[str, object] = {}
     available_detectors: tuple[str, ...] = ("detector1",)
     detector_mode = "single"

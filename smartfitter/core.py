@@ -29,13 +29,13 @@ from typing import Any
 import numpy as np
 
 from nvfit.analysis_tools import AnalysisStep, process_series
-from nvfit.app_state import fit_result_to_dict, json_safe
+from nvfit.app_state import CleanList, fit_result_to_dict, json_safe
 from nvfit.fit_engine import FitResult
 from nvfit.prepared_fit import PreparedFit, evaluate_result
 from nvfit.analysis_identity import analysis_descriptor, result_envelope, source_path
 from nvfit.units import compatibility, trace_units, unit_scale
 from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
-from nvfit.io_mat import DETECTOR_LABELS, ExperimentDataset, ExperimentTrace, load_experiment_dataset
+from nvfit.io_mat import DETECTOR_LABELS, ExperimentDataset, ExperimentTrace, load_experiment_dataset, load_mat_file
 from nvfit.iterations import (
     iteration_matrix,
     selected_trace,
@@ -166,25 +166,44 @@ FWHM_PER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
 
 
 def clean(value: Any) -> Any:
-    """JSON-safe conversion that maps NaN/inf to None (JSON has no NaN)."""
-    value = json_safe(value)
+    """JSON-safe conversion that maps NaN/inf to None (JSON has no NaN).
+
+    One pass over the tree. Arrays become CleanList via arr() (vectorized), and CleanList is returned as is,
+    so large maps are not walked value by value in Python.
+    """
+    if isinstance(value, CleanList):
+        return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    if isinstance(value, list):
-        return [clean(v) for v in value]
     if isinstance(value, dict):
-        return {k: clean(v) for k, v in value.items()}
-    return value
+        return {str(k): clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return arr(value) if value.dtype.kind in "fiub" else clean(value.tolist())
+    if isinstance(value, np.generic):
+        return clean(value.item())
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return clean(json_safe(value))
 
 
 def arr(values: Any) -> list | None:
+    """Numeric array as nested JSON lists with NaN/inf as None, built with NumPy rather than per value."""
     if values is None:
         return None
     a = np.asarray(values, dtype=float)
     out = a.tolist()
-    if a.ndim == 1:
-        return [v if math.isfinite(v) else None for v in out]
-    return clean(out)
+    bad = ~np.isfinite(a)
+    if bad.any():
+        if a.ndim == 0:
+            return None
+        for index in np.argwhere(bad):
+            row = out
+            for i in index[:-1]:
+                row = row[i]
+            row[index[-1]] = None
+    return CleanList(out) if a.ndim else (out if math.isfinite(out) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +279,7 @@ class Workspace:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._cache: dict[tuple[str, str], tuple[int, ExperimentDataset]] = {}
+        self._raw: dict[str, tuple[tuple, dict]] = {}  # parsed .mat per file version (see _parsed)
         self._peek: dict[str, tuple[int, dict]] = {}
         self._disk: dict[str, dict] | None = None  # persistent peek cache, loaded lazily
         self._disk_dirty = False
@@ -323,7 +343,7 @@ class Workspace:
             hit = self._cache.get(key)
             if hit and hit[0] == stamp:
                 return hit[1]
-        ds = load_experiment_dataset(p, mode)
+        ds = load_experiment_dataset(p, mode, raw=self._parsed(p, stamp))
         if _file_stamp(Path(p).stat()) != stamp:
             raise ValueError(f"Source changed while loading: {Path(p).name}; retry after saving.")
         with self._lock:
@@ -331,6 +351,22 @@ class Workspace:
             if len(self._cache) > 64:
                 self._cache.pop(next(iter(self._cache)))
         return ds
+
+    def _parsed(self, p: str, stamp) -> dict:
+        """Parsed .mat contents shared by all observables of one file version (Contrast, Signal, ... each
+        used to re-read and re-parse the whole file). A few recent files only: parsed maps can be large."""
+        key = os.path.normcase(p)
+        with self._lock:
+            hit = self._raw.get(key)
+            if hit and hit[0] == stamp:
+                self._raw[key] = self._raw.pop(key)  # most recently used last
+                return hit[1]
+        raw = load_mat_file(p)
+        with self._lock:
+            self._raw[key] = (stamp, raw)
+            while len(self._raw) > 4:
+                self._raw.pop(next(iter(self._raw)))
+        return raw
 
     def trace(self, path: str, detector: str | None, mode: str) -> ExperimentTrace:
         ds = self.dataset(path, mode)
@@ -551,15 +587,29 @@ def analysis_for(ws, path, detector, mode, proc=None, settings=None, kind="fit")
     return result_envelope(analysis_descriptor(path, detector, mode, proc), revision, settings, dependencies, kind)
 
 
-def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict | None = None) -> dict:
-    ds = ws.dataset(path, mode)
-    tr = ws.trace(path, detector, mode)
-    proc = proc or {}
+def _payload_info(ws: Workspace, path: str, ds, tr, mode: str, proc: dict) -> tuple[dict, dict]:
     info = describe(ds, tr)
     analysis = analysis_for(ws, path, tr.detector_id, mode, proc, kind="data")
     info["source_revision"] = analysis["source_revision"]
     if info["source_revision"] and "mtime_ns" in info["source_revision"]:
         info["mtime"] = int(info["source_revision"]["mtime_ns"]) / 1e9
+    return info, analysis
+
+
+def load_info(ws: Workspace, path: str, mode: str = "contrast") -> dict:
+    """The file description that opening a file needs, without building the plot payload (that follows per
+    detector). Opening used to build and send the whole payload twice, once only for this header."""
+    ds = ws.dataset(path, mode)
+    tr = ws.trace(path, None, mode)
+    info, _ = _payload_info(ws, path, ds, tr, mode, {})
+    return clean({"info": info, "detector": tr.detector_id, "mode": mode})
+
+
+def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict | None = None) -> dict:
+    ds = ws.dataset(path, mode)
+    tr = ws.trace(path, detector, mode)
+    proc = proc or {}
+    info, analysis = _payload_info(ws, path, ds, tr, mode, proc)
     out: dict[str, Any] = {"info": info, "detector": tr.detector_id, "mode": mode}
     out["analysis"] = analysis
     if tr.scan_dim == "scan2d" and tr.z2d is not None:
@@ -960,6 +1010,80 @@ def _identifiability(result: FitResult, x: np.ndarray) -> dict:
     return out
 
 
+def _odmr_peak_review(result: FitResult, x: np.ndarray, residuals: np.ndarray) -> list[dict] | None:
+    """Per-resonance values and local fit quality for ODMR Lorentzians.
+
+    ``w`` is the Lorentzian half width at half maximum, so FWHM = 2w. The local residual RMS uses the fitted
+    points within ±2 FWHM of each centre; a value well above the overall RMS points to a misfit at that peak.
+    """
+    if not result.model_name.startswith("ODMR"):
+        return None
+    p = dict(zip(result.param_names, np.asarray(result.params, float)))
+    e = dict(zip(result.param_names, np.asarray(result.errors, float)))
+    peaks = [("", "C", "w", "x0")] if "x0" in p else [(str(i), f"C{i}", f"w{i}", f"x0_{i}") for i in range(1, 9) if f"x0_{i}" in p]
+    xs, res = np.asarray(x, float), np.asarray(residuals, float)
+    ok = np.isfinite(xs) & np.isfinite(res)
+    overall = float(np.sqrt(np.mean(res[ok] ** 2))) if ok.any() else float("nan")
+    out = []
+    for n, (label, c, w, x0) in enumerate(peaks, start=1):
+        center, hwhm = p[x0], abs(p[w])
+        near = ok & (np.abs(xs - center) <= 4.0 * hwhm)
+        local = float(np.sqrt(np.mean(res[near] ** 2))) if near.sum() >= 2 else float("nan")
+        flags = []
+        if near.sum() < 3:
+            flags.append("fewer than 3 points within ±2 FWHM: the line is not resolved")
+        if np.isfinite(local) and np.isfinite(overall) and overall > 0 and local > 2.0 * overall:
+            flags.append(f"local residual {local / overall:.1f}x the overall RMS: check the line shape here")
+        out.append({"peak": n, "center": center, "center_err": e.get(x0), "fwhm": 2.0 * hwhm,
+                    "fwhm_err": 2.0 * abs(e[w]) if np.isfinite(e.get(w, np.nan)) else None,
+                    "amplitude": p[c], "amplitude_err": e.get(c), "points": int(near.sum()),
+                    "local_rms": local, "rms_ratio": local / overall if overall > 0 else None, "flags": flags})
+    return sorted(out, key=lambda r: r["center"])
+
+
+RABI_DEFINITIONS = {
+    "pi_time_ns": "π pulse length after the delay, from the fitted Rabi frequency (or pulse-area model)",
+    "pi_over_2_time_ns": "π/2 pulse length after the delay",
+    "programmed_pi_time_ns": "Delay + π: the duration to program for a π pulse",
+    "programmed_pi_over_2_time_ns": "Delay + π/2: the duration to program for a π/2 pulse",
+    "first_peak_ns": "First maximum of the fitted curve on the scanned axis (includes the delay)",
+    "delay_ns": "Fitted delay or dead time before driven oscillation starts",
+    "rabi_period_ns": "1 / fitted Rabi frequency",
+    "rabi_decay_ns": "Envelope decay time of the oscillation",
+}
+
+
+def _rabi_calibration(tr, result, metrics: dict, x: np.ndarray, status: str, analysis) -> dict:
+    """π / π/2 timing with the context needed to judge and reproduce it later."""
+    meta = tr.metadata or {}
+    values = {}
+    for key in RABI_DEFINITIONS:
+        if isinstance(metrics.get(key), (int, float)) and math.isfinite(metrics[key]):
+            err = metrics.get(f"{key}_err", metrics.get(f"{key}_nominal_err"))
+            values[key] = {"value": float(metrics[key]), "error": float(err) if isinstance(err, (int, float)) else None,
+                           "error_kind": "full" if f"{key}_err" in metrics else ("frequency only" if f"{key}_nominal_err" in metrics else None),
+                           "definition": RABI_DEFINITIONS[key]}
+    from nvfit.scan_stack import parse_file_time
+
+    file_time, time_source = parse_file_time(tr.source_path) if Path(str(tr.source_path)).exists() else (float("nan"), "unavailable")
+    revision = (analysis or {}).get("source_revision") or {}
+    return {
+        "values": values,
+        "context": {
+            "source": tr.file_name, "path": str(tr.source_path), "detector": getattr(tr, "detector_id", None),
+            "observable": tr.mode, "model": result.model_name, "selection": result.selection_note,
+            "fitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "acquired": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(file_time)) if math.isfinite(file_time) else None,
+            "acquired_source": time_source, "source_sha256": revision.get("sha256"),
+            "scan_ns": [float(np.min(x)), float(np.max(x))], "points": int(len(x)),
+            "iterations": meta.get("completed_iterations"), "rf_frequency_ghz": meta.get("rf_frequency_ghz"),
+            "saved_rf_ramp_time_ns": metrics.get("saved_rf_ramp_time_ns"),
+        },
+        "quality": {"status": status, "r2": float(result.r2), "converged": bool(result.success),
+                    "bound_hits": int(sum(result.bound_hits))},
+    }
+
+
 def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analysis=None):
     mode = tr.mode
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
@@ -1076,6 +1200,8 @@ def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analy
             "envelope": envelope,
             "candidates": candidates or extras.pop("model_candidates", None),
             "identifiability": _identifiability(result, x),
+            "peak_review": _odmr_peak_review(result, x, residuals),
+            "rabi_calibration": _rabi_calibration(tr, result, metrics, x, status, analysis) if result.model_name.startswith("Rabi") else None,
             "uncertainty": uncertainty,
             "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
             "elapsed_s": elapsed,

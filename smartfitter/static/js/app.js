@@ -51,7 +51,11 @@ function render() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
+    // performance.measure entries (sf:library, sf:view, sf:chrome) make slow redraws visible in DevTools.
+    performance.mark('sf:render');
     renderLibrary();
+    performance.measure('sf:library', 'sf:render');
+    performance.mark('sf:view');
     const v = S.view;
     const analyze = v === 'analyze' || v === 'home';
     els.main.classList.toggle('hidden', !analyze);
@@ -65,9 +69,12 @@ function render() {
     else if (v === 'day') renderDay(els.full);
     else if (v === 'stack') renderStack(els.full);
     else if (v === 'autofind') renderAutoFind(els.full);
+    performance.measure('sf:view', 'sf:view');
+    performance.mark('sf:chrome');
     renderTop();
     applyPanelWidths();
     renderStatus(0, '');
+    performance.measure('sf:chrome', 'sf:chrome');
   });
 }
 

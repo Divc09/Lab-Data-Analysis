@@ -1330,6 +1330,44 @@ def _rescale_odmr_result(result: FitResult, y_scale: float, extras: dict[str, ob
     )
 
 
+def _top_up_odmr_peaks(x: np.ndarray, y: np.ndarray, polarity: str, peak_indices: np.ndarray, count: int) -> np.ndarray:
+    """The detected peaks, plus the next-strongest separated extrema until there are ``count`` seeds."""
+    chosen = [int(i) for i in np.asarray(peak_indices, dtype=int)[:count]]
+    if len(chosen) >= count:
+        return np.asarray(chosen, dtype=int)
+    signal = _odmr_detection_signal(y, polarity)
+    span = float(np.ptp(x)) or 1.0
+    gap = span / (4.0 * count)  # keep seeds apart so two Lorentzians do not start on one resonance
+    for i in np.argsort(signal)[::-1]:
+        if len(chosen) >= count:
+            break
+        if all(abs(float(x[i]) - float(x[j])) >= gap for j in chosen):
+            chosen.append(int(i))
+    return np.asarray(chosen, dtype=int)
+
+
+def _fit_odmr_requested(x, y, n_starts, polarity, peak_indices, ranges, count, locks, single_range, weights) -> FitResult:
+    count = int(min(max(1, count), 4))
+    detected = [float(v) for v in np.asarray(x[np.asarray(peak_indices, dtype=int)], dtype=float)[:4]] if len(peak_indices) else []
+    if count == 1:
+        result = _fit_odmr_single(x, y, n_starts, polarity, locks=locks, center_range=single_range, weights=weights)
+        note = "fitted 1 peak as requested"
+        if len(peak_indices) > 1:
+            note += f" ({len(peak_indices)} candidate resonances were detected)"
+        return _with_selection(result, note, {"detected_peaks": detected, "requested_peaks": 1})
+    seeds = _top_up_odmr_peaks(x, y, polarity, peak_indices, count)
+    if len(seeds) < count:
+        raise ValueError(f"Cannot place {count} separated peaks in this scan; choose fewer peaks or Auto.")
+    result = _fit_odmr_multi(x, y, n_starts, seeds, max_peaks=count, polarity=polarity,
+                             center_ranges=ranges or None, weights=weights)
+    note = f"fitted {count} peaks as requested"
+    if len(peak_indices) < count:
+        found, added = len(peak_indices), count - len(peak_indices)
+        note += (f"; {found} {'was' if found == 1 else 'were'} detected, so {added} started at the next-strongest "
+                 f"{polarity}{'' if added == 1 else 's'}")
+    return _with_selection(result, note, {"detected_peaks": detected, "requested_peaks": count})
+
+
 def _select_odmr_candidate(
     single: FitResult, multi: FitResult | None, peak_indices: np.ndarray, x: np.ndarray
 ) -> FitResult:
@@ -1516,6 +1554,11 @@ def _fit_non_ramsey_impl(
             if constrained_ranges:
                 strengths = _odmr_detection_signal(y, polarity)[peak_indices]
                 single_range = constrained_ranges[int(np.argmax(strengths))]
+            if not cfg.odmr_auto_peak:
+                # An explicit peak count is honoured exactly; the note says when peaks had to be seeded.
+                candidates.append(_fit_odmr_requested(x, y, n_starts, polarity, peak_indices, constrained_ranges,
+                                                      int(cfg.odmr_peak_count), locks, single_range, w_sem))
+                continue
             single = _fit_odmr_single(x, y, n_starts, polarity, locks=locks, center_range=single_range, weights=w_sem)
             multi: FitResult | None = None
             if cfg.odmr_multipeak or len(peak_indices) > 1:

@@ -16,8 +16,15 @@ export const CMAP_GRADIENT = {
 // Plotly's Greys runs white->black; flip so "gray" means black->white like Matplotlib.
 const NEEDS_FLIP = { gray: true, RdBu: true };
 
+// Sorted finite values per map array, reused across redraws (sorting a large map is the costly part of limits).
+const sortedCache = new WeakMap();
+function sortedFinite(values) {
+  let v = sortedCache.get(values);
+  if (!v) { v = Float64Array.from(values.filter(Number.isFinite)).sort(); sortedCache.set(values, v); }
+  return v;
+}
 function percentile(values, p) {
-  const v = values.filter(Number.isFinite).sort((a, b) => a - b);
+  const v = sortedFinite(values);
   if (!v.length) return NaN;
   const idx = (p / 100) * (v.length - 1);
   const lo = Math.floor(idx), hi = Math.ceil(idx);
@@ -34,18 +41,28 @@ export function mapValueLabel(f) {
   return `${name}${unit ? ` [${unit}]` : ''}`;
 }
 
-// Display arrays honoring axis swap. Returns {x, y, z, xl, yl}
+// Display arrays honoring axis swap. Returns {x, y, z, xl, yl}. Cached per loaded map (a reload brings a new map
+// object), so redraws do not copy every cell again; callers treat the result as read-only.
+const displayCache = new WeakMap();
 export function displayMap(m, swap, source = 'value') {
+  let byKey = displayCache.get(m);
+  if (!byKey) { byKey = new Map(); displayCache.set(m, byKey); }
+  const key = `${swap ? 1 : 0}|${m.z[source] ? source : 'value'}`;
+  let out = byKey.get(key);
+  if (out) return out;
   const z0 = m.z[source] || m.z.value;
   const z = z0.map((r) => r.map((v) => (v === null ? NaN : v)));
-  if (!swap) return { x: m.x, y: m.y, z, xl: m.x_label, yl: m.y_label };
-  const zt = m.x.map((_, c) => m.y.map((__, r) => z[r][c]));
-  return { x: m.y, y: m.x, z: zt, xl: m.y_label, yl: m.x_label };
+  out = !swap ? { x: m.x, y: m.y, z, xl: m.x_label, yl: m.y_label }
+    : { x: m.y, y: m.x, z: m.x.map((_, c) => m.y.map((__, r) => z[r][c])), xl: m.y_label, yl: m.x_label };
+  out.flat = out.z.flat();
+  byKey.set(key, out);
+  return out;
 }
 
-export function mapLimits(f, det, z) {
+// flatValues: the cached displayMap(...).flat, so percentile limits reuse their sorted values across redraws.
+export function mapLimits(f, det, z, flatValues) {
   const M = f.map;
-  const flat = z.flat();
+  const flat = flatValues || z.flat();
   if (M.limits === 'manual' && M.manual[det] && M.manual[det][0] !== null) return M.manual[det];
   if (M.limits === 'auto') return finiteExtent(flat, [0, 1]);
   return [percentile(flat, M.plo), percentile(flat, M.phi)];
@@ -135,7 +152,7 @@ export function figureMaps(f, overlay) {
       disp = displayMap(m, sourceSwap(f, p), M.source || 'value');
       const raw = disp.z;
       let z = raw;
-      const [lo, hi] = (sameQuantity(p) && shared) || mapLimits(f, p.det, z);
+      const [lo, hi] = (sameQuantity(p) && shared) || mapLimits(f, p.det, z, disp.flat);
       let zmin = lo, zmax = hi, tickvals, ticktext;
       if (M.log) {
         z = z.map((r) => r.map((v) => (v > 0 ? Math.log10(v) : NaN)));

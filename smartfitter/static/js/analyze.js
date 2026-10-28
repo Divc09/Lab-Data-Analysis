@@ -275,14 +275,16 @@ function toolbar(f) {
       h('button', { class: `chip ${f.tt.showEvents ? 'on' : ''}`, onclick: () => { f.tt.showEvents = !f.tt.showEvents; emit(); } }, `Events ${d?.time?.events?.length || 0}`),
       layerChip(f, 'legend', 'Legend'));
   } else {
+    // Only layers this file can show: a chip that could never turn on (no fit yet, no per-point SEM, a single
+    // iteration) is left out instead of sitting greyed out, which keeps the row to one line.
     const its = d?.iterations;
     chips.append(
-      layerChip(f, 'data', 'Data', '#5A9BEA'), layerChip(f, 'fit', 'Fit', '#F08A3C', { disabled: !fit }),
-      layerChip(f, 'band', f.errorMode === 'bars' ? '± SEM bars' : '± SEM', '#3D5E8C', { tall: true, disabled: !d?.proc?.sem, title: d?.proc?.sem ? 'Standard error of the mean across iterations' : 'No per-point uncertainty in this file' }),
-      layerChip(f, 'res', 'Residuals', null, { disabled: !fit }), layerChip(f, 'smooth', 'Smoothed', '#222'),
-      h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, disabled: !its, title: its ? 'Show individual iterations (choose which in Process)' : 'No per-iteration data',
-        onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its ? its.selected.length : '–')),
-      layerChip(f, 'legend', 'Legend'), layerChip(f, 'results', 'Results box', null, { disabled: !fit }),
+      layerChip(f, 'data', 'Data', '#5A9BEA'), fit ? layerChip(f, 'fit', 'Fit', '#F08A3C') : null,
+      d?.proc?.sem ? layerChip(f, 'band', f.errorMode === 'bars' ? '± SEM bars' : '± SEM', '#3D5E8C', { tall: true, title: 'Standard error of the mean across iterations' }) : null,
+      fit ? layerChip(f, 'res', 'Residuals') : null, layerChip(f, 'smooth', 'Smoothed', '#222'),
+      its?.count > 1 ? h('button', { class: `chip ${f.layers.iter ? 'on' : ''}`, title: 'Show individual iterations (choose which in Process)',
+        onclick: () => { f.layers.iter = !f.layers.iter; emit(); } }, 'Iterations ', h('span', { class: 'mono dim' }, its.selected.length)) : null,
+      layerChip(f, 'legend', 'Legend'), fit ? layerChip(f, 'results', 'Results box') : null,
       moreLayers(f, fit));
   }
   const tools = h('div', { class: 'row wrap', style: 'gap:2px' },
@@ -308,15 +310,18 @@ function toolbar(f) {
     tt ? null : (f.tool === 'select'
       ? h('button', { class: 'btn sm primary', title: 'Drag a box around points to exclude them. Click again or press Esc to cancel.', onclick: () => setTool(f, 'zoom') }, icon('edit', 13), 'Drag to exclude · cancel')
       : h('button', { class: 'ibtn', title: 'Exclude points: drag a box around them (one-shot)', onclick: () => setTool(f, 'select') }, icon('edit'))),
-    h('button', { class: `ibtn ${f.tool === 'measure' ? 'on' : ''}`, title: 'Measure: click two points', onclick: () => { setTool(f, f.tool === 'measure' ? 'zoom' : 'measure'); f.measure = []; } }, icon('measure')),
-    h('span', { class: 'sep' }),
-    h('button', { class: 'btn', title: 'Open the plot editor (series, legend, axes, text, style). Tip: double-click titles/legend on the plot to edit in place.', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), S.editor.open ? 'Close editor' : 'Edit plot'),
+    h('button', { class: `ibtn ${f.tool === 'measure' ? 'on' : ''}`, title: 'Measure: click two points', onclick: () => { setTool(f, f.tool === 'measure' ? 'zoom' : 'measure'); f.measure = []; } }, icon('measure')));
+  // Figure actions sit at the right end of the layer row, which has room, so the tools fit on one line.
+  const figure = h('div', { class: 'row', style: 'gap:2px;margin-left:auto' },
+    h('button', { class: `btn ${S.editor.open ? 'on' : ''}`, title: 'Open the plot editor (series, legend, axes, text, style). Tip: double-click titles/legend on the plot to edit in place.', onclick: () => { S.editor.open = !S.editor.open; emit(); } }, icon('edit', 14), S.editor.open ? 'Close editor' : 'Edit plot'),
     !tt ? h('button', { class: 'btn sm', title: 'Jump to an editor section', 'aria-label': 'Editor sections', onclick: (e) => {
       const r = e.currentTarget.getBoundingClientRect();
       contextMenu(r.left, r.bottom + 4, [['series', 'Series'], ['legend', 'Legend'], ['axes', 'Axes & ticks'], ['text', 'Annotations & results'], ['inset', 'Inset & breaks'], ['style', 'Layout & style']]
         .map(([tab, label]) => ({ label, run: () => { S.editor.open = true; S.editor.tab = tab; emit(); } })));
     } }, '▾') : null,
     h('button', { class: 'ibtn', title: 'Copy figure to the clipboard (Ctrl+Shift+C)', 'aria-label': 'Copy figure', onclick: () => copyFigure(f) }, icon('copy', 15)));
+  chips.style.flex = '1 1 100%';
+  chips.append(figure);
   return h('div', { class: 'toolbar', style: 'flex:none' }, chips, tools);
 }
 
@@ -949,9 +954,8 @@ function fitTab(f) {
     } else if (fam === 'ODMR') {
       out.append(h('div', { class: 'g2' }, field('Polarity', select(['Auto', 'Peak', 'Dip'], s.odmr_polarity, (v) => set({ odmr_polarity: v }))),
         field('Peaks', select([['auto', 'Auto'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4']], s.odmr_auto_peaks ? 'auto' : String(s.odmr_peaks), (v) => set(v === 'auto' ? { odmr_auto_peaks: true } : { odmr_auto_peaks: false, odmr_peaks: Number(v), odmr_multi: Number(v) > 1 })))),
-      check('Multi-Lorentzian when several peaks are found', s.odmr_multi, (v) => set({ odmr_multi: v })),
-      h('div', { class: 'g2' }, field('Centers from', input(s.odmr_ranges[0]?.[0] ?? '', (v) => set({ odmr_ranges: [[num(v), s.odmr_ranges[0]?.[1] ?? null]] }), { numeric: true, placeholder: 'any' })),
-        field('to', input(s.odmr_ranges[0]?.[1] ?? '', (v) => set({ odmr_ranges: [[s.odmr_ranges[0]?.[0] ?? null, num(v)]] }), { numeric: true, placeholder: 'any' }))));
+      s.odmr_auto_peaks ? check('Multi-Lorentzian when several peaks are found', s.odmr_multi, (v) => set({ odmr_multi: v })) : null,
+      odmrRangeChips(f, s, set));
       out.append(peakPickCard(f));
     } else if (fam === 'T1') {
       out.append(field('Preprocess', seg([['Auto', 'Auto'], ['Direct T1', 'Direct'], ['Normalize then 1-data', 'Normalize, 1 − data']], s.t1_prep, (v) => set({ t1_prep: v }))),
@@ -1040,6 +1044,8 @@ function resultCard(f, fit) {
     sci.chi2Note(fit),
     fit.status !== 'PASS' ? h('div', { class: 'note', style: 'color:var(--warn)' }, fit.reason) : null,
     identifiabilityCard(fit),
+    peakReviewCard(fit, f),
+    rabiCalibrationCard(fit),
     modelSelectionCard(fit),
     h('details', {}, h('summary', {}, 'All derived values'), h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(fit.metrics || {}).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v' }, typeof v === 'number' ? fmt(v, 6) : String(v))])),
       h('pre', { class: 'note', style: 'white-space:pre-wrap;font-family:var(--mono);font-size:11px' }, fit.message)),
@@ -1060,6 +1066,60 @@ function notebookText(f, fit) {
   if (f.fitSpec.range_min !== null || f.fitSpec.range_max !== null) lines.push(`  fit range ${f.fitSpec.range_min ?? 'start'} to ${f.fitSpec.range_max ?? 'end'} ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'} (native)`);
   lines.push(`  ${f.path}`);
   return lines.join('\n');
+}
+
+// AN11: ODMR centre ranges as removable chips; range n constrains fitted peak n (in order). Native x units.
+function odmrRangeChips(f, s, set) {
+  const ranges = (s.odmr_ranges || []).filter((r) => r && r[0] != null && r[1] != null);
+  const unit = f.info.x_unit || '';
+  const draft = (f.odmrRangeDraft ||= [null, null]);
+  const add = () => {
+    const [lo, hi] = draft;
+    if (lo == null || hi == null) { toast('Enter both ends of the range first.'); return; }
+    f.odmrRangeDraft = [null, null];
+    set({ odmr_ranges: [...ranges, [Math.min(lo, hi), Math.max(lo, hi)]] });
+  };
+  return h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Centre ranges (native ${unit || 'x units'}) · range n constrains peak n`),
+    h('div', { class: 'chips-s', style: 'margin:2px 0 6px' }, ranges.length ? ranges.map((r, i) => h('span', { class: 'chip-s ok', title: `Peak ${i + 1} centre must lie in this range` },
+      `${i + 1}: ${fmt(r[0], 6)}–${fmt(r[1], 6)} `, h('button', { class: 'ibtn', style: 'height:14px;width:14px;font-size:10px', 'aria-label': `Remove range ${i + 1}`, onclick: () => set({ odmr_ranges: ranges.filter((_, j) => j !== i) }) }, '×')))
+      : h('span', { class: 'dim', style: 'font-size:11px' }, 'Any centre')),
+    h('div', { class: 'row', style: 'gap:4px' },
+      input(draft[0] ?? '', (v) => { draft[0] = num(v); }, { numeric: true, unit, placeholder: 'from', style: 'width:84px', 'aria-label': 'Range start' }),
+      h('span', { class: 'dim' }, 'to'),
+      input(draft[1] ?? '', (v) => { draft[1] = num(v); }, { numeric: true, unit, placeholder: 'to', style: 'width:84px', 'aria-label': 'Range end' }),
+      h('button', { class: 'btn sm', onclick: add }, 'Add range')));
+}
+
+// AN11: per-peak values and local fit quality for ODMR fits.
+function peakReviewCard(fit, f) {
+  const rows = fit.peak_review;
+  if (!rows?.length) return null;
+  const unit = f.info.x_unit || '';
+  const v = (x, e) => displayValue(x, e, unit, filePresentation(f, f));
+  return h('details', { open: rows.some((r) => r.flags.length) }, h('summary', {}, `Peaks · ${rows.length}${rows.some((r) => r.flags.length) ? ' · check flagged' : ''}`),
+    h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, ['#', 'Centre', 'FWHM', 'Amplitude', 'Local/overall RMS'].map((t) => h('th', {}, t))),
+      rows.map((r, i) => h('tr', { title: r.flags.join('\n') || `${r.points} points within ±2 FWHM` }, h('td', {}, String(i + 1)), h('td', {}, v(r.center, r.center_err).withUnit),
+        h('td', {}, v(r.fwhm, r.fwhm_err).withUnit), h('td', {}, fmt(r.amplitude, 3)), h('td', { style: r.flags.length ? 'color:var(--warn)' : '' }, r.rms_ratio == null ? '–' : `${fmt(r.rms_ratio, 2)}×${r.flags.length ? ' ⚠' : ''}`)))),
+    ...rows.flatMap((r, i) => r.flags.map((t) => h('div', { class: 'note', style: 'color:var(--warn)' }, `Peak ${i + 1}: ${t}`))),
+    h('div', { class: 'note' }, 'FWHM = 2 × the Lorentzian half width w. Local RMS uses residuals within ±2 FWHM of each centre.'));
+}
+
+// AN11: Rabi π / π/2 timing with definitions and the context needed to reuse the calibration later.
+function rabiCalibrationCard(fit) {
+  const c = fit.rabi_calibration;
+  if (!c || !Object.keys(c.values || {}).length) return null;
+  const ctx = c.context || {};
+  const text = () => [
+    `Rabi calibration · ${ctx.source} · ${ctx.detector || ''} · ${ctx.observable}`,
+    ...Object.entries(c.values).map(([k, q]) => `${k} = ${fmt(q.value, 6)} ns${q.error ? ` ± ${fmt(q.error, 3)} ns (${q.error_kind})` : ''}  [${q.definition}]`),
+    `Model ${ctx.model}; ${ctx.selection || ''}`, `Quality: ${c.quality.status}, R² ${fmt(c.quality.r2, 4)}, converged ${c.quality.converged}, bound hits ${c.quality.bound_hits}`,
+    `Acquired ${ctx.acquired || 'unknown'} (${ctx.acquired_source}); fitted ${ctx.fitted_at}; scan ${fmt(ctx.scan_ns[0], 5)}–${fmt(ctx.scan_ns[1], 5)} ns, ${ctx.points} points, ${ctx.iterations ?? '?'} iterations`,
+    ctx.rf_frequency_ghz ? `RF ${ctx.rf_frequency_ghz} GHz` : '', ctx.source_sha256 ? `Source SHA-256 ${ctx.source_sha256}` : '', ctx.path || ''].filter(Boolean).join('\n');
+  return h('details', {}, h('summary', {}, 'Rabi calibration'),
+    h('table', { class: 'tbl', style: 'margin-top:6px' }, Object.entries(c.values).map(([k, q]) => h('tr', { title: q.definition },
+      h('td', { class: 'txt' }, k.replace(/_ns$/, '').replace(/_/g, ' ')), h('td', {}, `${fmt(q.value, 5)} ns`), h('td', { class: 'dim' }, q.error ? `± ${fmt(q.error, 2)}${q.error_kind === 'frequency only' ? ' (f only)' : ''}` : '')))),
+    h('div', { class: 'note' }, `Acquired ${ctx.acquired || 'unknown'} (${ctx.acquired_source}) · ${ctx.model} · ${c.quality.status}. Hover a row for its definition; "f only" errors omit the pulse-area terms.`),
+    h('button', { class: 'btn sm', onclick: () => copyText(text(), 'Rabi calibration copied') }, 'Copy calibration'));
 }
 
 // AN08: warnings about weakly determined parameters, always visible; the correlation matrix behind a disclosure.

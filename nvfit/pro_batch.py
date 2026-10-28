@@ -6,10 +6,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import find_peaks
 
@@ -198,6 +194,17 @@ def _format_param_line(name: str, val: float, err: float) -> str:
     return f"  {name} = {val:.4g}{unit_str} ± {err:.2g}"
 
 
+def _pyplot():
+    """matplotlib.pyplot with the non-interactive Agg backend, imported on first use: only batch figure
+    writing needs it, and importing it at module load added ~0.1 s to every app start."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
 def _plot_fit(
     out_path: Path,
     x: np.ndarray,
@@ -212,6 +219,7 @@ def _plot_fit(
     """Create publication-quality fit plot with stats annotation."""
     y = np.asarray(result.extras.get("plot_y", y), float)
     y_label = str(result.extras.get("plot_y_label") or y_label)
+    plt = _pyplot()
     fig, (ax, axr) = plt.subplots(
         2,
         1,
@@ -273,6 +281,7 @@ def _plot_fit(
 
 
 def _plot_scan1d(out_path: Path, x: np.ndarray, y: np.ndarray, title: str, x_label: str, y_label: str, dpi: int = 180):
+    plt = _pyplot()
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(x, y, "o-", ms=3.5, lw=1.2, color="#1976d2")
     ax.set_title(title, fontsize=11, fontweight="bold")
@@ -294,6 +303,7 @@ def _plot_scan2d(
     y_label: str,
     dpi: int = 180,
 ):
+    plt = _pyplot()
     fig, ax = plt.subplots(figsize=(9, 7))
     # Percentile normalization for better contrast
     vmin = np.nanpercentile(z2d, 2)

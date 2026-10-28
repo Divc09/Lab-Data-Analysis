@@ -16,6 +16,7 @@ The findings below are kept as written on October 27. This section records what 
 | 3 (Codex) | `15c50e4` | AN01, F06, F07, F08, F09, F10, F14, F15, F18, F21, F22, F23, F25, F30; Codex review follow-ups (lock scoping, server cleanup, restyle) in `9b39839` |
 | 4 | `9b39839` | F26, F27, F29, F32, F34, UX03, UX05, UX07, UX11, AN02, FE09; follow-ups: map log hover, PDF raster fallback notice, short-trace checks, source refresh identity, CLI parity |
 | 5 | "SmartFitter audit round 5" (Oct 28) | UX06, UX08, UX12, AN03, AN08, FE08, EN08; follow-ups: irregular linecut edges, figure panel letters, watcher transactions |
+| 6 | not yet committed | AN11, EN04; light versions of UX02 and UX13; bug fix: pinned points (and added lines, axis limits, ticks, inset/break ranges) were rescaled toward x = 0 on every redraw when the x axis was shown in converted units |
 
 Decisions that change or close items:
 
@@ -36,13 +37,32 @@ Partly done:
 - **EN01 / EN03 / EN07:** result signatures, versioned sessions and atomic batch manifests exist (round 3); figure/data exports outside Batch still write files directly.
 - **Figure limits (follow-up):** panel letters are unlimited; purging obsolete Plotly panels, versioned asynchronous renders and size/DPI validation remain.
 
-Pending a decision: **UX02, UX13, UX14** (mockups shown on October 28).
+Round 6 details:
+
+- **UX02 / UX13 (light versions, by choice):** the full redesigns in the mockups were declined. Instead the plot toolbar went from three or four rows to two (inapplicable layer chips are hidden; Edit plot and Copy sit at the end of the layer row), and the plot editor keeps its tabs but gained labelled series columns, colour pickers, a simpler Legend tab, the results-box position at the top of Text & results, no duplicated Grid/Box frame controls, and clearer reuse buttons.
+- **AN11:** an explicit ODMR peak count is honoured exactly (the note says when peaks had to be seeded); centre ranges are removable chips (range n constrains peak n); a per-peak table reports centre, FWHM (= 2w), amplitude and local residual RMS with flags; Rabi fits carry a calibration record (π, π/2, programmed values, first peak, delay, each with its definition) with source, acquisition time, checksum, scan range and fit quality, and a Copy button. Multi-peak locks already applied through the ODMRMulti parameter scope.
+- **EN04:** `tools/measure_first_plot.py` times decode, the two load calls and JSON encoding per file. On the 15 fixtures the backend takes at most ~100 ms and the browser shows the first plot in 60–150 ms. Opening a file loads its full payload twice (once only for the header); that is about half the bytes and time and is the first thing to change if larger real files feel slow. No optimization was made, since the measurements did not call for one.
+
+Declined: UX14 (start screen is fine).
 
 Deferred, planned later: **EN09** (legacy Qt support boundary).
 
 Skipped by decision: UX10, AN05, AN06, AN07, FE02, FE03, FE06, FE07, FE10, EN02, EN05, EN06.
 
-Not yet triaged or implemented: AN11 (ODMR/Rabi workflow details), AN12 (physical-interpretation labels), FE05 (time-trace event review), EN04 (measure file-to-first-plot time), EN10 (Windows-only integration and one build identity). Follow-ups still open: result removal semantics, scientific-tool scope (periodogram, step, ratio and drift requests do not take the processing `proc`), spot source provenance for Auto fluorescence, and research-script reproducibility.
+Declined as not useful enough: AN12 (physical-interpretation labels), FE05 (time-trace event review), EN10 (Windows-only integration and one build identity).
+
+Speed round (after round 6, not yet committed), measured on real lab files (2 MB and 1.4 MB dual-detector maps) in the running app; the desktop window and the browser serve the same code:
+
+| Action | Before | After |
+|---|---|---|
+| Open 1.4 MB dual-detector map | 2.4 s | 0.23 s |
+| Open 2 MB map | 1.3 s | 0.21 s |
+| Switch Contrast/Signal on a large map | 1.6 s | 0.08–0.12 s |
+| Change binning on a large map | 0.83 s | 0.12 s |
+| Toggle a layer on a large map | 0.09 s | 0.03 s |
+| Server import (start-up) | 0.73 s | 0.54 s |
+
+Changes: `clean()` no longer re-walks every value at each nesting level (arrays become a pre-cleaned list type built with NumPy); opening a file fetches only its header (`load_info`) instead of the full payload twice; parsed .mat contents are shared between observables of one file version; the per-cell readers in `io_mat` read each cell once and use NumPy for the rest (identical results on 228 loads of fixtures and real files, and 3.0 s → 1.1 s for that set); map views and their percentile limits are cached per loaded map; static files revalidate with ETags instead of re-downloading Plotly (4.7 MB) on every start; matplotlib loads only when a batch writes figures. Redraws record `sf:library`, `sf:view` and `sf:chrome` performance measures for DevTools. Follow-ups still open: result removal semantics, scientific-tool scope (periodogram, step, ratio and drift requests do not take the processing `proc`), spot source provenance for Auto fluorescence, and research-script reproducibility.
 
 ## 1. Main conclusions
 

@@ -7,6 +7,15 @@ import { currentFigure, plotDiv, kindOf } from './analyze.js';
 import { seriesOptions, filePresentation, updateFilePresentation, comparisonFiles } from './seriescontrol.js';
 import { unitOptions, xDisplay, displayValue } from './unitdisplay.js';
 
+// Colour field: a picker for quick choices beside the text box, which still takes any CSS colour
+// (e.g. a translucent rgba background the picker cannot express).
+function colorInput(value, onCommit) {
+  const hex = /^#[0-9a-f]{6}$/i.test(value || '') ? value : '#ffffff';
+  return h('div', { class: 'row', style: 'gap:4px' },
+    h('input', { type: 'color', value: hex, title: 'Pick a colour', style: 'width:28px;height:26px;padding:0;border:none;background:none', onchange: (e) => onCommit(e.target.value) }),
+    input(value, onCommit, { style: 'flex:1;min-width:0' }));
+}
+
 const DASH = [['solid', '—'], ['dash', '– –'], ['dot', '···'], ['dashdot', '–·']];
 const MARKERS = [['circle', '●'], ['square', '■'], ['diamond', '◆'], ['triangle-up', '▲'], ['x', '✕']];
 
@@ -220,9 +229,9 @@ export function editorPanel(f) {
     h('div', { class: 'etabs', role: 'tablist' }, tabs.map(([k, l]) => h('button', { class: tab === k ? 'on' : '', onclick: () => { S.editor.tab = k; emit('insp'); } }, l))),
     body,
     h('div', { class: 'row wrap', style: 'padding:10px 12px;border-top:1px solid var(--line)' },
-      h('button', { class: 'btn sm', onclick: async () => { S.settings = await call('settings_set', { patch: { plot_style: { ...clone(f.style), shapes: [], inset: undefined, xbreak: undefined, title: '', x: {}, y: {}, y2: {} } } }); toast('Saved as your default style for new files.', 'ok'); } }, 'Save as my default'),
-      h('button', { class: 'btn sm', onclick: () => { commit('reset style'); f.style = clone(S.settings.plot_style || {}); emit(); } }, 'Reset to default'),
-      h('button', { class: 'btn sm', title: 'Apply this presentation to every open file of the same type', onclick: () => applyToType(f) }, 'Apply to same type')));
+      h('button', { class: 'btn sm', onclick: async () => { S.settings = await call('settings_set', { patch: { plot_style: { ...clone(f.style), shapes: [], inset: undefined, xbreak: undefined, title: '', x: {}, y: {}, y2: {} } } }); toast('Saved as your default style for new files.', 'ok'); } }, 'Use as default for new files'),
+      h('button', { class: 'btn sm', title: 'Replace this plot\'s look with your saved default (undo with Ctrl+Z)', onclick: () => { commit('reset style'); f.style = clone(S.settings.plot_style || {}); emit(); } }, 'Reset to my default'),
+      h('button', { class: 'btn sm', title: `Apply this look to every other open ${f.info.type} file`, onclick: () => applyToType(f) }, `Apply to open ${f.info.type} files`)));
 }
 
 // Same semantics as the style tools: only the portable look travels (no titles, limits, annotations, series names or
@@ -277,21 +286,24 @@ function addDecoration(f, kind, ev) {
 function seriesTab(f) {
   const st = baseStyle(f.style);
   const list = seriesList(f);
+  const cols = 'grid-template-columns:26px minmax(0,1fr) 40px 48px auto';
   return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
-    h('div', { class: 'note' }, 'Colour · label · on plot · in legend. Click the colour for line, marker and width options.'),
-    h('div', {}, list.map((s) => {
+    h('div', {},
+      h('div', { class: 'srow srow-head', style: cols }, h('span', {}, ''), h('span', {}, 'Label'), h('span', {}, 'Plot'), h('span', {}, 'Legend'), h('span', {}, 'Order')),
+      list.map((s) => {
       const o = f.style.series?.[s.key] || {};
-      return h('div', { class: 'srow', style: 'grid-template-columns:26px minmax(0,1fr) 22px 22px auto' },
-        h('button', { class: 'swatch', style: `background:${o.color || s.color};width:22px;height:18px`, title: 'Style this series', onclick: (e) => openSeriesEditor(f, s.key, e.clientX - 330, e.clientY) }),
-        input(o.name ?? s.name, (v) => updSeries(f, s.key, { name: v }), { style: 'height:26px' }),
-        h('input', { type: 'checkbox', checked: o.visible !== false, title: 'On plot', onchange: (e) => updSeries(f, s.key, { visible: e.target.checked }) }),
-        h('input', { type: 'checkbox', checked: o.legend !== false, title: 'In legend', onchange: (e) => updSeries(f, s.key, { legend: e.target.checked }) }),
+      return h('div', { class: 'srow', style: cols },
+        h('button', { class: 'swatch', style: `background:${o.color || s.color};width:22px;height:18px`, title: 'Colour, line, marker and width for this series', 'aria-label': `Style ${s.name}`, onclick: (e) => openSeriesEditor(f, s.key, e.clientX - 330, e.clientY) }),
+        input(o.name ?? s.name, (v) => updSeries(f, s.key, { name: v }), { style: 'height:26px', 'aria-label': `Label for ${s.name}` }),
+        h('input', { type: 'checkbox', checked: o.visible !== false, title: 'Draw on the plot', 'aria-label': `Show ${s.name} on plot`, onchange: (e) => updSeries(f, s.key, { visible: e.target.checked }) }),
+        h('input', { type: 'checkbox', checked: o.legend !== false, title: 'List in the legend', 'aria-label': `Show ${s.name} in legend`, onchange: (e) => updSeries(f, s.key, { legend: e.target.checked }) }),
         h('div', { class: 'row', style: 'gap:2px' }, [-1, 1].map((direction) => h('button', { class: 'btn sm', title: direction < 0 ? 'Move up' : 'Move down', onclick: () => {
           const order = list.map((t) => t.key), i = order.indexOf(s.key), j = i + direction;
           if (j < 0 || j >= order.length) return;
           commit('trace order'); [order[i], order[j]] = [order[j], order[i]]; f.style.seriesOrder = order; emit();
         } }, direction < 0 ? '↑' : '↓'))));
-    })),
+    }),
+      h('div', { class: 'note' }, 'Click a colour swatch for line, marker and width options.')),
     field('Colour palette', select([['lab', 'Lab default (blue, orange, teal, magenta)'], ['okabe', 'Colour-blind safe (Okabe–Ito)'], ['gray', 'Grayscale']], st.palette, (v) => { commit('palette'); f.style.palette = v; emit(); })),
     kindOf(f) === '1d' ? field('Uncertainty display', seg([['band', 'Band'], ['bars', 'Error bars']], f.errorMode, (v) => { f.errorMode = v; f.layers.band = true; emit(); })) : null,
     h('div', { class: 'g2' }, field('Default line width', input(st.line, (v) => { commit('line width'); f.style.line = num(v) ?? 1.6; emit(); }, { numeric: true })), field('Default marker size', input(st.marker, (v) => { commit('marker size'); f.style.marker = num(v) ?? 6; emit(); }, { numeric: true }))));
@@ -301,17 +313,25 @@ function legendTab(f) {
   const st = baseStyle(f.style);
   const L = st.legend;
   const set = (patch) => { commit('legend'); f.style.legend = { ...(f.style.legend || {}), ...patch }; emit(); };
+  const custom = L.x != null;
   return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
     check('Show legend', f.layers.legend, (v) => { commit('legend'); f.layers.legend = v; emit(); }),
-    field('Legend title', input(L.title || '', (title) => set({ title }))),
-    h('div', { class: 'g2' }, field('Anchor X (plot fraction)', input(L.x ?? '', (v) => set({ x: num(v), y: L.y ?? 0.99 }), { numeric: true })), field('Anchor Y', input(L.y ?? '', (v) => set({ x: L.x ?? 0.01, y: num(v) }), { numeric: true }))),
-    field('Position', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right'], ['outside', 'Outside'], ['below', 'Below']], L.x != null ? '' : L.pos, (v) => set({ pos: v, x: null, y: null }))),
-    h('div', { class: 'note' }, 'Or drag the legend on the plot; the position is remembered.'),
+    // Common choices first; exact anchors only when needed (dragging the legend on the plot sets them too).
+    field('Position', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right'], ['outside', 'Outside'], ['below', 'Below']], custom ? '' : L.pos, (v) => set({ pos: v, x: null, y: null }))),
     h('div', { class: 'g2' }, field('Columns', input(L.cols || 1, (v) => set({ cols: Math.max(1, num(v) || 1) }), { numeric: true })), field('Font size (px)', input(L.size || '', (v) => set({ size: num(v) }), { numeric: true, placeholder: 'auto' }))),
-    check('Frame', L.frame !== false, (v) => set({ frame: v })),
-    h('div', { class: 'g3' }, field('Text colour', input(L.color || '#1D2330', (color) => set({ color }))), field('Background (CSS colour)', input(L.bg || 'rgba(255,255,255,0.92)', (bg) => set({ bg }))), field('Border colour', input(L.edge || '#D9DDE4', (edge) => set({ edge })))),
-    field('Border width (px)', input(L.borderwidth ?? 1, (v) => set({ borderwidth: Math.max(0, num(v) ?? 1) }), { numeric: true })),
-    h('div', { class: 'note' }, 'Edit each file’s result parameters, template, precision and units in Series → Style & legend. Double-click legend text to rename in place; Alt-click opens full trace styling.'));
+    field('Legend title', input(L.title || '', (title) => set({ title }), { placeholder: 'none' })),
+    h('details', { open: custom || !!f.display.editorDetails?.legendBox, ontoggle: (e) => { f.display.editorDetails ||= {}; f.display.editorDetails.legendBox = e.target.open; } },
+      h('summary', {}, custom ? 'Box and exact position (custom position set)' : 'Box and exact position'),
+      h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
+        h('div', { class: 'row wrap' }, check('Frame', L.frame !== false, (v) => set({ frame: v })),
+          field('Border width (px)', input(L.borderwidth ?? 1, (v) => set({ borderwidth: Math.max(0, num(v) ?? 1) }), { numeric: true, style: 'width:60px' }))),
+        field('Text colour', colorInput(L.color || '#1D2330', (color) => set({ color }))),
+        field('Background', colorInput(L.bg || 'rgba(255,255,255,0.92)', (bg) => set({ bg }))),
+        field('Border colour', colorInput(L.edge || '#D9DDE4', (edge) => set({ edge }))),
+        h('div', { class: 'g2' }, field('Anchor x (0–1 of plot)', input(L.x ?? '', (v) => set({ x: num(v), y: L.y ?? 0.99 }), { numeric: true, placeholder: 'preset' })),
+          field('Anchor y (0–1 of plot)', input(L.y ?? '', (v) => set({ x: L.x ?? 0.01, y: num(v) }), { numeric: true, placeholder: 'preset' }))),
+        h('div', { class: 'note' }, 'Dragging the legend on the plot sets the anchor; choosing a Position above clears it.'))),
+    h('div', { class: 'note' }, 'Double-click legend text on the plot to rename it; Alt-click opens full trace styling. Per-file result values, precision and units are in Series → Style & legend.'));
 }
 
 export function parseTickTable(text) {
@@ -388,7 +408,9 @@ function textTab(f) {
   const fallback = new Map(all.map((l, i) => [l.key, i]));
   const rank = (l) => order.includes(l.key) ? order.indexOf(l.key) : order.length + fallback.get(l.key);
   all.sort((a, b) => rank(a) - rank(b));
-  out.append(check('Show results box on the plot', f.layers.results, (v) => { commit('results visibility'); f.layers.results = v; emit(); }));
+  out.append(check('Show results box on the plot', f.layers.results, (v) => { commit('results visibility'); f.layers.results = v; emit(); }),
+    h('div', { class: 'g2' }, field('Box position', select([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right']], cfg.pos, (v) => { commit('results position'); f.style.results = { ...(f.style.results || {}), pos: v, x: null, y: null }; emit(); })),
+      field('Number format', select([['pm', 'Value ± error'], ['sig4', '4 significant']], cfg.format, (v) => { commit('format'); f.style.results = { ...(f.style.results || {}), format: v }; emit(); }))));
   if (all.length) out.append(h('div', { class: 'card', style: 'padding:4px 10px' }, all.map((l, i) => {
     const line = cfg.lines?.[l.key] || {};
     const move = (direction) => { const keys = all.map((r) => r.key), j = i + direction; if (j < 0 || j >= keys.length) return; [keys[i], keys[j]] = [keys[j], keys[i]]; setCfg({ order: keys }); };
@@ -405,11 +427,14 @@ function textTab(f) {
   })));
   else out.append(h('div', { class: 'note' }, 'Fit values appear here after a fit; custom static rows work without fitting.'));
   out.append(h('button', { class: 'btn sm', onclick: () => setCfg({ static: [...(cfg.static || []), { key: `static:${Date.now()}`, label: 'Custom row', text: 'Note' }] }) }, 'Add static annotation row'),
-    h('div', { class: 'g2' }, field('Box font size (px)', input(cfg.size || '', (v) => setCfg({ size: num(v) }), { numeric: true })), field('Alignment', select(['left', 'center', 'right'], cfg.align || 'left', (align) => setCfg({ align })))),
-    h('div', { class: 'g3' }, field('Text colour', input(cfg.color || '#1D2330', (color) => setCfg({ color }))), field('Background', input(cfg.bg || 'rgba(255,255,255,0.92)', (bg) => setCfg({ bg }))), field('Border', input(cfg.edge || '#D9DDE4', (edge) => setCfg({ edge })))),
-    h('div', { class: 'g2' }, field('Padding (px)', input(cfg.padding ?? 6, (v) => setCfg({ padding: num(v) ?? 6 }), { numeric: true })), check('Frame', cfg.frame !== false, (frame) => setCfg({ frame }))));
-  out.append(h('div', { class: 'g2' }, field('Number format', select([['pm', 'Value ± error'], ['sig4', '4 significant']], cfg.format, (v) => { commit('format'); f.style.results = { ...(f.style.results || {}), format: v }; emit(); })),
-    field('Box position', select([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right']], cfg.pos, (v) => { commit('results position'); f.style.results = { ...(f.style.results || {}), pos: v, x: null, y: null }; emit(); }))));
+    h('details', { open: !!f.display.editorDetails?.resultsBox, ontoggle: (e) => { f.display.editorDetails ||= {}; f.display.editorDetails.resultsBox = e.target.open; } },
+      h('summary', {}, 'Box appearance'),
+      h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
+        h('div', { class: 'g2' }, field('Font size (px)', input(cfg.size || '', (v) => setCfg({ size: num(v) }), { numeric: true, placeholder: 'auto' })), field('Alignment', select(['left', 'center', 'right'], cfg.align || 'left', (align) => setCfg({ align })))),
+        field('Text colour', colorInput(cfg.color || '#1D2330', (color) => setCfg({ color }))),
+        field('Background', colorInput(cfg.bg || 'rgba(255,255,255,0.92)', (bg) => setCfg({ bg }))),
+        field('Border colour', colorInput(cfg.edge || '#D9DDE4', (edge) => setCfg({ edge }))),
+        h('div', { class: 'g2' }, field('Padding (px)', input(cfg.padding ?? 6, (v) => setCfg({ padding: num(v) ?? 6 }), { numeric: true })), check('Frame', cfg.frame !== false, (frame) => setCfg({ frame }))))));
   out.append(h('span', { class: 'lbl', style: 'margin-top:6px' }, 'Added items'));
   const shapes = f.style.shapes || [];
   if (!shapes.length) out.append(h('div', { class: 'note' }, 'Use Add above for text, arrows, reference lines, shaded regions and fit-value lines.'));
@@ -436,8 +461,8 @@ function styleTab(f) {
       field('Font', select(['Arial', 'Helvetica', 'Times New Roman', 'Calibri', 'Segoe UI', 'Courier New'], st.font, (v) => set({ font: v }))), field('Base size (px)', input(st.base, (v) => set({ base: num(v) || 14 }), { numeric: true }))),
     field('DPI', input(st.dpi, (v) => set({ dpi: num(v) || 300 }), { numeric: true })),
     field('Background', seg([['white', 'White'], ['transparent', 'Transparent']], st.bg, (v) => set({ bg: v }))),
-    h('div', { class: 'row wrap' }, check('Grid', st.grid, (v) => set({ grid: v })), check('Box frame', st.mirror, (v) => set({ mirror: v })),
-      kindOf(f) === '1d' ? check('Residual panel', f.layers.res, (v) => { f.layers.res = v; emit(); }) : null),
+    kindOf(f) === '1d' ? check('Residual panel', f.layers.res, (v) => { f.layers.res = v; emit(); }) : null,
+    h('div', { class: 'note' }, 'Grid, box frame (mirrored ticks) and tick direction are in Axes & ticks.'),
     h('span', { class: 'lbl' }, 'Reuse this look'), styleTools(f),
-    h('div', { class: 'note' }, 'Edits apply to this file. Copy/paste, templates and "Apply to same type" carry only the look (fonts, sizes, palette, grid, ticks, legend/results layout, axis formatting), never titles, limits or annotations.'));
+    h('div', { class: 'note' }, 'Edits apply to this file. Copy/paste, templates and the "same type" and default buttons carry only the look (fonts, sizes, palette, grid, ticks, legend/results layout, axis formatting), never titles, limits or annotations.'));
 }
