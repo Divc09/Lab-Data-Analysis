@@ -8,8 +8,6 @@ __pycache__/
 htmlcov/
 test-results/
 tests/*
-!tests/test_time_trace_support.py
-!tests/test_map_comparison.py
 TestData/
 
 # Local agent/editor state
