@@ -89,6 +89,14 @@ function renderInspectorOnly() {
 // Shared list for the Start-screen card and the "?" overlay.
 const SHORTCUTS = [['Open files', 'Ctrl O'], ['Add files', 'Ctrl Shift O'], ['Search files / commands', 'Ctrl K'], ['Command palette', 'Ctrl Shift P'], ['Run fit · robust fit', 'Ctrl F · Ctrl Shift F'], ['Save/export workspace · save session', 'Ctrl S · Ctrl Shift S'],
   ['Open session', 'Ctrl Alt O'], ['Undo · redo', 'Ctrl Z · Ctrl Y'], ['Copy workspace figure/table', 'Ctrl Shift C'], ['Reset plot view', 'Ctrl Home'], ['Inspector tabs', 'Alt 1–7'], ['Next · previous library file', 'Alt Down · Alt Up'], ['Clear selection / search', 'Esc'], ['This shortcut list', '?']];
+// Mouse and modifier gestures with no visible button; listed so they can be discovered.
+const MOUSE_TIPS = [['Compare a file on the plot', 'Drag it from the Library onto the plot'], ['Select several Library files', 'Ctrl/Shift-click'],
+  ['File menu (Compare set, baseline, show in folder)', 'Right-click a Library file'], ['Library: open · parent folder', 'Enter · Backspace'], ['Plot menu (edit, copy, cuts, exclude pins)', 'Right-click the plot'],
+  ['Pin a data point · pin several', 'Click · Ctrl/Shift-click'], ['Zoom · reset zoom', 'Scroll wheel · double-click empty plot'], ['Hide/show a series', 'Click its legend entry'],
+  ['Series colour, line and marker', 'Alt-click its legend entry'], ['Rename a title, axis or legend label', 'Double-click it'], ['Move legend, results box or annotation', 'Drag it'],
+  ['± SEM / Smoothed / Iterations on the main file only', 'Alt-click the chip'], ['Reorder compared files', 'Drag ⋮⋮ in the Series panel'], ['Reorder figure panels', 'Drag a panel row'],
+  ['Select several spots (2D)', 'Ctrl/Shift-click rows'], ['Reset a side panel’s width', 'Double-click its edge']];
+const tipRows = (rows) => rows.flatMap(([a, b]) => [h('span', { class: 'k' }, a), h('span', { class: 'dim' }, b)]);
 
 function currentWorkspaceActions() {
   const view = S.view;
@@ -631,6 +639,8 @@ function renderHome(main) {
       h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: async () => { const p = 'D:\\BacklundLabResearch\\Code\\Backlund-Lab-Code-Base\\Saved Data'; await openFolder(p).then(() => { S.library.watching = true; S.view = 'analyze'; emit(); }).catch(() => {}); } }, 'Watch Saved Data'), h('button', { class: 'btn', onclick: async () => { await chooseFolder(); S.library.watching = true; S.view = 'analyze'; emit(); } }, 'Choose folder'))),
     h('section', { class: 'card', style: 'padding:14px 18px;display:flex;flex-direction:column;gap:10px' }, h('div', { class: 'lbl' }, 'Keyboard shortcuts'),
       h('div', { class: 'kv' }, SHORTCUTS.flatMap(([a, b]) => [h('span', { class: 'k' }, a), h('span', {}, h('span', { class: 'kbd' }, b))]))),
+    h('section', { class: 'card', style: 'padding:14px 18px;display:flex;flex-direction:column;gap:10px' }, h('div', { class: 'lbl' }, 'Mouse and modifier tricks'),
+      h('div', { class: 'kv' }, tipRows(MOUSE_TIPS))),
   ));
   mount(els.insp);
 }
@@ -697,7 +707,10 @@ function openShortcuts() {
   modal(h('div', { style: 'padding:18px 20px;display:flex;flex-direction:column;gap:14px' },
     h('div', { class: 'row', style: 'justify-content:space-between' }, h('div', { class: 'lbl' }, 'Keyboard shortcuts'), h('span', { class: 'dim', style: 'font-size:11px' }, 'Esc to close')),
     h('div', { style: 'display:grid;grid-template-columns:1fr 1fr;gap:10px 28px' },
-      cols.map((col) => h('div', { class: 'kv' }, col.flatMap(([a, b]) => [h('span', { class: 'k' }, a), h('span', {}, h('span', { class: 'kbd' }, b))]))))),
+      cols.map((col) => h('div', { class: 'kv' }, col.flatMap(([a, b]) => [h('span', { class: 'k' }, a), h('span', {}, h('span', { class: 'kbd' }, b))])))),
+    h('div', { class: 'lbl' }, 'Mouse and modifier tricks'),
+    h('div', { style: 'display:grid;grid-template-columns:1fr 1fr;gap:10px 28px' },
+      [MOUSE_TIPS.slice(0, Math.ceil(MOUSE_TIPS.length / 2)), MOUSE_TIPS.slice(Math.ceil(MOUSE_TIPS.length / 2))].map((col) => h('div', { class: 'kv' }, tipRows(col))))),
     { className: 'shortcuts' });
 }
 
