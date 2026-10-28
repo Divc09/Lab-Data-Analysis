@@ -339,3 +339,14 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* Unsaved-work marker beside the app name. */
 .dirty-dot { color: var(--warn); font-size: 10px; margin-left: 4px; }
+
+/* Library row status chips and checkpoints listed under their final run. */
+.chips-s { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.chip-s { font-size: 10px; line-height: 15px; padding: 0 6px; border-radius: 8px; background: #20252E; color: var(--text3); white-space: nowrap; }
+.chip-s.ok { background: var(--okBg); color: var(--ok); } .chip-s.warn { background: var(--warnBg); color: var(--warn); }
+.chip-s.bad { background: var(--badBg); color: var(--bad); }
+.frow.cp-child { margin-left: 18px; border-left: 1px solid var(--line2); opacity: .85; }
+
+/* Always-visible identity of the shown result, above the inspector tabs. */
+.result-head { padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; font-size: 12px; min-width: 0; }
+.pill.STALE { background: var(--warnBg); color: var(--warn); }

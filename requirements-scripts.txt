@@ -1,0 +1,5 @@
+# Research scripts under scripts/ that need more than the runtime.
+# scripts/build_429_tdd_deck.py imports pptx. It is not installed in the reference environment,
+# so no version has been validated; pin one here once the deck script has been run with it.
+-r requirements.txt
+python-pptx

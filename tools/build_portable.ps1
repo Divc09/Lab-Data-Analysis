@@ -6,7 +6,8 @@ Set-Location $root
 $py = Join-Path $root '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { throw "Missing $py - create the venv first." }
 
-& $py -m pip install --quiet pyinstaller
+# Pinned with the runtime in requirements-dev.txt, so a rebuild uses the same PyInstaller and libraries.
+& $py -m pip install --quiet -r requirements-dev.txt
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $version = (& $py -c "from smartfitter import core; print(core.APP_VERSION)").Trim()

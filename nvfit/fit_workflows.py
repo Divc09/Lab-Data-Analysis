@@ -206,6 +206,22 @@ def _spin_echo_seed_and_bounds(exp_type: str, tspan: float) -> tuple[list[float]
     return lower, upper, seed0
 
 
+def model_candidate_summary(result: FitResult, role: str = "", chosen: bool = False) -> dict[str, object]:
+    """One row of an Auto model comparison: the scores the selection rules look at."""
+    nfree = int(sum(result.free_mask)) if result.free_mask is not None else len(result.params)
+    return {
+        "model": result.model_name,
+        "role": role,
+        "r2": float(result.r2),
+        "bic": float(result.bic),
+        "rmse": float(result.rmse),
+        "free_params": nfree,
+        "bound_hits": int(sum(result.bound_hits)),
+        "converged": bool(result.success),
+        "chosen": bool(chosen),
+    }
+
+
 def _with_selection(result: FitResult, note: str, extras: dict[str, object] | None = None) -> FitResult:
     result.selection_note = note
     if extras:
@@ -1440,21 +1456,26 @@ def _fit_non_ramsey_impl(
             return _semantic_result(
                 _attach_rabi_envelope(_with_selection(phase_ramp, "selected phase-ramp Rabi model"), x, y)
             )
-        return _semantic_result(
-            _attach_rabi_envelope(
-                _choose_rabi_model(
-                    x=x,
-                    y=y,
-                    phase_ramp=phase_ramp,
-                    constant=constant,
-                    chirped=chirped,
-                    adaptive=adaptive,
-                    long_damped=long_damped,
-                ),
-                x,
-                y,
-            )
+        chosen = _choose_rabi_model(
+            x=x,
+            y=y,
+            phase_ramp=phase_ramp,
+            constant=constant,
+            chirped=chirped,
+            adaptive=adaptive,
+            long_damped=long_damped,
         )
+        # Keep the whole comparison so the UI can show why Auto chose this model.
+        considered = {"phase-ramp": phase_ramp, "constant": constant, "chirped": chirped, "adaptive": adaptive}
+        if bool(features["is_long_decayed"]):
+            considered["long damped"] = long_damped
+        chosen.extras["model_candidates"] = [
+            model_candidate_summary(fit, role, chosen=fit is chosen)
+            if fit is not None
+            else {"model": role, "skipped": "the data cannot identify this model's parameters"}
+            for role, fit in considered.items()
+        ]
+        return _semantic_result(_attach_rabi_envelope(chosen, x, y))
 
     if exp_type == "T1":
         return _semantic_result(_fit_t1(x, y, cfg, trace=trace, locks=locks, weights=w_sem))

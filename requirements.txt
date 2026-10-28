@@ -1,12 +1,15 @@
-numpy
-scipy
-matplotlib
-h5py
-PySide6
-qtawesome
-pytest
-plotly
-pywebview
-pillow
-svglib
-reportlab
+# SmartFitter runtime dependencies, pinned to the known-good reference environment
+# (Windows 11, Python 3.14.5, recorded 2026-10-28). Change a pin deliberately, then rerun the test suites.
+# plotly is needed at runtime: the web UI serves plotly.min.js from this package.
+numpy==2.4.2
+scipy==1.16.3
+matplotlib==3.10.8
+h5py==3.15.1
+plotly==7.1.0
+pywebview==6.2.1
+pillow==12.1.0
+svglib==2.3.0
+reportlab==5.0.1
+# Legacy Qt interface (nvfit.gui_app)
+PySide6==6.10.2
+QtAwesome==1.4.2

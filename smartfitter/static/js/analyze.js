@@ -804,8 +804,52 @@ export function renderInspector(f, insp) {
   const pane = builders[f.tab](f);
   if (f.tab === 'stats') pane.append(sci.ttSciCard(f));
   body.append(pane);
-  mount(insp, h('div', { class: 'tabs', role: 'tablist' }, tabs.map(([t, l]) => h('button', { class: f.tab === t ? 'on' : '', role: 'tab', onclick: () => { f.tab = t; emit('insp'); } }, l))), body);
+  const keep = previous && previous.dataset.path === f.path && previous.dataset.tab === f.tab ? redrawState(previous) : null;
+  mount(insp, resultHeader(f), h('div', { class: 'tabs', role: 'tablist' }, tabs.map(([t, l]) => h('button', { class: f.tab === t ? 'on' : '', role: 'tab', onclick: () => { f.tab = t; emit('insp'); } }, l))), body);
   body.scrollTop = inspectorScroll.get(f)?.[f.tab] || 0;
+  if (keep) restoreRedrawState(body, keep);
+}
+
+// UX08: a redraw rebuilds the inspector; carry over which sections were open and which field had focus
+// (located by its position among the pane's fields) so a background load or fit does not interrupt editing.
+const FIELDS = 'input, select, textarea, button';
+function redrawState(body) {
+  const fields = [...body.querySelectorAll(FIELDS)], active = document.activeElement;
+  const i = active && body.contains(active) ? fields.indexOf(active) : -1;
+  return {
+    open: new Set([...body.querySelectorAll('details[open] > summary')].map((s) => s.textContent)),
+    closed: new Set([...body.querySelectorAll('details:not([open]) > summary')].map((s) => s.textContent)),
+    focus: i >= 0 ? { i, count: fields.length, tag: active.tagName, value: active.value, start: active.selectionStart, end: active.selectionEnd } : null,
+  };
+}
+function restoreRedrawState(body, keep) {
+  body.querySelectorAll('details > summary').forEach((s) => {
+    if (keep.open.has(s.textContent)) s.parentElement.open = true;
+    else if (keep.closed.has(s.textContent)) s.parentElement.open = false;
+  });
+  const fields = [...body.querySelectorAll(FIELDS)], el = keep.focus && fields.length === keep.focus.count ? fields[keep.focus.i] : null;
+  if (!el || el.tagName !== keep.focus.tag) return;
+  el.focus({ preventScroll: true });
+  // An uncommitted edit in a text field survives the redraw instead of snapping back to the stored value.
+  if (el.tagName === 'INPUT' && el.value !== keep.focus.value && /^(text|search|)$/.test(el.type)) el.value = keep.focus.value;
+  try { if (keep.focus.start != null) el.setSelectionRange(keep.focus.start, keep.focus.end); } catch { /* not a text input */ }
+}
+
+// UX06: what the shown result belongs to, always visible above the tabs.
+function resultHeader(f) {
+  const fit = f.fit?.[f.detector];
+  const p = f.proc || {};
+  const proc = [p.bin > 1 ? `bin ${p.bin}` : '', p.roi_min != null || p.roi_max != null ? 'ROI' : '', p.excluded?.length ? `${p.excluded.length} excluded` : '',
+    p.steps?.length ? `${p.steps.length} transform${p.steps.length > 1 ? 's' : ''}` : '', p.iterations ? 'iteration subset' : ''].filter(Boolean);
+  const identity = [detLabel(f, f.detector), MODE_LABEL[f.mode] || f.mode, proc.length ? proc.join(', ') : 'unprocessed'].join(' · ');
+  if (!fit) return h('div', { class: 'result-head', role: 'status' }, h('div', { class: 'ellip', title: f.path }, h('b', {}, f.info?.name || f.path)), h('div', { class: 'dim ellip' }, `${identity} · not fitted`));
+  const status = f.fitStale ? 'STALE' : fit.status;
+  const key = (fit.params || []).filter((q) => /^(T1|T2|T2_star|T|tau|tau_s|f0|freq|center_1|x0|pi_time)/.test(q.name)).slice(0, 2)
+    .map((q) => { const d = displayValue(q.value, q.error, parameterUnit(q, f.info), filePresentation(f, f)); return `${q.name} ${d.text}${d.unit && d.unit !== '-' ? ` ${d.unit}` : ''}`; });
+  return h('div', { class: 'result-head', role: 'status', 'aria-label': 'Shown result' },
+    h('div', { class: 'row', style: 'gap:6px' }, h('b', { class: 'ellip', style: 'flex:1', title: f.path }, f.info.name), h('span', { class: `pill ${status}`, title: f.fitStale ? 'Processing or fit settings changed since this fit; refit to update it' : fit.reason || '' }, status)),
+    h('div', { class: 'dim ellip', title: identity }, `${identity} · ${fit.model}`),
+    key.length ? h('div', { class: 'mono ellip' }, `${key.join(' · ')} · R² ${fmt(fit.r2, 4)}`) : h('div', { class: 'mono' }, `R² ${fmt(fit.r2, 4)}`));
 }
 
 function t1DisplayControl(f) {
@@ -995,7 +1039,8 @@ function resultCard(f, fit) {
       h('span', { class: 'k' }, 'Bound hits'), h('span', { class: 'v' }, String(fit.bound_hits)), sci.chi2Rows(fit)),
     sci.chi2Note(fit),
     fit.status !== 'PASS' ? h('div', { class: 'note', style: 'color:var(--warn)' }, fit.reason) : null,
-    fit.candidates ? h('div', { class: 'note' }, 'Candidates: ' + fit.candidates.map((c) => `${c.model} R² ${fmt(c.r2, 3)}`).join(' · ')) : null,
+    identifiabilityCard(fit),
+    modelSelectionCard(fit),
     h('details', {}, h('summary', {}, 'All derived values'), h('div', { class: 'kv', style: 'margin-top:6px' }, Object.entries(fit.metrics || {}).flatMap(([k, v]) => [h('span', { class: 'k' }, k), h('span', { class: 'v' }, typeof v === 'number' ? fmt(v, 6) : String(v))])),
       h('pre', { class: 'note', style: 'white-space:pre-wrap;font-family:var(--mono);font-size:11px' }, fit.message)),
     h('div', { class: 'row' }, h('button', { class: 'btn', style: 'flex:1;justify-content:center', onclick: () => copyText(slidesTable(f, fit), 'Results copied as a table for slides') }, 'Copy for slides'),
@@ -1015,6 +1060,37 @@ function notebookText(f, fit) {
   if (f.fitSpec.range_min !== null || f.fitSpec.range_max !== null) lines.push(`  fit range ${f.fitSpec.range_min ?? 'start'} to ${f.fitSpec.range_max ?? 'end'} ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'} (native)`);
   lines.push(`  ${f.path}`);
   return lines.join('\n');
+}
+
+// AN08: warnings about weakly determined parameters, always visible; the correlation matrix behind a disclosure.
+function identifiabilityCard(fit) {
+  const id = fit.identifiability;
+  if (!id || (!id.warnings?.length && !id.correlation)) return null;
+  const c = id.correlation;
+  const cell = (r) => h('td', { style: `color:${Math.abs(r) >= 0.95 ? 'var(--warn)' : Math.abs(r) >= 0.8 ? 'var(--text)' : 'var(--text3)'}` }, fmt(r, 2));
+  return h('div', {},
+    ...(id.warnings || []).map((w) => h('div', { class: 'note', style: 'color:var(--warn)' }, `⚠ ${w}`)),
+    c ? h('details', {}, h('summary', {}, 'Parameter correlations'),
+      h('table', { class: 'tbl', style: 'margin-top:6px' }, h('tr', {}, h('th', {}, ''), c.names.map((n) => h('th', {}, n))),
+        c.names.map((n, i) => h('tr', {}, h('td', { class: 'txt' }, n), c.matrix[i].map((r, j) => (j === i ? h('td', { class: 'dim' }, '1') : cell(r)))))),
+      h('div', { class: 'note' }, 'From the fit covariance (a linear approximation, like the ± errors). |r| ≥ 0.95 means the data pin down a combination of the two parameters better than either alone.')) : null);
+}
+
+// AN03: every model Auto compared, with the scores its selection rules use.
+function modelSelectionCard(fit) {
+  const rows = fit.candidates;
+  if (!rows?.length) return null;
+  const fitted = rows.filter((r) => !r.skipped && Number.isFinite(r.bic));
+  const best = fitted.length ? Math.min(...fitted.map((r) => r.bic)) : NaN;
+  return h('details', { open: false }, h('summary', {}, `Model selection · ${rows.length} candidates`),
+    h('div', { class: 'note', style: 'margin:6px 0' }, `Rule: ${fit.selection || 'see model notes'}`),
+    h('table', { class: 'tbl' }, h('tr', {}, ['', 'Model', 'R²', 'ΔBIC', 'Params', 'Bound hits', 'Converged'].map((t) => h('th', {}, t))),
+      rows.map((r) => r.skipped
+        ? h('tr', { class: 'dim' }, h('td', {}, ''), h('td', { class: 'txt' }, r.role || r.model), h('td', { colspan: 5, class: 'txt' }, `skipped: ${r.skipped}`))
+        : h('tr', {}, h('td', {}, r.chosen ? '✓' : ''), h('td', { class: 'txt', title: r.model }, r.role ? `${r.role} (${r.model})` : r.model),
+          h('td', {}, fmt(r.r2, 4)), h('td', {}, Number.isFinite(r.bic) && Number.isFinite(best) ? fmt(r.bic - best, 3) : '–'),
+          h('td', {}, r.free_params ?? '–'), h('td', {}, String(r.bound_hits ?? '–')), h('td', {}, r.converged === false ? 'no' : 'yes')))),
+    h('div', { class: 'note' }, 'ΔBIC compares models on the same data (lower is better; above ~10 is strong evidence against). Auto can prefer a lower-R² model for a physical or complexity reason stated in the rule.'));
 }
 
 function paramCard(f, fit) {

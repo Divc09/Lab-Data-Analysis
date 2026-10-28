@@ -255,6 +255,10 @@ export function renderCompare(root) {
   drawOverlay(set);
   drawTrend(pts, reg);
   if(incompatibleTrend.length) alignNoteEl.textContent += ` · Trend units incompatible: ${incompatibleTrend.join(', ')}`;
+  // A checkpoint holds its final run's first iterations: both in one trend would count that run twice.
+  const family = (p) => basename(itemPath(p)).replace(/\.mat$/i, '').replace(/__?checkpoint\d*$/i, '').toLowerCase();
+  const sameRun = pts.filter((q, i) => pts.some((o, j) => j !== i && family(o.p) === family(q.p) && itemPath(o.p) !== itemPath(q.p)));
+  if (sameRun.length) alignNoteEl.textContent += ` · Same run twice (checkpoint and final): ${[...new Set(sameRun.map((q) => basename(itemPath(q.p))))].join(', ')}`;
 }
 
 function globalCard() {

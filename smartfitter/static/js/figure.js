@@ -73,7 +73,9 @@ function cells(g) {
   return S.figure.panels.map((p, i) => ({ p, x: pad + (i % g.cols) * (cw + pad), y: pad + Math.floor(i / g.cols) * (ch + pad), w: cw, h: ch }));
 }
 
-const label = (i) => ({ a: 'abcdefghij'[i], '(a)': `(${'abcdefghij'[i]})`, A: 'ABCDEFGHIJ'[i], off: '' })[S.figure.labels] || '';
+// Panel letters a..z, then aa, ab, ... (no limit on panel count).
+const letters = (i) => (i < 26 ? String.fromCharCode(97 + i) : letters(Math.floor(i / 26) - 1) + String.fromCharCode(97 + (i % 26)));
+const label = (i) => ({ a: letters(i), '(a)': `(${letters(i)})`, A: letters(i).toUpperCase(), off: '' })[S.figure.labels] || '';
 
 export function renderFigure(root) {
   const F = S.figure;

@@ -90,6 +90,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+The pins in `requirements.txt` are the tested environment (Windows 11, Python 3.14.5). For running the tests or building the portable app, install `requirements-dev.txt` instead; for the research scripts under `scripts/`, `requirements-scripts.txt`.
+
 macOS or Linux:
 
 ```bash

@@ -12,6 +12,7 @@ from .fit_workflows import (
     FitWorkflowConfig,
     aligned_sem,
     fit_non_ramsey,
+    model_candidate_summary,
     _prepare_t1_series,
     _rabi_fit_weights,
     parameter_control_model,
@@ -103,10 +104,7 @@ class PreparedFit:
                 model=self.ramsey_model,
                 parameter_model=self.config.parameter_model,
             )
-            candidates = [
-                {"model": c.model_name, "r2": c.r2, "bic": c.bic, "bound_hits": sum(c.bound_hits)}
-                for c in sel.candidates
-            ]
+            candidates = [model_candidate_summary(c, chosen=c is sel.best) for c in sel.candidates]
             sel.best.extras.update(ramsey_candidates=candidates, ramsey_selected_by=sel.selected_by)
             return sel.best, candidates
         result = fit_non_ramsey(

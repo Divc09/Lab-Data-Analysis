@@ -1,0 +1,4 @@
+# Tests and the portable build, on top of the runtime pins.
+-r requirements.txt
+pytest==9.0.2
+pyinstaller==6.22.3

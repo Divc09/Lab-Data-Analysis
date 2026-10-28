@@ -218,10 +218,13 @@ export function cutSources(f) {
   return [...f.info.detectors.map((det) => ({ path: f.path, det })), ...(other ? [other] : [])];
 }
 
-// Measured extent of an axis: cell centres +/- half the neighbouring spacing at each edge.
+// Measured extent of an axis: the outer cell edges, each half of that end cell's own spacing beyond its centre
+// (cell edges sit midway between neighbouring centres), so uneven grids are not given an average-width edge.
 export function axisExtent(a) {
-  const [lo, hi] = finiteExtent(a), hw = a.length > 1 ? (hi - lo) / (a.length - 1) / 2 : 0;
-  return [lo - hw, hi + hw];
+  const v = a.filter(Number.isFinite).sort((p, q) => p - q);
+  if (!v.length) return [NaN, NaN];
+  if (v.length === 1) return [v[0], v[0]];
+  return [v[0] - (v[1] - v[0]) / 2, v[v.length - 1] + (v[v.length - 1] - v[v.length - 2]) / 2];
 }
 const inside = (a, v) => { const [lo, hi] = axisExtent(a); return v >= lo && v <= hi; };
 

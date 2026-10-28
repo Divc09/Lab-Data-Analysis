@@ -5,6 +5,45 @@
 **Baseline:** branch `main`, commit `45c76712c1b57d8e9a807b7f2c018554211e1bd6`, including the existing local edits.  
 **Deliverable:** findings and recommendations only. No application, test, configuration, or existing documentation files were edited for this audit.
 
+## 0. Implementation status (updated October 28, 2026)
+
+The findings below are kept as written on October 27. This section records what has since been done, decided, or left open. "Verified" means focused synthetic regression tests (kept locally; tests are deliberately not tracked in Git) plus, where noted, checks in the running app or on the `TestData/NewCodebaseTests` fixtures. None of this is bench or physical validation.
+
+| Round | Commit | Items |
+|---|---|---|
+| 1 | `dd66a94` | F01, F02, F03, F04, F05, F11, F12, F13, F17, F20 |
+| 2 (Codex) | `15c50e4` | F16, F19, F24, F28, F33, UX01, UX04 |
+| 3 (Codex) | `15c50e4` | AN01, F06, F07, F08, F09, F10, F14, F15, F18, F21, F22, F23, F25, F30; Codex review follow-ups (lock scoping, server cleanup, restyle) in `9b39839` |
+| 4 | `9b39839` | F26, F27, F29, F32, F34, UX03, UX05, UX07, UX11, AN02, FE09; follow-ups: map log hover, PDF raster fallback notice, short-trace checks, source refresh identity, CLI parity |
+| 5 | "SmartFitter audit round 5" (Oct 28) | UX06, UX08, UX12, AN03, AN08, FE08, EN08; follow-ups: irregular linecut edges, figure panel letters, watcher transactions |
+
+Decisions that change or close items:
+
+- **F31:** tests stay local and untracked by choice (`tests/*` is ignored). The portable-test half of F31 is closed by that decision; a documented verification command remains useful.
+- **F32:** Auto fits one Gaussian peak on a constant background for 1D line scans in Analyze, Compare and Batch. Scans with fewer than 5 points are plotted, and failed line-scan fits no longer fall back to a spin-echo model.
+- **UX05:** an unsaved-work marker plus discard confirmations; no autosave/recovery file, by choice.
+- **UX07:** typed units are converted when compatible with the field's native unit; anything else is an inline error.
+- **FE08:** pooling refuses runs that share bit-identical iteration columns (checkpoint plus final, or copies), detected from the data, not file names. The Library lists checkpoints under their final run.
+- **EN08:** `requirements.txt` (runtime), `requirements-dev.txt` (tests, PyInstaller) and `requirements-scripts.txt` (research scripts) are pinned to the reference environment (Windows 11, Python 3.14.5). `python-pptx` is declared but unvalidated (not installed). A clean-machine install and portable launch have not been retested.
+
+Partly done:
+
+- **UX09:** horizontal/vertical/cross/line cut modes exist; an inspect-only map mode does not.
+- **FE04:** figure panels follow the open file and fall back to a saved snapshot; there is no explicit freeze switch or "linked analysis changed" badge.
+- **AN10:** units and shared-bound constraints are done (F13, F15); naming unweighted RSS/dof as χ² and an exportable shared-vs-independent comparison remain.
+- **AN09 / AN04:** the iteration-sensitivity tool covers leave-one-iteration-out; residual autocorrelation, standardized residual views and a fit-range sensitivity explorer do not exist.
+- **FE01:** Compare analysis items and captured processing variants cover part of "analysis variants"; there is no general result library.
+- **EN01 / EN03 / EN07:** result signatures, versioned sessions and atomic batch manifests exist (round 3); figure/data exports outside Batch still write files directly.
+- **Figure limits (follow-up):** panel letters are unlimited; purging obsolete Plotly panels, versioned asynchronous renders and size/DPI validation remain.
+
+Pending a decision: **UX02, UX13, UX14** (mockups shown on October 28).
+
+Deferred, planned later: **EN09** (legacy Qt support boundary).
+
+Skipped by decision: UX10, AN05, AN06, AN07, FE02, FE03, FE06, FE07, FE10, EN02, EN05, EN06.
+
+Not yet triaged or implemented: AN11 (ODMR/Rabi workflow details), AN12 (physical-interpretation labels), FE05 (time-trace event review), EN04 (measure file-to-first-plot time), EN10 (Windows-only integration and one build identity). Follow-ups still open: result removal semantics, scientific-tool scope (periodogram, step, ratio and drift requests do not take the processing `proc`), spot source provenance for Auto fluorescence, and research-script reproducibility.
+
 ## 1. Main conclusions
 
 SmartFitter already has substantial capabilities: detector-aware MAT loading, experiment-specific fitting, iteration selection and pooling, editable plots, comparisons, map overlays, spot fitting, time-trace tools, AutoFind inspection, stacks, batch processing, and figure composition. The largest opportunity is to make those capabilities behave consistently across workspaces and preserve exactly which data and settings produced each result.

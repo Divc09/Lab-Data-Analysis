@@ -190,7 +190,25 @@ function fileMatches(p, info) {
   return words.every((w) => hay.includes(w));
 }
 
-function fileRow(p, meta) {
+// Run families: "X__checkpoint.mat", "X__checkpoint2.mat" and the final "X.mat" are one acquisition run.
+const isCheckpoint = (name) => /__?checkpoint\d*(\.mat)?$/i.test(name);
+const runFamily = (name) => basename(name).replace(/\.mat$/i, '').replace(/__?checkpoint\d*$/i, '').toLowerCase();
+
+// Status chips for a Library row: what would otherwise need the file opened to find out.
+function statusChips(p, info, f, checkpointOf) {
+  const chips = [];
+  const fit = f?.fit?.[f.detector];
+  if (fit) chips.push(f.fitStale ? ['warn', 'stale fit', 'Settings changed since this fit; refit to update it'] : ['ok', `fit R² ${fmt(fit.r2, 3)}`, `${fit.model}; current with the file's settings`]);
+  const failed = Object.keys(f?.info?.detector_errors || {});
+  if (failed.length) chips.push(['bad', `${failed.map((d) => detLabel(f, d)).join(', ')} failed`, Object.values(f.info.detector_errors).join('\n')]);
+  const [done, target] = String(info.iterations || '').split('/').map(Number);
+  if (Number.isFinite(done) && Number.isFinite(target) && target > 0 && done < target) chips.push(['warn', `partial ${done}/${target}`, 'Run stopped or still acquiring: fewer iterations than planned']);
+  if (checkpointOf) chips.push(['dim', 'checkpoint', `Checkpoint of ${checkpointOf}: its iterations are also in the final file, so do not pool both`]);
+  else if (isCheckpoint(basename(p))) chips.push(['dim', 'checkpoint', 'Checkpoint; no final file for this run in this folder yet']);
+  return chips.map(([kind, text, title]) => h('span', { class: `chip-s ${kind}`, title }, text));
+}
+
+function fileRow(p, meta, { checkpointOf = null } = {}) {
   const info = S.files[p]?.info || S.library.peeks[p] || {};
   const f = S.files[p];
   const isPrimary = S.primary === p && S.view === 'analyze';
@@ -203,10 +221,10 @@ function fileRow(p, meta) {
   else if (info.points) sub.push(`${info.points} pts`);
   if ((Array.isArray(info.detectors) ? info.detectors.length : info.detectors) > 1) sub.push('2 detectors');
   if (info.iterations && info.iterations !== '/') sub.push(`${info.iterations} it`);
-  if (f && f.fit[f.detector]) sub.push(`fit R² ${fmt(f.fit[f.detector].r2, 3)}`);
   if (info.error) sub.push('unreadable');
+  const chips = statusChips(p, info, f, checkpointOf);
   return h('div', {
-    class: `frow ${isPrimary ? 'sel primary' : ''} ${libSelected.has(p) ? 'multi-sel' : ''} ${newer ? 'newfile' : ''}`, title: info.error ? `${p}\n${info.error}` : `${p}\nClick to open · Ctrl/Shift-click to select for comparison`, 'data-path': p, tabindex: 0,
+    class: `frow ${isPrimary ? 'sel primary' : ''} ${libSelected.has(p) ? 'multi-sel' : ''} ${newer ? 'newfile' : ''} ${checkpointOf ? 'cp-child' : ''}`, title: info.error ? `${p}\n${info.error}` : `${p}\nClick to open · Ctrl/Shift-click to select for comparison`, 'data-path': p, tabindex: 0,
     onfocus: () => { libFocus = p; },
     // Drag onto the plot (compare), the Compare set or the Figure composer; a multi-selection drags together.
     draggable: 'true',
@@ -227,7 +245,8 @@ function fileRow(p, meta) {
   },
   tag(info.tag),
   h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip' }, basename(p).replace(/\.mat$/i, '')),
-    h('div', { class: 'sub ellip' }, [isPrimary ? 'Primary' : f ? 'Open' : '', S.overlays.includes(p) ? 'Compared' : '', newer ? 'New' : '', ...sub].filter(Boolean).join(' · '))),
+    h('div', { class: 'sub ellip' }, [isPrimary ? 'Primary' : f ? 'Open' : '', S.overlays.includes(p) ? 'Compared' : '', newer ? 'New' : '', ...sub].filter(Boolean).join(' · ')),
+    chips.length ? h('div', { class: 'chips-s' }, chips) : null),
   canOverlay ? h('label', { class: 'lib-compare', title: 'Compare on the current Analyze plot without replacing its primary file', onclick: (e) => e.stopPropagation() },
     h('input', { type: 'checkbox', checked: S.overlays.includes(p), 'aria-label': `Overlay ${basename(p)}`,
       onchange: async (e) => {
@@ -511,10 +530,17 @@ function renderLibList() {
       .filter((f) => fileMatches(f.path, S.files[f.path]?.info || lib.peeks[f.path] || {}));
     let lastDay = '';
     out.push(h('div', { class: 'group-lbl' }, h('span', { class: 'lbl' }, `${listing.name}`), h('span', { class: 'dim', style: 'font-size:11px' }, `${files.length}/${listing.files.length}`)));
+    // Checkpoints are listed under their final run (same name without __checkpointN), since they hold the
+    // final file's first iterations; a checkpoint with no final file yet keeps its own place.
+    const finals = new Map(files.filter((f) => !isCheckpoint(f.name)).map((f) => [runFamily(f.name), f]));
+    const childrenOf = new Map();
+    files.forEach((f) => { if (isCheckpoint(f.name) && finals.has(runFamily(f.name))) (childrenOf.get(runFamily(f.name)) || childrenOf.set(runFamily(f.name), []).get(runFamily(f.name))).push(f); });
     files.forEach((f) => {
+      if (isCheckpoint(f.name) && finals.has(runFamily(f.name))) return;
       const group = lib.sort === 'type' ? lib.peeks[f.path]?.type || 'Scanning…' : lib.sort === 'name' ? '' : fmtDate(f.mtime);
       if (group && group !== lastDay) { out.push(h('div', { class: 'lbl', style: 'padding:8px 8px 2px;font-size:10px' }, group)); lastDay = group; }
       out.push(fileRow(f.path, f));
+      for (const c of (childrenOf.get(runFamily(f.name)) || []).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))) out.push(fileRow(c.path, c, { checkpointOf: f.name }));
     });
     if (!listing.files.length) out.push(h('div', { class: 'note', style: 'padding:8px' }, 'No .mat files in this folder. Open a subfolder above.'));
   }
@@ -818,27 +844,47 @@ async function watchTick() {
       const seen = lib.seen[listing.path] || {};
       const fresh = listing.files.filter((f) => !(f.path in seen));
       fresh.forEach((f) => { seen[f.path] = f.mtime; lib.newSince[f.path] = true; delete lib.peeks[f.path]; });
-      listing.files.forEach((f) => { if (seen[f.path] !== f.mtime) { seen[f.path] = f.mtime; delete lib.peeks[f.path]; } });
+      const changed = listing.files.filter((f) => !fresh.includes(f) && seen[f.path] !== f.mtime);
+      changed.forEach((f) => { seen[f.path] = f.mtime; delete lib.peeks[f.path]; });
       lib.seen[listing.path] = seen;
       lib.listing = listing;
-      if (fresh.length) { toast(`New file${fresh.length > 1 ? 's' : ''}: ${fresh.map((f) => f.name).join(', ')}`); requestPeeks(fresh.map((f) => f.path)); renderLibList(); }
+      if (changed.length) requestPeeks(changed.map((f) => f.path)); // refresh row details (iterations, status)
+      if (fresh.length) { toast(`New file${fresh.length > 1 ? 's' : ''}: ${fresh.map((f) => f.name).join(', ')}`); requestPeeks(fresh.map((f) => f.path)); }
+      if (fresh.length || changed.length) renderLibList();
     }
     if (lib.watching && paths.length) {
       const st = await call('stat', { paths }, { quiet: true });
       for (const p of paths) {
         const f = S.files[p];
-        if (st[p] && f.mtime && st[p] !== f.mtime) {
-          const hadFit = !!f.fit[f.detector];
-          f.mtime = st[p];
+        if (!f || !st[p]) continue;
+        if (!f.mtime) { f.mtime = st[p]; continue; }
+        if (st[p] === f.mtime) { delete watchPending[p]; continue; }
+        // MATLAB may still be writing: reload only once the timestamp has held for one whole tick.
+        const pending = watchPending[p];
+        if (!pending || pending.mtime !== st[p]) { watchPending[p] = { mtime: st[p], tries: 0 }; continue; }
+        try {
           await reloadFile(f);
-          toast(`Updated: ${basename(p)} (new checkpoint)`);
-          if (hadFit && S.settings.auto_refit !== false && !f.fitting) { try { await runFit(f); } catch (e) { /* toast shown by api */ } }
+        } catch (e) {
+          // Half-written or locked file: keep the old data and retry on the next ticks (the error tray reports it).
+          if (++pending.tries < WATCH_RETRIES) continue;
+          delete watchPending[p]; f.mtime = st[p];
+          continue;
         }
-        if (st[p]) f.mtime = st[p];
+        delete watchPending[p];
+        const hadFit = !!f.fit[f.detector];
+        f.mtime = st[p];
+        toast(`Updated: ${basename(p)} (new checkpoint)`);
+        if (!hadFit) continue;
+        // The shown fit describes the previous contents until it is refitted.
+        f.fitStale = true;
+        if (S.settings.auto_refit !== false && !f.fitting) { try { await runFit(f, { recordUndo: false }); } catch (e) { /* reported in the error tray; fit stays stale */ } }
+        emit();
       }
     }
   } catch (e) { /* folder temporarily unavailable */ }
 }
+const watchPending = {};
+const WATCH_RETRIES = 5;
 
 boot();
 

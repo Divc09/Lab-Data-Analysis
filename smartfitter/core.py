@@ -906,6 +906,60 @@ def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dic
     return _fit_payload(tr, x, y, exp_type, result, candidates, elapsed, analysis)
 
 
+# Decay/lifetime parameters, in the same native units as the fitted x axis.
+DECAY_PARAMS = {"T1", "T2", "T2_star", "tau", "T", "tau_s"}
+STRONG_CORRELATION = 0.95
+
+
+def _identifiability(result: FitResult, x: np.ndarray) -> dict:
+    """Parameter correlations from the fit covariance, and warnings about weakly determined parameters.
+
+    Correlations come from the same linearized covariance as the ± errors, so they are indicative, not exact.
+    The lifetime rules compare a decay constant with the measured span and step of the fitted x values.
+    """
+    out: dict[str, Any] = {"correlation": None, "warnings": []}
+    names = list(result.param_names)
+    cov = None if result.covariance is None else np.asarray(result.covariance, float)
+    free = np.asarray(result.free_mask if result.free_mask is not None else [True] * len(names), bool)
+    if cov is not None and cov.shape == (len(names), len(names)):
+        sd = np.sqrt(np.where(np.diag(cov) > 0, np.diag(cov), np.nan))
+        keep = [i for i in range(len(names)) if free[i] and np.isfinite(sd[i])]
+        if len(keep) >= 2:
+            corr = cov[np.ix_(keep, keep)] / np.outer(sd[keep], sd[keep])
+            out["correlation"] = {"names": [names[i] for i in keep], "matrix": np.clip(corr, -1.0, 1.0).tolist()}
+            for a in range(len(keep)):
+                for b in range(a + 1, len(keep)):
+                    r = float(corr[a, b])
+                    if abs(r) >= STRONG_CORRELATION:
+                        out["warnings"].append(
+                            f"{names[keep[a]]} and {names[keep[b]]} are strongly correlated (r = {r:+.3f}): "
+                            "the data constrain a combination of them better than either one."
+                        )
+    xs = np.asarray(x, float)
+    xs = xs[np.isfinite(xs)]
+    if xs.size >= 2:
+        span = float(np.ptp(xs))
+        steps = np.diff(np.unique(xs))
+        step = float(np.min(steps)) if steps.size else 0.0
+        for name, value in zip(names, np.asarray(result.params, float)):
+            if name not in DECAY_PARAMS or not np.isfinite(value) or value <= 0:
+                continue
+            if span > 0 and value > 3 * span:
+                out["warnings"].append(
+                    f"{name} = {value:.4g} is over 3x the measured span ({span:.4g}, same units): the decay is mostly "
+                    "extrapolated and largely unconstrained by these data."
+                )
+            elif span > 0 and value > span:
+                out["warnings"].append(
+                    f"{name} = {value:.4g} exceeds the measured span ({span:.4g}, same units): part of the decay is extrapolated."
+                )
+            elif step > 0 and value < step:
+                out["warnings"].append(
+                    f"{name} = {value:.4g} is shorter than the smallest x step ({step:.4g}): the decay is not resolved."
+                )
+    return out
+
+
 def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analysis=None):
     mode = tr.mode
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
@@ -1020,7 +1074,8 @@ def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analy
             "plot_y_label": extras.pop("plot_y_label", None),
             "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(band)} if dense_y is not None else None,
             "envelope": envelope,
-            "candidates": candidates,
+            "candidates": candidates or extras.pop("model_candidates", None),
+            "identifiability": _identifiability(result, x),
             "uncertainty": uncertainty,
             "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
             "elapsed_s": elapsed,

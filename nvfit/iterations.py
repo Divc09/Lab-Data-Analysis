@@ -91,6 +91,27 @@ def selected_trace(tr: ExperimentTrace, mode: str, selection: list[int] | None, 
                    iteration_valid=None, metadata=meta, **matrices)
 
 
+def _reject_shared_iterations(runs: list, traces: list, matrices: list) -> None:
+    """Refuse to pool the same observation twice.
+
+    A checkpoint file holds the first iterations of its final file, and a copied file holds all of them. Such
+    iterations are bit-identical measured columns, so an exact column match between two runs is detected from
+    the data itself, not guessed from file names.
+    """
+    for i in range(len(matrices)):
+        for j in range(i + 1, len(matrices)):
+            a, b = matrices[i], matrices[j]
+            shared = sum(
+                any(np.array_equal(a[:, p], b[:, q], equal_nan=True) for q in range(b.shape[1])) for p in range(a.shape[1])
+            )
+            if shared:
+                raise ValueError(
+                    f"{traces[i].file_name} and {traces[j].file_name} contain {shared} identical iteration(s): the same "
+                    "observations (a checkpoint and its final run, or a copy). Pooling would count them twice; use the "
+                    "final file, or deselect the shared iterations."
+                )
+
+
 def combine_datasets(load: Callable, recipe: dict, mode: str) -> ExperimentDataset:
     """Pool selected columns, retaining each source's exact sampled x coordinates."""
     runs = recipe.get("runs") or []
@@ -151,9 +172,11 @@ def combine_datasets(load: Callable, recipe: dict, mode: str) -> ExperimentDatas
             for key in pooled:
                 matrix = iteration_matrix(selected, key)
                 pooled[key].append(None if matrix is None else matrix[idx])
+        _reject_shared_iterations(runs, traces, pooled["signal"] if all(m is not None for m in pooled["signal"]) else pooled["contrast"])
         matrices = {"iteration_" + key: np.concatenate(ms, axis=1) if all(m is not None for m in ms) else None for key, ms in pooled.items()}
         meta = {**(base.metadata or {}), "iteration_sources": provenance, "combined": {"grid": policy, "runs": retained,
-                "note": "Pooled iteration mean; sample SEM assumes independent iterations. Checkpoints may duplicate observations; no deduplication or interpolation."},
+                "note": "Pooled iteration mean; sample SEM assumes independent iterations. Checked: no identical iteration "
+                        "appears in two runs (a checkpoint and its final file share them); no interpolation."},
                 "complete_iterations": len(provenance), "complete_iteration_indices": list(range(1, len(provenance) + 1)),
                 "target_iterations": len(provenance), "completed_iterations": len(provenance), "save_type": "combined", "run_status": "combined"}
         seed = replace(base, source_path=recipe["path"], file_name=recipe["name"], x_ns=common.copy(), raw_x=common.copy(),
