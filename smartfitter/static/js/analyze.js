@@ -4,7 +4,7 @@ import { call } from './api.js';
 import { canonical, sourcePath } from './analysisidentity.js';
 import { S, emit, active, commit, markDirty, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor } from './state.js';
 import { openOverlayPicker, browseOverlays } from './overlaypicker.js';
-import { isNormalizedT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
+import { isNormalizedT1, isDirectT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, fmtPm, fmtCounts, num, toast, clone, tag, basename, dirname, stem, contextMenu, linreg } from './util.js';
 import { figure1D, figureTT, xTitle, yTitle, fftAvailability } from './plot1d.js';
 import { figureMaps, linecuts, CMAP_GRADIENT, visibleSpots, peakCell, displayMap, mapPanels, nearest, fitColorbars, lineLength, mapRelayoutView, rememberMapRanges, mapValueLabel } from './plot2d.js';
@@ -297,7 +297,7 @@ function toolbar(f) {
         d?.iterations ? { label: 'Fit each selected iteration', run: () => import('./iterations.js').then((m) => m.runIterationFits(f)) } : null,
         { label: 'Combine runs (pool iterations)…', run: () => openCombineDialog(f) }]);
     } }, `Iterations${d?.iterations ? ` ${d.iterations.selected.length}/${d.iterations.count}` : ''} ▾`) : null,
-    !tt && isNormalizedT1(fit) ? t1DisplayControl(f) : null,
+    !tt && (isNormalizedT1(fit) || isDirectT1(fit)) ? t1DisplayControl(f) : null,
     !tt ? h('label', { class: 'row', style: 'gap:4px', title: 'X-axis display unit (display only; fits stay in native units)' }, h('span', { class: 'dim' }, 'X'),
       select(unitOptions(f.info.x_unit), f.display.xunit || 'auto', (xunit) => { commit('x display units'); f.display.xunit = xunit; emit(); }, { style: 'width:78px', 'aria-label': 'X unit' })) : null,
     tt ? seg([['both', 'Line + points'], ['pts', 'Points'], ['line', 'Line']], f.styleMode, (v) => { f.styleMode = v; emit(); })
@@ -859,8 +859,8 @@ function resultHeader(f) {
 }
 
 function t1DisplayControl(f) {
-  const fit = f.fit[f.detector], n = t1Normalization(fit);
-  return seg([['original', 'Original units'], ['normalized', 'Normalized 1 − data']], displaySpace(f), (v) => {
+  const fit = f.fit[f.detector], direct = isDirectT1(fit), n = direct || t1Normalization(fit);
+  return seg([['original', 'Original units'], ['normalized', direct ? 'Plot as decay' : 'Normalized 1 − data']], displaySpace(f), (v) => {
     commit('T1 display units'); f.display = { ...f.display, t1: v }; f.yrange = null;
     if (f.style.y) { f.style.y.min = null; f.style.y.max = null; }
     emit();
@@ -960,6 +960,7 @@ function fitTab(f) {
       out.append(peakPickCard(f));
     } else if (fam === 'T1') {
       out.append(field('Preprocess', seg([['Auto', 'Auto'], ['Direct T1', 'Direct'], ['Normalize then 1-data', 'Normalize, 1 − data']], s.t1_prep, (v) => set({ t1_prep: v }))),
+        h('div', { class: 'note' }, 'Auto fits the measured data directly (rise or decay model by trace direction). Use “Plot as decay” above the plot to show a direct fit as 1 − data (no rescaling).'),
         field('Shape', seg([['Regular exponential', 'Exponential'], ['Stretched exponential', 'Stretched']], s.t1_family, (v) => set({ t1_family: v }))));
     } else if (fam === 'SpinEcho') {
       out.append(h('div', { class: 'note' }, 'Stretched exponential y0 + A·exp(−(t/T2)ⁿ). Lock n in Seeds & bounds to force n = 1, 2 or 3.'));
@@ -1287,7 +1288,7 @@ function plotTab(f) {
   const s = baseStyle(st);
   return h('div', { style: 'display:flex;flex-direction:column;gap:12px' },
     kindOf(f) === '1d' ? overlaysCard(f) : null,
-    isNormalizedT1(f.fit[f.detector]) ? field('T1 display units', t1DisplayControl(f)) : null,
+    isNormalizedT1(f.fit[f.detector]) || isDirectT1(f.fit[f.detector]) ? field('T1 display units', t1DisplayControl(f)) : null,
     field('Title', input(st.title || '', (v) => set({ title: v }), { placeholder: 'None (double-click the plot to edit)' })),
     h('div', { class: 'g2' }, field('X label', input(st.x?.title ?? xTitle(f), (v) => set({ x: { ...(st.x || {}), title: v } }))), field('Y label', input(st.y?.title ?? (kindOf(f) === 'tt' ? '' : yTitle(f)), (v) => set({ y: { ...(st.y || {}), title: v } })))),
     h('div', { class: 'g2' }, field('X range', input(st.x?.min != null ? `${st.x.min}, ${st.x.max}` : 'auto', (v) => { const p = v.split(/[,;\s]+/).map(num); set({ x: { ...(st.x || {}), min: p[0] ?? null, max: p[1] ?? null } }); })),

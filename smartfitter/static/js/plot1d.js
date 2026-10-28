@@ -2,7 +2,7 @@
 import { S, detLabel, plotFile } from './state.js';
 import { PALETTES, baseStyle, baseLayout, axisLayout, legendLayout, scatterTrace, resultsAnnotation, userDecorations, friendlyAxis, MODE_LABEL, seriesStyle } from './plotstyle.js';
 
-import { displaySpace, displaySeries, isNormalizedT1, toOriginal, toNormalized } from './fitdisplay.js';
+import { displaySpace, displaySeries, isNormalizedT1, isDirectT1, toOriginal, toNormalized, normScale } from './fitdisplay.js';
 import { xDisplay, resolveXAxis } from './unitdisplay.js';
 import { comparisonFiles, filePresentation, legendLabel } from './seriescontrol.js';
 import { uniformSampling, magnitudeSpectrum } from './spectrum.js';
@@ -32,10 +32,12 @@ function modeFor(f, styleMode) {
 export function yTitle(f) {
   const d = f.data[f.detector];
   const fit = f.fit[f.detector];
-  if (displaySpace(f) !== 'original' && fit?.plot_y_label) return displayOf(f).inv ? `${fit.plot_y_label} (inverted)` : fit.plot_y_label;
+  const decay = isDirectT1(fit) && displaySpace(f) === 'normalized';
+  if (displaySpace(f) !== 'original' && fit?.plot_y_label && !decay) return displayOf(f).inv ? `${fit.plot_y_label} (inverted)` : fit.plot_y_label;
   const unit = f.info.unit ? ` [${f.info.unit}]` : ' [a.u.]';
   const base = f.mode === 'contrast' ? 'Contrast [dimensionless]' : `${MODE_LABEL[f.mode] || f.mode}${unit}`;
-  return displayOf(f).inv ? `${base} (inverted)` : base;
+  const shown = decay && fit.extras.t1_prep_mode !== 'direct_decay' ? `1 − ${base}` : base;
+  return displayOf(f).inv ? `${shown} (inverted)` : shown;
 }
 
 const displayOf = (f) => {
@@ -85,7 +87,7 @@ export function figure1D(f, { forExport = false } = {}) {
   // uncertainty
   const semByX = new Map((d.proc.x || []).map((v, i) => [v, d.proc.sem?.[i]]));
   const sem = d.proc.sem && (space === 'original' || (space === 'normalized' && shown.normalization))
-    ? xr.map((v) => { const s = semByX.get(v); return s == null ? NaN : s / (space === 'normalized' ? shown.normalization.span : 1); }) : null;
+    ? xr.map((v) => { const s = semByX.get(v); return s == null ? NaN : s / (space === 'normalized' ? normScale(shown.normalization) : 1); }) : null;
   if (L.band && sem) {
     if (f.errorMode === 'bars') {
       // drawn on the data trace below
@@ -115,7 +117,7 @@ export function figure1D(f, { forExport = false } = {}) {
       if (iterCmap && sel.length) traces.push(iterColorbar(iterCmap, vals.length, st));
     }
     if (L.meanSd && d.proc.sd && sel.length > 1) {
-      const mean = iterationY(d.proc.y), sd = nonNull(d.proc.sd).map((v) => space === 'normalized' ? v / norm.span : v);
+      const mean = iterationY(d.proc.y), sd = nonNull(d.proc.sd).map((v) => space === 'normalized' ? v / normScale(norm) : v);
       const s = seriesStyle(st, 'meanSd', { name: 'Selected mean ± SD', color: pal[0] });
       traces.push({ type: 'scatter', x: [...ix, ...[...ix].reverse()], y: [...mean.map((v, i) => v + sd[i]), ...mean.map((v, i) => v - sd[i]).reverse()], fill: 'toself',
         fillcolor: hexA(s.color, 0.14), line: { width: 0 }, name: s.name, showlegend: s.legend, hoverinfo: 'skip', meta: { key: 'meanSd' } });
@@ -159,7 +161,7 @@ export function figure1D(f, { forExport = false } = {}) {
     let osem = null;
     if (cfg.err && cfg.err !== 'none' && od?.proc?.sem && (space === 'original' || (space === 'normalized' && os.normalization))) {
       const m = new Map((od.proc.x || []).map((v, i) => [v, od.proc.sem[i]]));
-      osem = os.x.map((v) => { const s = m.get(v); return s == null ? NaN : s / (space === 'normalized' ? os.normalization.span : 1); });
+      osem = os.x.map((v) => { const s = m.get(v); return s == null ? NaN : s / (space === 'normalized' ? normScale(os.normalization) : 1); });
     }
     if (osem && cfg.err === 'band' && cfg.data) traces.push({ type: 'scatter', x: [...ox, ...[...ox].reverse()], y: [...oy.map((v, i) => v + osem[i]), ...oy.map((v, i) => v - osem[i]).reverse()],
       fill: 'toself', fillcolor: hexA(cfg.color, 0.15), line: { width: 0 }, name: `${cfg.label} ±1 SEM`, showlegend: false, hoverinfo: 'skip', legendgroup: p, meta: { key: `ovband:${p}` }, ...yx });
@@ -239,6 +241,10 @@ export function figure1D(f, { forExport = false } = {}) {
   if (L.results) { const a = resultsAnnotation(st, fit, f.info); if (a) annotations.push(a); }
   if (isNormalizedT1(fit)) annotations.push({ xref: 'paper', yref: 'paper', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom', showarrow: false,
     text: `${space === 'original' ? 'Original units · fit mapped from normalized space' : 'Normalized 1 − data · each file uses its own normalization'} · A, y0 normalized`, font: { size: Math.max(9, st.base - 3), color: '#5B6474' }, name: 'fit-space' });
+  const decayView = isDirectT1(fit) && space === 'normalized';
+  if (decayView) annotations.push({ xref: 'paper', yref: 'paper', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom', showarrow: false,
+    text: fit.extras.t1_prep_mode === 'direct_decay' ? 'Plotted as decay · data already decays, shown unchanged'
+      : `Plotted as decay · 1 − ${f.mode}, no rescaling · fitted directly`, font: { size: Math.max(9, st.base - 3), color: '#5B6474' }, name: 'fit-space' });
   const shapes = [...deco.shapes];
   // ODMR peak-pick-only results (analyze.js peakPickCard): detected sample points, no model.
   const picked = f.peakPick?.[det];
@@ -264,7 +270,7 @@ export function figure1D(f, { forExport = false } = {}) {
     annotations, shapes,
     uirevision: f.path + det + f.mode + space + xd.unit + !!st.x.log,
   });
-  if (isNormalizedT1(fit)) layout.margin.t = Math.max(layout.margin.t, 38);
+  if (isNormalizedT1(fit) || decayView) layout.margin.t = Math.max(layout.margin.t, 38);
   if (rightSeries.length) {
     // Independent right-hand axis for series the user moved there (Series panel); the left axis stops mirroring ticks.
     layout.yaxis9 = { ...axisLayout(st, 'yRight', `${yTitle(f)} · right: ${rightSeries.join(', ')}`, { range: f.yRightRange }), overlaying: 'y', side: 'right', anchor: 'x', ...(st.yRight?.ticks?.length ? {} : { tickmode: 'auto', nticks: 8 }),
@@ -285,7 +291,7 @@ export function figure1D(f, { forExport = false } = {}) {
       layout.yaxis3 = { ...axisLayout(st, 'y3', '|FFT|'), domain: [0, 0.2], anchor: 'x2' };
       layout.xaxis.title.text = layout.xaxis.title.text; // keep
     } else {
-      layout.yaxis3 = { ...axisLayout(st, 'y3', space === 'normalized' ? 'Resid.<br>[a.u.]' : space === 'fit' ? `Resid. · ${fit.plot_y_label || 'fit space'}` : `Resid.<br>[${f.mode === 'contrast' ? '1' : f.info.unit || 'a.u.'}]`), domain: [0, 0.2], anchor: 'x', zeroline: true, zerolinecolor: '#C9CED6' };
+      layout.yaxis3 = { ...axisLayout(st, 'y3', space === 'normalized' && !decayView ? 'Resid.<br>[a.u.]' : space === 'fit' ? `Resid. · ${fit.plot_y_label || 'fit space'}` : `Resid.<br>[${f.mode === 'contrast' ? '1' : f.info.unit || 'a.u.'}]`), domain: [0, 0.2], anchor: 'x', zeroline: true, zerolinecolor: '#C9CED6' };
       layout.xaxis.anchor = 'y3';
       layout.yaxis.anchor = 'x';
     }

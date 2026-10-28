@@ -1,5 +1,6 @@
 // Fit-space/display-space mapping. The stored fit and its parameters never change.
 export const isNormalizedT1 = (fit) => fit?.extras?.t1_prep_mode === 'normalized_1_minus_data';
+export const isDirectT1 = (fit) => ['direct', 'direct_decay'].includes(fit?.extras?.t1_prep_mode);
 export const hasPlotTransform = (fit) => !!fit?.plot_y && (isNormalizedT1(fit) || !fit.extras?.t1_prep_mode);
 export function t1Normalization(fit) {
   const e = fit?.extras || {};
@@ -9,27 +10,36 @@ export function t1Normalization(fit) {
 export function displaySpace(f) {
   const fit = f.fit[f.detector];
   if (isNormalizedT1(fit)) return f.display?.t1 === 'normalized' || !t1Normalization(fit) ? 'normalized' : 'original';
+  // A direct T1 fit can be shown as a decay ("Plot as decay"); the fit itself stays in original units.
+  if (isDirectT1(fit)) return f.display?.t1 === 'normalized' ? 'normalized' : 'original';
   return hasPlotTransform(fit) ? 'fit' : 'original';
 }
-export const toNormalized = (y, n) => y.map((v) => v === null ? NaN : 1 - (v - n.lo) / n.span);
+// keep: an already-falling trace is not flipped. mirror ("Plot as decay" of a direct fit): plain 1 − y with
+// no rescaling, so a rising contrast 0.02 → 0.14 is drawn 0.98 → 0.86.
+export const toNormalized = (y, n) => y.map((v) => v === null ? NaN
+  : n.mirror ? (n.keep ? v : 1 - v)
+  : n.keep ? (v - n.lo) / n.span : 1 - (v - n.lo) / n.span);
+// Factor that divides SEM/SD/±1σ widths in the normalized display (1 when the display keeps measured units).
+export const normScale = (n) => (n.mirror ? 1 : n.span);
 export const toOriginal = (y, n) => y.map((v) => v === null ? NaN : n.lo + n.span * (1 - v));
 const numbers = (a) => (a || []).map((v) => v === null ? NaN : v);
 
 // Without a normalized fit, use the same base choice and span floor as _prepare_t1_series.
-export function normalizationFromData(d) {
+// A direct-decay fit is already a decay, so its normalized display is not flipped.
+export function normalizationFromData(d, fit = null, mirror = false) {
   const xs = d?.proc?.fit_x || d?.proc?.x || [];
   const y = (d?.proc?.fit_y || d?.proc?.y || []).filter((v, i) => Number.isFinite(v) && Number.isFinite(xs[i]));
   const base = y;
   if (!base.length) return null;
   const lo = base.reduce((a, b) => Math.min(a, b), Infinity), hi = base.reduce((a, b) => Math.max(a, b), -Infinity);
   const span = Math.max(hi - lo, 1e-9);
-  return { lo, span, source: 'y', stored: false };
+  return { lo, span, source: 'y', stored: false, keep: fit?.extras?.t1_prep_mode === 'direct_decay', mirror };
 }
 
 export function displaySeries(f, det, space, mainFit = null) {
   const d = f.data[det], fit = f.fit[det];
   if (!d?.proc) return null;
-  const n = t1Normalization(fit) || (!isNormalizedT1(fit) ? normalizationFromData(d) : null);
+  const n = t1Normalization(fit) || (!isNormalizedT1(fit) ? normalizationFromData(d, fit, isDirectT1(mainFit || fit)) : null);
   let x = numbers(d.proc.x), y = numbers(d.proc.y), note = '';
   if (space === 'normalized') {
     if (!n && !isNormalizedT1(fit)) return null;
@@ -38,7 +48,7 @@ export function displaySeries(f, det, space, mainFit = null) {
       else { x = numbers(fit.x); y = numbers(fit.plot_y); }
     }
     else { y = toNormalized(n.source === 'trace.y' ? numbers(d.raw.trace_y || d.raw.y) : y, n); }
-    note = n?.stored ? 'own fit normalization' : n ? 'own data min–max; not a normalized fit' : 'legacy normalized fit; refit for original units';
+    note = n?.stored ? 'own fit normalization' : n?.mirror ? 'plotted as decay (1 − y)' : n ? 'own data min–max; not a normalized fit' : 'legacy normalized fit; refit for original units';
   } else if (space === 'fit') {
     // An unknown plot_y transform is only comparable to an explicitly matching fitted space.
     if (!hasPlotTransform(fit) || fit.plot_y_label !== mainFit?.plot_y_label) return null;
@@ -57,14 +67,18 @@ export function displaySeries(f, det, space, mainFit = null) {
     }
   } else if (fitY && !isNormalizedT1(fit) && space === 'normalized') {
     fitY = toNormalized(fitY, n);
-    residuals = residuals.map((v) => -v / n.span);
-    band = band?.map((v) => v / n.span);
+    residuals = residuals.map((v) => (n.keep ? v : -v) / normScale(n));
+    band = band?.map((v) => v / normScale(n));
   }
   return { x, y, fitY, residuals, band, note, normalization: n };
 }
 
 export function displayProvenance(f) {
   const fit = f.fit[f.detector];
+  if (isDirectT1(fit) && displaySpace(f) === 'normalized')
+    return fit.extras.t1_prep_mode === 'direct_decay'
+      ? `Plotted as a decay: the data already decays, shown unchanged in measured ${f.mode} units.`
+      : `Plotted as a decay: 1 − ${f.mode} for data and fit, no rescaling. Fit done directly; T1 and n unchanged; A and y0 refer to the measured ${f.mode}.`;
   if (!isNormalizedT1(fit)) return hasPlotTransform(fit) ? `Display: ${fit.plot_y_label || 'fit space'}. Only matching fit-space overlays are shown.` : '';
   const n = t1Normalization(fit);
   if (!n) return 'Legacy normalized fit has no inverse metadata: showing normalized space. Refit to use original units.';

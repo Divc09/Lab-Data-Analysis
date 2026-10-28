@@ -328,7 +328,8 @@ def _prepare_t1_series(
         return y, "direct_decay"
     auto = mode == "auto"
     corr = float(np.corrcoef(x, y)[0, 1]) if len(x) > 2 else 0.0
-    use_normalized = mode.startswith("normalize") or (auto and corr > 0.25)
+    # Auto fits directly: 1 - data is an affine rescale (same T1) and breaks on falling traces.
+    use_normalized = mode.startswith("normalize")
     if not use_normalized:
         # A falling T1 trace (e.g. MW pi-referenced T1 contrast) is fitted directly with the decay model.
         if auto and corr < -0.25:

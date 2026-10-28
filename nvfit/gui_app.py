@@ -1895,7 +1895,8 @@ class SmartFitterMainWindow(QMainWindow):
         self.t1_prep_combo = NoScrollComboBox()
         self.t1_prep_combo.addItems(["Auto", "Direct T1", "Normalize then 1-data"])
         self.t1_prep_combo.setToolTip(
-            "Choose whether T1 should be fit directly or after normalization followed by 1-data."
+            "Choose whether T1 should be fit directly or after normalization followed by 1-data. "
+            "Auto fits directly (rise or decay model by trace direction)."
         )
         self.t1_prep_combo.currentTextChanged.connect(self._update_equation_display)
         t1_layout.addRow("T1 preprocessing", self.t1_prep_combo)
