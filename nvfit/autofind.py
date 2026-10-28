@@ -43,12 +43,17 @@ def _plain(value):
     return value
 
 
+def is_v73(path: str | Path) -> bool:
+    """True for MATLAB v7.3 (HDF5) files, which scipy's loadmat cannot read."""
+    with Path(path).open('rb') as f:
+        header = f.read(128)
+    return b'MATLAB 7.3' in header or header.startswith(b'\x89HDF')
+
+
 def read_mat(path: str | Path, names: list[str] | None = None) -> dict:
     """Load v5 structs/cells; v7.3 structs/cells use HDF5 references when available."""
     path = Path(path)
-    with path.open('rb') as f:
-        header = f.read(128)
-    if b'MATLAB 7.3' not in header and not header.startswith(b'\x89HDF'):
+    if not is_v73(path):
         raw = loadmat(path, struct_as_record=False, squeeze_me=True, variable_names=names)
         return {k: _plain(v) for k, v in raw.items() if not k.startswith('__')}
     import h5py
@@ -58,10 +63,18 @@ def read_mat(path: str | Path, names: list[str] | None = None) -> dict:
             cls = obj.attrs.get('MATLAB_class', b'')
             if isinstance(cls, bytes):
                 cls = cls.decode()
-            if cls in ('table', 'datetime', 'function_handle'):
+            # MATLAB class objects (datetime, string, table...) are references into MCOS storage, not data.
+            if cls in ('table', 'datetime', 'function_handle', 'string', 'duration', 'categorical') or 'MATLAB_object_decode' in obj.attrs:
                 return {'opaque': cls}
+            if obj.attrs.get('MATLAB_empty', 0):
+                # MATLAB stores an empty value as its dimensions; the data is not those numbers.
+                return '' if cls == 'char' else np.empty(0, dtype=object if cls in ('cell', 'struct') else float)
             if isinstance(obj, h5py.Group):
                 fields = {k: decode(v) for k, v in obj.items() if not k.startswith('#')}
+                # HDF5 lists members alphabetically; MATLAB_fields keeps the struct's own field order.
+                order = [b''.join(np.asarray(n).ravel()).decode(errors='replace') for n in obj.attrs.get('MATLAB_fields', [])]
+                if order:
+                    fields = {k: fields[k] for k in order if k in fields} | {k: v for k, v in fields.items() if k not in order}
                 if cls == 'struct':
                     refs = [v for v in obj.values() if isinstance(v, h5py.Dataset) and h5py.check_dtype(ref=v.dtype) and 'MATLAB_class' not in v.attrs]
                     count = int(np.prod(refs[0].shape)) if refs else 1
@@ -79,7 +92,8 @@ def read_mat(path: str | Path, names: list[str] | None = None) -> dict:
                 return np.squeeze(out)
             if cls == 'char':
                 return ''.join(chr(int(x)) for x in a.T.ravel() if x)
-            return np.squeeze(a.T)
+            out = np.squeeze(a.T)
+            return out[()] if out.ndim == 0 else out
         return {k: decode(v) for k, v in f.items() if not k.startswith('#') and (names is None or k in names)}
 
 

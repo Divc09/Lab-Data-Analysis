@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 
-from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights, parameter_controls, current_parameter_controls
+from .fit_engine import (
+    FitResult,
+    UnderdeterminedFitError,
+    fit_model_multistart,
+    reduced_chi2,
+    sem_to_weights,
+    parameter_controls,
+    current_parameter_controls,
+)
 from .models import (
     gaussian_peaks,
     time_trace_decay,
@@ -57,6 +65,7 @@ class FitWorkflowConfig:
     custom_spec: dict | None = None
     custom_expr: str = ""
     t1_normalization: tuple[float, float] | None = None
+    parameter_model: str | None = None
 
 
 def _fit_time_trace_decay(x, y, n_starts, locks=None, weights=None) -> FitResult:
@@ -78,8 +87,16 @@ def _fit_time_trace_decay(x, y, n_starts, locks=None, weights=None) -> FitResult
         _apply_locks(names, lower, upper, seed, locks)
         seeds.append(seed)
     result = fit_model_multistart(
-        model_name="TimeTraceDecay", model_func=time_trace_decay, x=x, y=y,
-        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac", weights=weights,
+        model_name="TimeTraceDecay",
+        model_func=time_trace_decay,
+        x=x,
+        y=y,
+        param_names=names,
+        lower=lower,
+        upper=upper,
+        seeds=seeds,
+        x_scale="jac",
+        weights=weights,
         selection_note="Descriptive exponential drift/bleaching; tau_s is in seconds, not a spin lifetime",
     )
     result.extras["parameter_units"] = {"tau_s": "s"}
@@ -132,13 +149,19 @@ def _fit_gaussian_peaks(x, y, count, n_starts, locks=None, weights=None) -> FitR
     scales = np.array([amplitude * 0.05] + [amplitude * 0.1, span / (12 * count), span / (20 * count)] * count)
     seeds += [seed + rng.normal(size=len(seed)) * scales for _ in range(max(1, n_starts) - 1)]
     result = fit_model_multistart(
-        model_name="GaussianPeaks", model_func=gaussian_peaks, x=x, y=y,
-        param_names=names, lower=lower, upper=upper, seeds=seeds, x_scale="jac", weights=weights,
+        model_name="GaussianPeaks",
+        model_func=gaussian_peaks,
+        x=x,
+        y=y,
+        param_names=names,
+        lower=lower,
+        upper=upper,
+        seeds=seeds,
+        x_scale="jac",
+        weights=weights,
         selection_note=f"{count} Gaussian peak(s) on a constant background; centers and widths in scan axis units",
     )
-    result.extras["peak_fwhm"] = {
-        f"peak_{i}": float(2.354820045 * result.params[3 * i]) for i in range(1, count + 1)
-    }
+    result.extras["peak_fwhm"] = {f"peak_{i}": float(2.354820045 * result.params[3 * i]) for i in range(1, count + 1)}
     return result
 
 
@@ -426,7 +449,9 @@ def aligned_sem(trace: "ExperimentTrace | None", x: np.ndarray) -> np.ndarray | 
     return None if idx is None else sem[idx]
 
 
-def _attach_sem_chi2(result: FitResult, y: np.ndarray, sem: np.ndarray, n_locked: int, t1_span: float, *, weighted: bool) -> FitResult:
+def _attach_sem_chi2(
+    result: FitResult, y: np.ndarray, sem: np.ndarray, n_locked: int, t1_span: float, *, weighted: bool
+) -> FitResult:
     y_ref = np.asarray(result.extras.get("plot_y", y), dtype=float)
     sem_eff = np.asarray(sem, dtype=float)
     if result.extras.get("t1_prep_mode") == "normalized_1_minus_data":
@@ -437,7 +462,9 @@ def _attach_sem_chi2(result: FitResult, y: np.ndarray, sem: np.ndarray, n_locked
     if np.isfinite(chi2):
         result.extras["reduced_chi2"] = chi2
         tag = "SEM-weighted fit" if weighted else "SEM available"
-        result.selection_note = f"{result.selection_note}; {tag}, reduced chi2={chi2:.2f} (absolute 1/sem^2)".lstrip("; ")
+        result.selection_note = f"{result.selection_note}; {tag}, reduced chi2={chi2:.2f} (absolute 1/sem^2)".lstrip(
+            "; "
+        )
     return result
 
 
@@ -673,10 +700,25 @@ def _fit_rabi_adaptive(
         seed[2] = [max(40.0, 0.6 * span), max(80.0, span), max(120.0, 2.0 * span)][i % 3]
         seed[3] = [0.65, 1.0, 1.5][(i // 3) % 3]
         seed[4] = np.clip(f_seed * [0.92, 1.0, 1.08][i % 3], f_lo, f_hi)
-        seed[5] = np.clip([0.0, alpha_seed, 0.5 * f_seed / span, -0.25 * f_seed / span][i % 4], -chirp1_bound, chirp1_bound)
-        seed[6] = np.clip([0.0, -0.22 * f_seed / (span * span), 0.15 * f_seed / (span * span)][i % 3], -chirp2_bound, chirp2_bound)
+        seed[5] = np.clip(
+            [0.0, alpha_seed, 0.5 * f_seed / span, -0.25 * f_seed / span][i % 4], -chirp1_bound, chirp1_bound
+        )
+        seed[6] = np.clip(
+            [0.0, -0.22 * f_seed / (span * span), 0.15 * f_seed / (span * span)][i % 3], -chirp2_bound, chirp2_bound
+        )
         seed[7] = np.clip([delay_seed, max(0.0, derived_delay), max(0.0, saved_delay)][i % 3], 0.0, delay_upper)
-        jitter = np.array([0.004, 0.15 * a0, 0.18 * span, 0.15, 0.025 * f_seed, 0.08 * chirp1_bound, 0.08 * chirp2_bound, max(0.5, 0.04 * delay_upper)])
+        jitter = np.array(
+            [
+                0.004,
+                0.15 * a0,
+                0.18 * span,
+                0.15,
+                0.025 * f_seed,
+                0.08 * chirp1_bound,
+                0.08 * chirp2_bound,
+                max(0.5, 0.04 * delay_upper),
+            ]
+        )
         structured.append(seed + rng.normal(0.0, jitter))
 
     result = fit_model_multistart(
@@ -759,6 +801,13 @@ def _rabi_early_rmse(y: np.ndarray, y_fit: np.ndarray, x: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y[mask] - y_fit[mask]) ** 2)))
 
 
+def _optional_candidate(fit):
+    try:
+        return fit()
+    except UnderdeterminedFitError:
+        return None
+
+
 def _choose_rabi_model(
     *,
     x: np.ndarray,
@@ -771,12 +820,13 @@ def _choose_rabi_model(
 ) -> FitResult:
     if adaptive is not None:
         adaptive_reason = _rabi_adaptive_pathology(adaptive, x)
-        alternatives = [phase_ramp, constant] + ([chirped] if chirped is not None else []) + ([long_damped] if long_damped is not None else [])
+        alternatives = (
+            [phase_ramp, constant]
+            + ([chirped] if chirped is not None else [])
+            + ([long_damped] if long_damped is not None else [])
+        )
         best_alt = min(alternatives, key=lambda item: item.bic)
-        if not adaptive_reason and (
-            adaptive.bic <= best_alt.bic - 4.0
-            or adaptive.r2 >= best_alt.r2 + 0.015
-        ):
+        if not adaptive_reason and (adaptive.bic <= best_alt.bic - 4.0 or adaptive.r2 >= best_alt.r2 + 0.015):
             adaptive.extras["rabi_reference_model"] = best_alt.model_name
             adaptive.extras["rabi_reference_bic"] = float(best_alt.bic)
             return _with_selection(adaptive, "selected adaptive pulse-area Rabi model by BIC and residual improvement")
@@ -806,15 +856,21 @@ def _choose_rabi_model(
 
     if chirped is not None:
         chirped_peak_error = abs(_first_peak_from_series(x, chirped.y_fit) - data_first_peak)
-        if chirped.rmse <= phase_ramp.rmse * 0.75 or (chirped_peak_error <= 2.5 and chirped.r2 >= max(0.95, phase_ramp.r2 + 0.03)):
+        if chirped.rmse <= phase_ramp.rmse * 0.75 or (
+            chirped_peak_error <= 2.5 and chirped.r2 >= max(0.95, phase_ramp.r2 + 0.03)
+        ):
             chirped.extras["rabi_physical_reference_params"] = {
                 name: float(value) for name, value in zip(phase_ramp.param_names, phase_ramp.params)
             }
             chirped.extras["rabi_physical_reference_model"] = "RabiPhaseRamp"
-            return _with_selection(chirped, "selected chirped Rabi fallback because phase-ramp still missed startup alignment")
+            return _with_selection(
+                chirped, "selected chirped Rabi fallback because phase-ramp still missed startup alignment"
+            )
 
     if phase_ramp.rmse < constant.rmse:
-        return _with_selection(phase_ramp, f"selected phase-ramp Rabi model; first-peak mismatch remains {ramp_peak_error:.2f} ns")
+        return _with_selection(
+            phase_ramp, f"selected phase-ramp Rabi model; first-peak mismatch remains {ramp_peak_error:.2f} ns"
+        )
     return _with_selection(constant, "fell back to constant-frequency Rabi reference fit")
 
 
@@ -958,7 +1014,9 @@ def _fit_rabi_dual(x: np.ndarray, y: np.ndarray, config: FitWorkflowConfig) -> F
         (max(5e-5, f0 * 0.88), min(0.2, f0 * 1.15)),
         (max(5e-5, f0 * 0.75), min(0.2, f0 * 1.3)),
     ]
-    seed0 = np.array([y0, 0.0, 0.55 * yamp, 0.35 * yamp, freq_pairs[0][0], freq_pairs[0][1], 0.0, 0.5, max(200.0, tspan)])
+    seed0 = np.array(
+        [y0, 0.0, 0.55 * yamp, 0.35 * yamp, freq_pairs[0][0], freq_pairs[0][1], 0.0, 0.5, max(200.0, tspan)]
+    )
     scale = _scaled_perturbation(lower, upper)
     seeds: list[np.ndarray] = []
     for i in range(n_starts):
@@ -991,7 +1049,9 @@ def _fit_t1(
     weights: np.ndarray | None = None,
 ) -> FitResult:
     norm_extras = {}
-    y_fit, prep_used = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, trace=trace, norm_extras=norm_extras, normalization=config.t1_normalization)
+    y_fit, prep_used = _prepare_t1_series(
+        x, y, prep_mode=config.t1_prep_mode, trace=trace, norm_extras=norm_extras, normalization=config.t1_normalization
+    )
     rng = np.random.default_rng(41)
     tspan = float(np.max(x) - np.min(x))
     y0 = float(np.min(y_fit)) if prep_used == "direct" else float(np.percentile(y_fit, 10))
@@ -1129,8 +1189,14 @@ def _single_odmr_bounds(
     return names, lower, upper, seed0
 
 
-def _odmr_controls(controls,y_scale):
-    return {name:tuple(v/y_scale if i!=1 and v is not None and (name=='y0' or name.startswith('C')) else v for i,v in enumerate(values)) for name,values in (controls or {}).items()}
+def _odmr_controls(controls, y_scale):
+    return {
+        name: tuple(
+            v / y_scale if i != 1 and v is not None and (name == "y0" or name.startswith("C")) else v
+            for i, v in enumerate(values)
+        )
+        for name, values in (controls or {}).items()
+    }
 
 
 def _fit_odmr_single(
@@ -1146,11 +1212,11 @@ def _fit_odmr_single(
     y_scale = max(float(np.percentile(y, 95) - np.percentile(y, 5)), 1e-9)
     y_fit = y / y_scale
     names, lower, upper, seed0 = _single_odmr_bounds(x, y_fit, polarity, center_range=center_range)
-    controls=_odmr_controls(locks or current_parameter_controls(),y_scale)
+    controls = _odmr_controls(locks or current_parameter_controls("ODMR"), y_scale)
     _apply_locks(names, lower, upper, seed0, controls)
     scale = _scaled_perturbation(lower, upper)
     seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
-    with parameter_controls(controls):
+    with parameter_controls(controls, model_name="ODMR"):
         result = fit_model_multistart(
             model_name="ODMR",
             model_func=odmr_lorentzian,
@@ -1201,7 +1267,7 @@ def _fit_odmr_multi(
         upper += [4.0 * amp if polarity == "peak" else 0.0, 0.18 * span, center_hi]
     scale = _scaled_perturbation(lower, upper)
     seeds = [np.asarray(seed, dtype=float) + rng.normal(0, scale) for _ in range(n_starts)]
-    with parameter_controls(_odmr_controls(current_parameter_controls(),y_scale)):
+    with parameter_controls(_odmr_controls(current_parameter_controls("ODMRMulti"), y_scale), model_name="ODMRMulti"):
         result = fit_model_multistart(
             model_name="ODMRMulti",
             model_func=odmr_multi_lorentzian,
@@ -1242,18 +1308,30 @@ def _rescale_odmr_result(result: FitResult, y_scale: float, extras: dict[str, ob
         selection_note=result.selection_note,
         extras={**dict(result.extras), **(extras or {})},
         covariance=result.covariance * np.outer(factors, factors) if result.covariance is not None else None,
-        free_mask=result.free_mask, uncertainty=result.uncertainty, model_func=result.model_func,
+        free_mask=result.free_mask,
+        uncertainty=result.uncertainty,
+        model_func=result.model_func,
     )
 
 
-def _select_odmr_candidate(single: FitResult, multi: FitResult | None, peak_indices: np.ndarray, x: np.ndarray) -> FitResult:
+def _select_odmr_candidate(
+    single: FitResult, multi: FitResult | None, peak_indices: np.ndarray, x: np.ndarray
+) -> FitResult:
     detected = [float(v) for v in np.asarray(x[peak_indices], dtype=float)[:4]] if len(peak_indices) else []
     if multi is None:
         return _with_selection(single, "selected single-peak ODMR candidate", {"detected_peaks": detected})
     if multi.bic <= single.bic - 4.0 and multi.r2 >= single.r2 + 0.05:
-        return _with_selection(multi, "selected multi-peak ODMR candidate by lower BIC and stronger explained variance", {"detected_peaks": detected})
+        return _with_selection(
+            multi,
+            "selected multi-peak ODMR candidate by lower BIC and stronger explained variance",
+            {"detected_peaks": detected},
+        )
     if sum(multi.bound_hits) > sum(single.bound_hits):
-        return _with_selection(single, "selected single-peak ODMR candidate because multi-peak fit hit more bounds", {"detected_peaks": detected})
+        return _with_selection(
+            single,
+            "selected single-peak ODMR candidate because multi-peak fit hit more bounds",
+            {"detected_peaks": detected},
+        )
     if multi.bic <= single.bic - 4.0 and multi.r2 >= single.r2 - 0.02:
         return _with_selection(multi, "selected multi-peak ODMR candidate by lower BIC", {"detected_peaks": detected})
     return _with_selection(single, "selected single-peak ODMR candidate by parsimony", {"detected_peaks": detected})
@@ -1273,7 +1351,11 @@ def _fit_non_ramsey_impl(
 ) -> FitResult:
     cfg = config or FitWorkflowConfig()
     w_sem = sem_to_weights(sem) if cfg.sem_weights and sem is not None else None
-    if trace is not None and trace.experiment_type == "TimeTrace" and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}:
+    if (
+        trace is not None
+        and trace.experiment_type == "TimeTrace"
+        and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}
+    ):
         raise ValueError("Elapsed-time data require TimeTraceDecay or a custom model with x in seconds.")
     if exp_type in {"TimeTrace", "TimeTraceDecay"}:
         return _fit_time_trace_decay(x, y, cfg.multistart, locks, w_sem)
@@ -1304,13 +1386,25 @@ def _fit_non_ramsey_impl(
         weights = _rabi_fit_weights(trace, x, enabled=bool(cfg.rabi_use_sem))
         mode = cfg.rabi_mode.lower().strip()
         if mode.startswith("long"):
-            return _semantic_result(_attach_rabi_envelope(_with_selection(_fit_rabi_long_damped(x, y, weights, n_starts), "selected long damped Rabi model"), x, y))
+            return _semantic_result(
+                _attach_rabi_envelope(
+                    _with_selection(_fit_rabi_long_damped(x, y, weights, n_starts), "selected long damped Rabi model"),
+                    x,
+                    y,
+                )
+            )
         if mode.startswith("constant-frequency"):
             constant = _fit_rabi_constant_reference(x, y, weights, n_starts)
-            return _semantic_result(_attach_rabi_envelope(_with_selection(constant, "selected constant-frequency damped cosine Rabi model"), x, y))
+            return _semantic_result(
+                _attach_rabi_envelope(
+                    _with_selection(constant, "selected constant-frequency damped cosine Rabi model"), x, y
+                )
+            )
         if mode.startswith("chirped"):
             chirped = _fit_rabi_chirp(x, y, weights, n_starts)
-            return _semantic_result(_attach_rabi_envelope(_with_selection(chirped, "selected chirped Rabi model"), x, y))
+            return _semantic_result(
+                _attach_rabi_envelope(_with_selection(chirped, "selected chirped Rabi model"), x, y)
+            )
         if mode.startswith("adaptive"):
             chirped = _fit_rabi_chirp(x, y, weights, n_starts)
             adaptive = _fit_rabi_adaptive(
@@ -1321,23 +1415,46 @@ def _fit_non_ramsey_impl(
                 metadata=(trace.metadata if trace is not None else None),
                 chirped_reference=chirped,
             )
-            return _semantic_result(_attach_rabi_envelope(_with_selection(adaptive, "selected adaptive pulse-area Rabi model"), x, y))
+            return _semantic_result(
+                _attach_rabi_envelope(_with_selection(adaptive, "selected adaptive pulse-area Rabi model"), x, y)
+            )
         phase_ramp = _fit_rabi_phase_ramp(x, y, weights, n_starts)
         constant = _fit_rabi_constant_reference(x, y, weights, n_starts)
-        chirped = _fit_rabi_chirp(x, y, weights, n_starts)
-        adaptive = _fit_rabi_adaptive(
+        # Optional richer candidates are skipped when the data cannot identify them; the phase-ramp and
+        # constant references above stay required.
+        chirped = _optional_candidate(lambda: _fit_rabi_chirp(x, y, weights, n_starts))
+        adaptive = _optional_candidate(lambda: _fit_rabi_adaptive(
             x,
             y,
             weights,
             n_starts,
             metadata=(trace.metadata if trace is not None else None),
             chirped_reference=chirped,
-        )
+        ))
         features = _rabi_long_scan_features(x, y)
-        long_damped = _fit_rabi_long_damped(x, y, weights, n_starts) if bool(features["is_long_decayed"]) else None
+        long_damped = (
+            _optional_candidate(lambda: _fit_rabi_long_damped(x, y, weights, n_starts))
+            if bool(features["is_long_decayed"]) else None
+        )
         if mode.startswith("phase-ramp"):
-            return _semantic_result(_attach_rabi_envelope(_with_selection(phase_ramp, "selected phase-ramp Rabi model"), x, y))
-        return _semantic_result(_attach_rabi_envelope(_choose_rabi_model(x=x, y=y, phase_ramp=phase_ramp, constant=constant, chirped=chirped, adaptive=adaptive, long_damped=long_damped), x, y))
+            return _semantic_result(
+                _attach_rabi_envelope(_with_selection(phase_ramp, "selected phase-ramp Rabi model"), x, y)
+            )
+        return _semantic_result(
+            _attach_rabi_envelope(
+                _choose_rabi_model(
+                    x=x,
+                    y=y,
+                    phase_ramp=phase_ramp,
+                    constant=constant,
+                    chirped=chirped,
+                    adaptive=adaptive,
+                    long_damped=long_damped,
+                ),
+                x,
+                y,
+            )
+        )
 
     if exp_type == "T1":
         return _semantic_result(_fit_t1(x, y, cfg, trace=trace, locks=locks, weights=w_sem))
@@ -1351,34 +1468,34 @@ def _fit_non_ramsey_impl(
         rng = np.random.default_rng(33)
         scale = _scaled_perturbation(lower, upper)
         seeds = [seed0 + rng.normal(0, scale) for _ in range(n_starts)]
-        return _semantic_result(fit_model_multistart(
-            model_name="SpinEcho",
-            model_func=spin_echo_model,
-            x=x,
-            y=y,
-            param_names=names,
-            lower=lower,
-            upper=upper,
-            seeds=seeds,
-            weights=w_sem,
-            selection_note="selected stretched-exponential decay model",
-        ))
+        return _semantic_result(
+            fit_model_multistart(
+                model_name="SpinEcho",
+                model_func=spin_echo_model,
+                x=x,
+                y=y,
+                param_names=names,
+                lower=lower,
+                upper=upper,
+                seeds=seeds,
+                weights=w_sem,
+                selection_note="selected stretched-exponential decay model",
+            )
+        )
 
     if exp_type == "ODMR":
-        polarities = ["peak", "dip"] if cfg.odmr_polarity.lower() == "auto" else [_detect_odmr_polarity(x, y, cfg.odmr_polarity)]
+        polarities = (
+            ["peak", "dip"] if cfg.odmr_polarity.lower() == "auto" else [_detect_odmr_polarity(x, y, cfg.odmr_polarity)]
+        )
         candidates: list[FitResult] = []
         for polarity in polarities:
             peak_indices = _detect_odmr_peaks(x, y, polarity)
-            peak_indices, constrained_ranges = _odmr_peaks_in_ranges(
-                x, y, polarity, peak_indices, cfg.odmr_peak_ranges
-            )
+            peak_indices, constrained_ranges = _odmr_peaks_in_ranges(x, y, polarity, peak_indices, cfg.odmr_peak_ranges)
             single_range: tuple[float, float] | None = None
             if constrained_ranges:
                 strengths = _odmr_detection_signal(y, polarity)[peak_indices]
                 single_range = constrained_ranges[int(np.argmax(strengths))]
-            single = _fit_odmr_single(
-                x, y, n_starts, polarity, locks=locks, center_range=single_range, weights=w_sem
-            )
+            single = _fit_odmr_single(x, y, n_starts, polarity, locks=locks, center_range=single_range, weights=w_sem)
             multi: FitResult | None = None
             if cfg.odmr_multipeak or len(peak_indices) > 1:
                 max_peaks = int(min(max(2, cfg.odmr_peak_count), 4))
@@ -1416,18 +1533,20 @@ def _fit_non_ramsey_impl(
         model = build_custom_expression_model(str(spec["expression"]), names)
         scale = [max(1e-6, 0.02 * max(abs(v), 1.0)) for v in seed0]
         seeds = [seed0 + rng.normal(0, scale, size=len(seed0)) for _ in range(n_starts)]
-        return _semantic_result(fit_model_multistart(
-            model_name=str(spec.get("name", "CustomModel")),
-            model_func=model,
-            x=x,
-            y=y,
-            param_names=names,
-            lower=lower,
-            upper=upper,
-            seeds=seeds,
-            weights=w_sem,
-            selection_note="selected custom model",
-        ))
+        return _semantic_result(
+            fit_model_multistart(
+                model_name=str(spec.get("name", "CustomModel")),
+                model_func=model,
+                x=x,
+                y=y,
+                param_names=names,
+                lower=lower,
+                upper=upper,
+                seeds=seeds,
+                weights=w_sem,
+                selection_note="selected custom model",
+            )
+        )
 
     names = ["y0", "A", "T2", "n"]
     lower, upper, seed0 = _spin_echo_seed_and_bounds("SpinEcho", tspan)
@@ -1451,6 +1570,56 @@ def _fit_non_ramsey_impl(
     return _semantic_result(result)
 
 
+def parameter_control_model(exp_type, config, x, y):
+    """Resolve the model whose parameter editor supplied these controls.
+
+    Auto selection can evaluate other models, but their parameter names are not a
+    contract for transferring controls. Older requests without an editor model
+    use the workflow's primary model; new editor requests name it explicitly.
+    """
+    if config.parameter_model:
+        return config.parameter_model
+    family = {
+        "DEERDuration": "Rabi",
+        "DEERDecay": "SpinEcho",
+        "DEERFrequency": "ODMR",
+        "DynamicDecoupling": "SpinEcho",
+    }.get(exp_type, exp_type)
+    if family == "Rabi":
+        mode = config.rabi_mode.lower().strip()
+        for prefix, model in (
+            ("long", "RabiLongDamped"),
+            ("constant-frequency", "RabiCosine"),
+            ("chirped", "RabiChirp"),
+            ("adaptive", "RabiAdaptive"),
+        ):
+            if mode.startswith(prefix):
+                return model
+        return "RabiPhaseRamp"
+    if family == "T1":
+        _, prep = _prepare_t1_series(x, y, prep_mode=config.t1_prep_mode, normalization=config.t1_normalization)
+        prefix = {"direct": "T1", "direct_decay": "T1Decay", "normalized_1_minus_data": "T1Norm"}[prep]
+        return prefix + ("Stretch" if "stretched" in config.t1_model_family.lower() else "Exp")
+    if family == "ODMR":
+        return "ODMRMulti" if config.odmr_multipeak else "ODMR"
+    if family == "CustomModel":
+        return str((config.custom_spec or {}).get("name", "CustomModel"))
+    return family
+
+
+def describe_parameter_controls(result, controls, model_name):
+    if not controls:
+        return result
+    applied = result.model_name == model_name
+    result.extras["parameter_controls"] = {"model": model_name, "applied": applied}
+    if not applied:
+        note = (
+            f"Parameter controls belong to {model_name}; they were not applied to selected model {result.model_name}."
+        )
+        result.selection_note = "; ".join(filter(None, (result.selection_note, note)))
+    return result
+
+
 def fit_non_ramsey(
     exp_type: str,
     x: np.ndarray,
@@ -1466,22 +1635,40 @@ def fit_non_ramsey(
     per-point SEM of the mean trace weights the fit and ``extras['reduced_chi2']`` is reported
     (sum((y-fit)/sem)^2/dof, absolute 1/sem^2 weights)."""
     cfg = config or FitWorkflowConfig()
+    if custom_spec is not None:
+        cfg = replace(cfg, custom_spec=custom_spec)
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     sem = aligned_sem(trace, x)
-    result = _fit_non_ramsey_impl(
-        exp_type, x, y, config=cfg, locks=locks, custom_spec=custom_spec,
-        trace_experiment_type=trace_experiment_type, trace=trace, sem=sem,
-    )
+    control_model = parameter_control_model(exp_type, cfg, x, y)
+    with parameter_controls(locks, model_name=control_model):
+        result = _fit_non_ramsey_impl(
+            exp_type,
+            x,
+            y,
+            config=cfg,
+            locks=None,
+            custom_spec=custom_spec,
+            trace_experiment_type=trace_experiment_type,
+            trace=trace,
+            sem=sem,
+        )
+    describe_parameter_controls(result, locks, control_model)
     if sem is None:
         if cfg.sem_weights and trace is not None:
             result.extras["sem_weights_applied"] = False
         return result
     rabi = result.model_name.startswith("Rabi") or exp_type in {"Rabi", "DEERDuration"}
-    weighted = bool(cfg.sem_weights) or (rabi and _rabi_fit_weights(trace, x, enabled=bool(cfg.rabi_use_sem)) is not None)
+    weighted = bool(cfg.sem_weights) or (
+        rabi and _rabi_fit_weights(trace, x, enabled=bool(cfg.rabi_use_sem)) is not None
+    )
     if not weighted:
         return result
-    n_locked = sum(1 for n in result.param_names if locks and n in locks and locks[n][1])
+    n_locked = (
+        len(result.params) - sum(result.free_mask)
+        if result.free_mask is not None
+        else sum(1 for n in result.param_names if locks and n in locks and locks[n][1])
+    )
     base = y
     result.extras["sem_weights_applied"] = True
-    span = result.extras.get('t1_norm_span', float(np.ptp(base)))
+    span = result.extras.get("t1_norm_span", float(np.ptp(base)))
     return _attach_sem_chi2(result, y, sem, n_locked, float(span), weighted=True)

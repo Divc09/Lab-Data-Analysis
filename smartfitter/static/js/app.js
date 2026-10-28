@@ -1,6 +1,6 @@
 // Application shell: top bar, library, routing, keyboard shortcuts, drag & drop, folder watching.
 import { call, onBusy } from './api.js';
-import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile } from './state.js';
+import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile, isDirty, markClean } from './state.js';
 import { h, mount, icon, toast, modal, contextMenu, fmt, fmtTime, fmtDate, basename, dirname, tag, debounce } from './util.js';
 import { renderAnalyze, renderInspector, runFit, runFitScoped, saveResults, copyFigure, resetView, ALT_TABS, kindOf } from './analyze.js';
 import { renderCompare, hasCompareTrend, hasCompareOverlay, saveCompareTrend, copyCompareOverlay } from './compare.js';
@@ -40,6 +40,9 @@ function buildShell() {
   mount(app, els.top, h('div', { class: 'body' }, els.lib, els.main, els.inspHandle, els.insp, els.full), els.status);
   onBusy((n, label) => renderStatus(n, label));
   subscribe((what) => (what === 'insp' ? renderInspectorOnly() : render()));
+  // Closing the window with unsaved work asks first (where the host honours beforeunload).
+  window.addEventListener('beforeunload', (e) => { if (isDirty()) { e.preventDefault(); e.returnValue = ''; } });
+  subscribe(() => { document.title = `${isDirty() ? '● ' : ''}SmartFitter`; });
 }
 
 let renderQueued = false;
@@ -113,7 +116,8 @@ function renderTop() {
   const nav = [['analyze', 'Analyze'], ['compare', 'Compare'], ['figure', 'Figure'], ['day', 'Day'], ['stack', 'Stacks'], ['autofind', 'AutoFind'], ['batch', 'Batch']];
   const save = currentWorkspaceActions().save;
   mount(els.top,
-    h('div', { class: 'brand', title: 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 20, '#5AA9F0'), h('span', { class: 'brand-name' }, 'SmartFitter')),
+    h('div', { class: 'brand', title: isDirty() ? 'Start screen · unsaved changes since the last session save (Ctrl+Shift+S)' : 'Start screen', onclick: () => { S.view = 'home'; emit(); } }, icon('logo', 20, '#5AA9F0'), h('span', { class: 'brand-name' }, 'SmartFitter'),
+      isDirty() ? h('span', { class: 'dirty-dot', 'aria-label': 'Unsaved changes' }, '●') : null),
     h('nav', { class: 'nav', 'aria-label': 'Workspaces' }, nav.map(([k, l]) => h('button', { class: S.view === k || (k === 'analyze' && S.view === 'home' && active()) ? 'on' : '', onclick: () => { S.view = k; emit(); } }, l))),
     h('div', { class: 'sp' }),
     h('button', { class: 'search-btn', title: 'Search files and commands (Ctrl+K, Ctrl+Shift+P)', onclick: openPalette }, icon('search', 13), h('span', {}, 'Search'), h('span', { class: 'kbd' }, 'Ctrl K')),
@@ -244,7 +248,24 @@ function fileMenu(e, p) {
   ]);
 }
 
+// Unsaved-work guard: run `go` directly when nothing would be lost, otherwise confirm first.
+function confirmDiscard(question, go) {
+  if (!isDirty()) return go();
+  const m = modal(h('div', { style: 'padding:18px 20px;display:flex;flex-direction:column;gap:14px;max-width:420px' },
+    h('div', {}, `${question} You have unsaved changes since the last session save; they will be lost unless you save a session (Ctrl+Shift+S).`),
+    h('div', { class: 'row', style: 'justify-content:flex-end;gap:8px' },
+      h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'),
+      h('button', { class: 'btn', onclick: async () => { m.close(); if (await saveSessionAs()) go(); } }, 'Save session…'),
+      h('button', { class: 'btn primary', onclick: () => { m.close(); go(); } }, 'Discard and continue'))));
+}
+
 function closeFile(p) {
+  const f = S.files[p];
+  const unsaved = f && (Object.keys(f.fit).length || Object.keys(f.iterationFits || {}).length || f.pins?.length);
+  if (unsaved && isDirty()) return confirmDiscard(`Close ${f.info.name}? Its fits and analysis settings will be discarded.`, () => closeFileNow(p));
+  closeFileNow(p);
+}
+function closeFileNow(p) {
   delete S.files[p];
   S.overlays = S.overlays.filter((q) => q !== p);
   S.compare.set = S.compare.set.filter((q) => (S.compare.items?.[q]?.path || q) !== p);
@@ -260,9 +281,9 @@ function closeAllFiles() {
     || Object.keys(f.iterationFits || {}).length || Object.keys(f.iterationSensitivity || {}).length).length;
   const go = () => {
     S.files = {}; S.overlays = []; S.compare.set = []; S.compare.results = {}; S.compare.items = {}; S.compare.global = null; S.library.extra = []; S.primary = null;
-    emit(); toast(`Closed ${n} file${n === 1 ? '' : 's'}.`);
+    markClean(); emit(); toast(`Closed ${n} file${n === 1 ? '' : 's'}.`);
   };
-  if (!fitted) return go();
+  if (!fitted) return confirmDiscard(`Close all ${n} open file${n === 1 ? '' : 's'}?`, go);
   const m = modal(h('div', { style: 'padding:18px 20px;display:flex;flex-direction:column;gap:14px;max-width:420px' },
     h('div', {}, `Close all ${n} open file${n === 1 ? '' : 's'}? ${fitted} ${fitted === 1 ? 'has' : 'have'} fit results that will be discarded unless you saved them (Ctrl+S) or saved a session (Ctrl+Shift+S).`),
     h('div', { class: 'row', style: 'justify-content:flex-end;gap:8px' },
@@ -537,7 +558,7 @@ async function chooseFolder() {
 }
 
 // ------------------------------------------------------------------ sessions
-export async function saveSession(path) { await call('save_session', { path, doc: sessionDoc() }, { label: 'Saving session' }); toast(`Session saved: ${basename(path)}`, 'ok'); }
+export async function saveSession(path) { await call('save_session', { path, doc: sessionDoc() }, { label: 'Saving session' }); markClean(); toast(`Session saved: ${basename(path)}`, 'ok'); return path; }
 async function saveSessionAs() {
   const f = active();
   const p = await call('dialog', { kind: 'save', title: 'Save analysis session', filename: `${f ? f.info.name.replace(/\.mat$/i, '').replace(/[<>:"/\\|?*]/g, '_') : 'analysis'}.sfsession.json`, directory: f ? dirname(f.combinedRecipe?.runs?.[0]?.path || f.path) : '' });
@@ -547,7 +568,8 @@ async function openSessionDialog() {
   const p = await call('dialog', { kind: 'open_files', title: 'Open analysis session', filters: ['SmartFitter session (*.sfsession.json;*.json)'] });
   if (p?.length) loadSession(p[0]);
 }
-async function loadSession(p) { const doc = await call('load_session', { path: p }, { label: 'Opening session' }); await applySession(doc); if (S.library.folder) openFolder(S.library.folder, { remember: false }); }
+function loadSession(p) { confirmDiscard('Open another session?', () => loadSessionNow(p)); }
+async function loadSessionNow(p) { const doc = await call('load_session', { path: p }, { label: 'Opening session' }); await applySession(doc); if (S.library.folder) openFolder(S.library.folder, { remember: false }); }
 
 // ------------------------------------------------------------------ home
 function renderHome(main) {

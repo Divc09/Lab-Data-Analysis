@@ -2,7 +2,7 @@ import { finiteExtent } from './numeric.js';
 // Analyze workspace: 1D experiments, time traces and 2D maps, with their inspectors.
 import { call } from './api.js';
 import { canonical, sourcePath } from './analysisidentity.js';
-import { S, emit, active, commit, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor } from './state.js';
+import { S, emit, active, commit, markDirty, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor } from './state.js';
 import { openOverlayPicker, browseOverlays } from './overlaypicker.js';
 import { isNormalizedT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, fmtPm, fmtCounts, num, toast, clone, tag, basename, dirname, stem, contextMenu, linreg } from './util.js';
@@ -80,13 +80,14 @@ export async function runFit(f, { robust = false, recordUndo = true } = {}) {
   f.fitting = true; emit('insp');
   try {
     for (const det of dets) {
-      const res = await call('fit', { path: f.path, detector: det, mode, proc, spec }, { label: `Fitting ${detLabel(f, det)}` });
+      const res = await call('fit', { path: f.path, detector: det, mode, proc, spec }, { label: `Fitting ${f.info.name} · ${detLabel(f, det)}`, retry: () => runFit(f, { robust, recordUndo: false }) });
       recordResult(f,res,{det,settings:spec});
       if (f.mode === mode) f.fit[det] = res;
       else { f.fitByMode ||= {}; (f.fitByMode[mode] ||= {})[det] = res; }
       f.fitHistory.unshift({ at: new Date().toLocaleTimeString(), det, mode, spec, res });
       f.fitHistory = f.fitHistory.slice(0, 12);
     }
+    markDirty();
     f.fitStale = signature !== JSON.stringify([f.mode, f.proc, prepareFitSpec(f)]);
     if (!f.layersTouched) { f.layers.fit = true; f.layers.results = kindOf(f) === '1d'; }
     const r = f.fit[f.detector];
@@ -112,7 +113,7 @@ function peakPickCard(f) {
   const stale = res && res.signature !== JSON.stringify([f.mode, f.proc]);
   return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:6px' },
     h('strong', {}, 'Peak-pick only (no fit)'),
-    h('div', { class: 'g2' }, field('Min prominence (% of range)', input(opt.prominence, (v) => { opt.prominence = Math.max(0.1, Math.min(100, num(v) || 8)); })),
+    h('div', { class: 'g2' }, field('Min prominence (% of range)', input(opt.prominence, (v) => { opt.prominence = Math.max(0.1, Math.min(100, num(v) || 8)); }, { numeric: true })),
       h('div', { style: 'align-self:end' }, check(`Use smoothed data${f.data[f.detector]?.proc?.smoothing_window > 1 ? ` (${f.data[f.detector].proc.smoothing_window} pt)` : ''}`, opt.smoothed, (v) => { opt.smoothed = v; }))),
     h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: run }, res ? 'Pick again' : 'Pick peaks'),
       res ? h('button', { class: 'btn sm', onclick: () => copyText(res.peaks.map((p) => `${p.x}\t${p.y}`).join('\n'), 'Peak positions copied') }, 'Copy') : null,
@@ -543,8 +544,10 @@ function bindPlot(el) {
     if (!f || !ev?.points?.length || kindOf(f) !== '1d') return;
     const d = f.data[f.detector];
     const idx = new Set(f.proc.excluded);
-    ev.points.filter((p) => p.data.meta?.key === 'data').forEach((p) => (d.proc.groups[p.pointIndex] || []).forEach((r) => idx.add(r)));
-    toast(`Excluded ${ev.points.length} point(s). Undo with Ctrl+Z.`);
+    const picked = ev.points.filter((p) => p.data.meta?.key === 'data');
+    picked.forEach((p) => (d.proc.groups[p.pointIndex] || []).forEach((r) => idx.add(r)));
+    const interpolated = picked.some((p) => d.proc.derived?.[p.pointIndex]);
+    toast(`Excluded ${ev.points.length} point(s)${interpolated ? '; interpolated points remove the measured points they were computed from' : ''}. Undo with Ctrl+Z.`);
     f.tool = 'zoom'; // one-shot: return to zoom after excluding
     setProc(f, { excluded: [...idx] }, 'exclude selection');
   });
@@ -697,8 +700,8 @@ function mapToolbar(f) {
       h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'lbl' }, 'Colormap'),
         cms.map((c) => h('button', { class: `cm ${M.cmap === c ? 'on' : ''}`, title: c, 'aria-label': c, style: `background:linear-gradient(90deg,${CMAP_GRADIENT[c]})`, onclick: () => set({ cmap: c }) }))),
       h('div', { class: 'row', style: 'gap:6px' }, h('span', { class: 'lbl' }, 'Range'),
-        input(M.plo, (v) => set({ plo: num(v) ?? 1, limits: 'robust' }), { style: 'width:52px;height:26px', title: 'Low percentile' }), h('span', { class: 'dim' }, 'to'),
-        input(M.phi, (v) => set({ phi: num(v) ?? 99.5, limits: 'robust' }), { style: 'width:58px;height:26px', title: 'High percentile' }), h('span', { class: 'dim' }, '%')),
+        input(M.plo, (v) => set({ plo: num(v) ?? 1, limits: 'robust' }), { numeric: true, style: 'width:52px;height:26px', title: 'Low percentile' }), h('span', { class: 'dim' }, 'to'),
+        input(M.phi, (v) => set({ phi: num(v) ?? 99.5, limits: 'robust' }), { numeric: true, style: 'width:58px;height:26px', title: 'High percentile' }), h('span', { class: 'dim' }, '%')),
       seg([['independent', 'Independent'], ['shared', 'Shared']], M.scale, (v) => set({ scale: v })),
       seg([['physical', 'Physical pixels'], ['square', 'Square']], M.geometry, (v) => { set({ geometry: v }); call('settings_set', { patch: { pixel_geometry: v } }, { quiet: true }); }),
       h('button', { class: `btn ${M.swap ? '' : ''}`, onclick: () => { commit('swap axes'); M.swap = !M.swap; M.bounds = null; M.cursor = M.cursor ? [M.cursor[1], M.cursor[0]] : null; if (M.line) M.line = M.line.map((q) => [q[1], q[0]]); if (overlayCache[f.path]) ensureOverlay(f).then(emit); emit(); } }, `Swap ${swapLabel(f)}`))));
@@ -739,27 +742,39 @@ export function mapRequest(f) {
   let second = M.compareWith;
   if (!second && f.info.detectors.length > 1) second = { path: f.path, detector: f.info.detectors.find((d) => d !== f.detector) };
   if (!second) return null;
-  return {first:{path:f.path,detector:f.detector,mode:f.mode,source:M.source || 'value'},second:{...second,mode:f.mode,source:M.source || 'value'},
-    opts:{shared:M.overlayScale==='shared',background:M.background,palette:M.palette,swap:M.swap}};
+  return {
+    first: { path: f.path, detector: f.detector, mode: f.mode, source: M.source || 'value' },
+    second: { ...second, mode: f.mode, source: M.source || 'value' },
+    opts: { shared: M.overlayScale === 'shared', background: M.background, palette: M.palette, swap: M.swap },
+  };
 }
 function displayedOverlay(f) {
-  const overlay=overlayCache[f.path];
-  if(!overlay || canonical(overlay.request)!==canonical(mapRequest(f)))return null;
-  for(const env of overlay.analyses || []) {
-    const owner=Object.values(S.files).find(o=>sourcePath(o.path)===env.descriptor.source);
-    if(owner?.info.source_revision?.sha256 && owner.info.source_revision.sha256!==env.source_revision?.sha256)return null;
+  const overlay = overlayCache[f.path];
+  if (!overlay || canonical(overlay.request) !== canonical(mapRequest(f))) return null;
+  for (const env of overlay.analyses || []) {
+    const owner = Object.values(S.files).find((o) => sourcePath(o.path) === env.descriptor.source);
+    if (owner?.info.source_revision?.sha256 && owner.info.source_revision.sha256 !== env.source_revision?.sha256) return null;
   }
   return overlay;
 }
 export async function ensureOverlay(f) {
-  const request=mapRequest(f);
-  if(!request){toast('Add another 2D file of the same plane, then pick it in Compare.');return;}
+  const request = mapRequest(f);
+  if (!request) {
+    toast('Add another 2D file of the same plane, then pick it in Compare.');
+    return;
+  }
   delete f.overlayErrorKey;
   try {
-    const result=await call('map_overlay',request,{label:'Building overlay'});
-    recordResult(f,result,{kind:'map_overlay'});
-    if(canonical(request)===canonical(mapRequest(f))){overlayCache[f.path]=result;return result;}
-  } catch (e) { overlayCache[f.path] = null;f.overlayErrorKey=canonical(request); }
+    const result = await call('map_overlay', request, { label: 'Building overlay' });
+    recordResult(f, result, { kind: 'map_overlay' });
+    if (canonical(request) === canonical(mapRequest(f))) {
+      overlayCache[f.path] = result;
+      return result;
+    }
+  } catch (e) {
+    overlayCache[f.path] = null;
+    f.overlayErrorKey = canonical(request);
+  }
 }
 
 // ---------------------------------------------------------------- inspector
@@ -842,8 +857,8 @@ function displayControls(f) {
   const upd = (patch) => { commit('display'); Object.assign(D, patch); emit(); };
   return h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Display'),
     seg([[false, 'Peaks'], [true, 'Dips (invert)']], !!D.invert, (v) => upd({ invert: v })),
-    h('div', { class: 'g2' }, field('Axis scale (×)', input(D.xscale ?? 1, (v) => upd({ xscale: num(v) || 1 }), { title: 'Displayed x = scale · x + offset' })),
-      field(`Axis offset (native ${f.info.x_unit || 'axis units'})`, input(D.xoffset ?? 0, (v) => upd({ xoffset: num(v) ?? 0 })))),
+    h('div', { class: 'g2' }, field('Axis scale (×)', input(D.xscale ?? 1, (v) => upd({ xscale: num(v) || 1 }), { numeric: true, title: 'Displayed x = scale · x + offset' })),
+      field(`Axis offset (native ${f.info.x_unit || 'axis units'})`, input(D.xoffset ?? 0, (v) => upd({ xoffset: num(v) ?? 0 }), { numeric: true }))),
     h('div', { class: 'note' }, 'Display only: the fit and exported numbers stay in the file\'s own units.'));
 }
 
@@ -891,8 +906,8 @@ function fitTab(f) {
       out.append(h('div', { class: 'g2' }, field('Polarity', select(['Auto', 'Peak', 'Dip'], s.odmr_polarity, (v) => set({ odmr_polarity: v }))),
         field('Peaks', select([['auto', 'Auto'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4']], s.odmr_auto_peaks ? 'auto' : String(s.odmr_peaks), (v) => set(v === 'auto' ? { odmr_auto_peaks: true } : { odmr_auto_peaks: false, odmr_peaks: Number(v), odmr_multi: Number(v) > 1 })))),
       check('Multi-Lorentzian when several peaks are found', s.odmr_multi, (v) => set({ odmr_multi: v })),
-      h('div', { class: 'g2' }, field('Centers from', input(s.odmr_ranges[0]?.[0] ?? '', (v) => set({ odmr_ranges: [[num(v), s.odmr_ranges[0]?.[1] ?? null]] }), { placeholder: 'any' })),
-        field('to', input(s.odmr_ranges[0]?.[1] ?? '', (v) => set({ odmr_ranges: [[s.odmr_ranges[0]?.[0] ?? null, num(v)]] }), { placeholder: 'any' }))));
+      h('div', { class: 'g2' }, field('Centers from', input(s.odmr_ranges[0]?.[0] ?? '', (v) => set({ odmr_ranges: [[num(v), s.odmr_ranges[0]?.[1] ?? null]] }), { numeric: true, placeholder: 'any' })),
+        field('to', input(s.odmr_ranges[0]?.[1] ?? '', (v) => set({ odmr_ranges: [[s.odmr_ranges[0]?.[0] ?? null, num(v)]] }), { numeric: true, placeholder: 'any' }))));
       out.append(peakPickCard(f));
     } else if (fam === 'T1') {
       out.append(field('Preprocess', seg([['Auto', 'Auto'], ['Direct T1', 'Direct'], ['Normalize then 1-data', 'Normalize, 1 − data']], s.t1_prep, (v) => set({ t1_prep: v }))),
@@ -900,7 +915,7 @@ function fitTab(f) {
     } else if (fam === 'SpinEcho') {
       out.append(h('div', { class: 'note' }, 'Stretched exponential y0 + A·exp(−(t/T2)ⁿ). Lock n in Seeds & bounds to force n = 1, 2 or 3.'));
     } else if (fam === 'LineScan' || fam === 'Scan2D') {
-      out.append(h('div', { class: 'note' }, 'Line scans are plot-only under Auto. Choose Gaussian peaks to fit fluorescence peaks.'));
+      out.append(h('div', { class: 'note' }, fam === 'LineScan' ? 'Auto fits one Gaussian peak on a constant background (as Batch does). Choose Gaussian peaks to fit several.' : '2D maps are not fitted here; use Spots to fit Gaussian spots.'));
     }
   }
   if (s.model === 'GaussianPeaks') out.append(field('Number of peaks', select([1, 2, 3, 4, 5, 6, 7, 8], s.peaks, (v) => set({ peaks: Number(v) }))),
@@ -911,14 +926,15 @@ function fitTab(f) {
     if (!s.custom_params.length) s.custom_params = exprParams(s.custom_expr);
     out.append(field('Expression in x (numpy functions: exp, log, sqrt, sin, cos, abs, clip)', ta),
       h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Param'), h('th', {}, 'Seed'), h('th', {}, 'Min'), h('th', {}, 'Max')),
-        s.custom_params.map((p) => h('tr', {}, h('td', { class: 'txt' }, p.name), ['seed', 'min', 'max'].map((k) => h('td', {}, input(p[k] ?? '', (v) => { p[k] = num(v); set({}); }, { placeholder: k === 'seed' ? '1' : '–' })))))));
+        s.custom_params.map((p) => h('tr', {}, h('td', { class: 'txt' }, p.name), ['seed', 'min', 'max'].map((k) => h('td', {}, input(p[k] ?? '', (v) => { p[k] = num(v); set({}); }, { numeric: true, placeholder: k === 'seed' ? '1' : '–' })))))));
   }
   // range
   const fr = f.data[f.detector]?.proc?.x || [];
   const splitAt = out.children.length; // everything appended from here on is secondary (moved below the results)
+  const rangeUnit = f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || '';
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Fit range (native ${f.info.type === 'TimeTrace' ? 's' : f.info.x_unit || 'axis units'})`),
-    h('div', { class: 'row wrap', style: 'gap:4px' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { placeholder: fr.length ? fmt(finiteExtent(fr)[0], 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
-      input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { placeholder: fr.length ? fmt(finiteExtent(fr)[1], 5) : 'max', style: 'width:90px' }),
+    h('div', { class: 'row wrap', style: 'gap:4px' }, input(s.range_min ?? '', (v) => set({ range_min: num(v) }), { numeric: true, unit: rangeUnit, placeholder: fr.length ? fmt(finiteExtent(fr)[0], 5) : 'min', style: 'width:90px' }), h('span', { class: 'dim' }, 'to'),
+      input(s.range_max ?? '', (v) => set({ range_max: num(v) }), { numeric: true, unit: rangeUnit, placeholder: fr.length ? fmt(finiteExtent(fr)[1], 5) : 'max', style: 'width:90px' }),
       h('button', { class: 'btn sm', title: 'Use the current zoomed x range', onclick: () => { const r = f.xrange?.map(f.info.type === 'TimeTrace' ? (v) => v * (f.tt.unit === 'min' ? 60 : 1) : xDisplay(f, comparisonFiles(f)).inverse).sort((a, b) => a - b); set({ range_min: r?.[0] ?? null, range_max: r?.[1] ?? null }); } }, 'Use view'),
       h('button', { class: 'btn sm', onclick: () => set({ range_min: null, range_max: null }) }, 'All'),
       h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const [lo, hi] = finiteExtent(fr); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
@@ -926,11 +942,11 @@ function fitTab(f) {
   // options
   const opts = h('details', { class: 'card pad', open: !!f.display.fitOptions, ontoggle: (e) => { f.display.fitOptions = e.target.open; } }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
     h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
-      h('div', { class: 'g2' }, field('Multistart', input(s.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }))),
-        fam === 'Rabi' ? field('Delay / dead time (ns)', input(s.dead_time_ns || '', (v) => set({ dead_time_ns: num(v) || 0 }), { placeholder: 'fit' })) : h('span')),
+      h('div', { class: 'g2' }, field('Multistart', input(s.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }), { numeric: true })),
+        fam === 'Rabi' ? field('Delay / dead time (ns)', input(s.dead_time_ns || '', (v) => set({ dead_time_ns: num(v) || 0 }), { numeric: true, unit: 'ns', placeholder: 'fit' })) : h('span')),
       fam === 'Rabi' ? [check('Weight by iteration SEM', s.sem_weights, (v) => set({ sem_weights: v })),
         check('Lock to π / π/2 times', s.pi_lock, (v) => set({ pi_lock: v })),
-        s.pi_lock ? h('div', { class: 'g2' }, field('π (ns)', input(s.pi_ns, (v) => set({ pi_ns: num(v) }))), field('π/2 (ns)', input(s.pi2_ns, (v) => set({ pi2_ns: num(v) })))) : null] : null,
+        s.pi_lock ? h('div', { class: 'g2' }, field('π (ns)', input(s.pi_ns, (v) => set({ pi_ns: num(v) }), { numeric: true, unit: 'ns' })), field('π/2 (ns)', input(s.pi2_ns, (v) => set({ pi2_ns: num(v) }), { numeric: true, unit: 'ns' }))) : null] : null,
       sci.semAllCheck(f, set),
       f.proc.steps.length ? check('Fit the transformed data', s.fit_transformed, (v) => set({ fit_transformed: v })) : null,
       f.info.detectors.length > 1 ? field('Apply to', seg([[false, 'Active detector'], [true, 'Both detectors']], s.apply_both, (v) => set({ apply_both: v }))) : null));
@@ -1022,13 +1038,13 @@ function paramCard(f, fit) {
     card.append(h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Param'), h('th', {}, 'Value'), h('th', {}, 'Min'), h('th', {}, 'Max'), h('th', {}, 'Lock')),
       fit.params.map((p) => {
         const e = s.params[p.name] || {};
-        const upd = (patch) => { commit('parameter bounds'); s.params[p.name] = { ...e, ...patch }; emit('insp'); };
-        return h('tr', {}, h('td', { class: 'txt' }, `${p.name}${parameterUnit(p, f.info) ? ` (${parameterUnit(p, f.info)})` : ''}`), h('td', {}, input(e.value ?? '', (v) => upd({ value: num(v) }), { placeholder: fmt(p.value, 4) })),
-          h('td', {}, input(e.min ?? '', (v) => upd({ min: num(v) }), { placeholder: '–' })), h('td', {}, input(e.max ?? '', (v) => upd({ max: num(v) }), { placeholder: '–' })),
+        const upd = (patch) => { commit('parameter bounds'); s.params_model = fit.model; s.params[p.name] = { ...e, ...patch }; emit('insp'); };
+        return h('tr', {}, h('td', { class: 'txt' }, `${p.name}${parameterUnit(p, f.info) ? ` (${parameterUnit(p, f.info)})` : ''}`), h('td', {}, input(e.value ?? '', (v) => upd({ value: num(v) }), { numeric: true, unit: parameterUnit(p, f.info), placeholder: fmt(p.value, 4) })),
+          h('td', {}, input(e.min ?? '', (v) => upd({ min: num(v) }), { numeric: true, unit: parameterUnit(p, f.info), placeholder: '–' })), h('td', {}, input(e.max ?? '', (v) => upd({ max: num(v) }), { numeric: true, unit: parameterUnit(p, f.info), placeholder: '–' })),
           h('td', {}, h('input', { type: 'checkbox', checked: !!e.lock, 'aria-label': `Lock ${p.name}`, onchange: (ev) => upd({ lock: ev.target.checked, value: e.value ?? p.value }) })));
       })),
-    h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn sm', onclick: () => { commit('seeds'); fit.params.forEach((p) => { s.params[p.name] = { ...(s.params[p.name] || {}), value: p.value }; }); emit('insp'); } }, 'Values from current fit'),
-      h('button', { class: 'btn sm', onclick: () => { commit('clear bounds'); s.params = {}; emit('insp'); } }, 'Clear'), h('button', { class: 'btn sm', onclick: () => savePreset(f) }, 'Save as preset')));
+    h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn sm', onclick: () => { commit('seeds'); s.params_model = fit.model; fit.params.forEach((p) => { s.params[p.name] = { ...(s.params[p.name] || {}), value: p.value }; }); emit('insp'); } }, 'Values from current fit'),
+      h('button', { class: 'btn sm', onclick: () => { commit('clear bounds'); s.params = {}; delete s.params_model; emit('insp'); } }, 'Clear'), h('button', { class: 'btn sm', onclick: () => savePreset(f) }, 'Save as preset')));
   }
   return card;
 }
@@ -1088,9 +1104,9 @@ function procTab(f) {
   if (kindOf(f) === '1d') out.append(iterationCard(f), iterationFitActions(f),
     h('button', { class: 'btn block', onclick: () => openCombineDialog(f) }, 'Combine runs…'));
   out.append(h('div', { class: 'g2' },
-    field('Bin size', input(f.proc.bin, (v) => setProc(f, { bin: Math.max(1, Math.round(num(v) || 1)) }))),
-    field(kindOf(f) === 'tt' ? 'Smoothing (points)' : 'Smoothing window', input(f.proc.smooth, (v) => { const smooth = Math.max(1, Math.round(num(v) || 1)); f.layers.smooth = smooth > 1; setProc(f, { smooth }); }))));
-  out.append(h('div', { class: 'g2' }, field('Data from', input(f.proc.roi_min ?? '', (v) => setProc(f, { roi_min: num(v) }), { placeholder: 'start' })), field('to', input(f.proc.roi_max ?? '', (v) => setProc(f, { roi_max: num(v) }), { placeholder: 'end' }))));
+    field('Bin size', input(f.proc.bin, (v) => setProc(f, { bin: Math.max(1, Math.round(num(v) || 1)) }), { numeric: true })),
+    field(kindOf(f) === 'tt' ? 'Smoothing (points)' : 'Smoothing window', input(f.proc.smooth, (v) => { const smooth = Math.max(1, Math.round(num(v) || 1)); f.layers.smooth = smooth > 1; setProc(f, { smooth }); }, { numeric: true }))));
+  out.append(h('div', { class: 'g2' }, field('Data from', input(f.proc.roi_min ?? '', (v) => setProc(f, { roi_min: num(v) }), { numeric: true, placeholder: 'start' })), field('to', input(f.proc.roi_max ?? '', (v) => setProc(f, { roi_max: num(v) }), { numeric: true, placeholder: 'end' }))));
   const nEx = f.proc.excluded.length + f.proc.exclusion_ranges.length;
   out.append(h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'Excluded points'),
     nEx ? h('div', { class: 'row wrap' }, h('span', { class: 'mono' }, `${f.proc.excluded.length} point(s)`), h('button', { class: 'btn sm', onclick: () => setProc(f, { excluded: [], exclusion_ranges: [] }, 'restore points') }, 'Restore all'))
@@ -1112,7 +1128,7 @@ function procTab(f) {
     let param = null;
     if (st.kind === 'baseline') param = select([['median', 'median'], ['mean', 'mean'], ['first', 'first point'], ['linear', 'linear fit']], st.params?.method || 'median', (v) => upd({ params: { method: v } }), { style: 'width:110px;height:26px' });
     if (st.kind === 'normalize') param = select([['minmax', 'min–max'], ['zscore', 'z-score'], ['area', 'area']], st.params?.method || 'minmax', (v) => upd({ params: { method: v } }), { style: 'width:110px;height:26px' });
-    if (st.kind === 'resample') param = input(st.params?.count || '', (v) => upd({ params: { count: num(v) } }), { placeholder: 'points', style: 'width:80px;height:26px' });
+    if (st.kind === 'resample') param = input(st.params?.count || '', (v) => upd({ params: { count: num(v) } }), { numeric: true, placeholder: 'points', style: 'width:80px;height:26px' });
     if (st.kind === 'expression') param = input(st.params?.expression || 'y', (v) => upd({ params: { expression: v } }), { style: 'height:26px', placeholder: 'e.g. y / max(y)' });
     return h('div', { class: 'card', style: 'padding:6px 8px;display:flex;align-items:center;gap:8px' },
       h('input', { type: 'checkbox', checked: st.enabled !== false, 'aria-label': 'Enable step', onchange: (e) => upd({ enabled: e.target.checked }) }),
@@ -1147,7 +1163,7 @@ function plotTab(f) {
       (v) => { commit('results box'); f.layers.results = v !== 'off'; st.results = { ...(st.results || {}), format: v === 'pm' ? 'pm' : 'sig4' }; emit(); })) : null,
     kindOf(f) === '1d' ? displayControls(f) : null,
     kindOf(f) === '1d' ? field('Uncertainty', seg([['band', 'Band'], ['bars', 'Error bars']], f.errorMode, (v) => { f.errorMode = v; f.layers.band = true; emit(); })) : null,
-    h('div', { class: 'g3' }, field('Width (in)', input(s.width_in, (v) => set({ width_in: num(v) || 8.5 }))), field('Height (in)', input(s.height_in, (v) => set({ height_in: num(v) || 5.5 }))), field('DPI', input(s.dpi, (v) => set({ dpi: num(v) || 300 })))),
+    h('div', { class: 'g3' }, field('Width (in)', input(s.width_in, (v) => set({ width_in: num(v) || 8.5 }), { numeric: true })), field('Height (in)', input(s.height_in, (v) => set({ height_in: num(v) || 5.5 }), { numeric: true })), field('DPI', input(s.dpi, (v) => set({ dpi: num(v) || 300 }), { numeric: true }))),
     h('div', { class: 'row wrap' }, check('Grid', s.grid, (v) => set({ grid: v })), check('Mirror ticks', s.mirror, (v) => set({ mirror: v })), kindOf(f) === '1d' ? check('Residual panel', f.layers.res, (v) => { f.layers.res = v; emit(); }) : null),
     h('button', { class: 'btn block', onclick: () => { S.editor.open = true; emit(); } }, 'Open full plot editor'),
     h('div', { class: 'note' }, 'Double-click the title or an axis label on the plot to retype it. Drag the legend or results box to move them. Double-click a legend entry to restyle that series.'));
@@ -1218,8 +1234,9 @@ export async function saveResults(f) {
       comparison: k === '1d' ? comparisonRows(f) : undefined,
       series: k === '1d' ? comparisonFiles(f).map((o) => ({ path: o.path, mode: o.mode, detector: o.detector, processing: o.proc, fit_spec: o.fitSpec, fit: Object.fromEntries(Object.entries(o.fit).map(([det, r]) => [det, { ...r, raw: undefined }])) })) : undefined },
     map_comparison_csv: !!e.map_csv && !!displayedOverlay(f),
-  } }, { label: 'Saving results' });
-  if (reportImgs) await call('export', { req: { output_dir: dir, stem: `${stemName}_report`, images: reportImgs, dpi: st.dpi, json: false } }, { label: 'Saving report PDF' });
+  } }, { label: `Saving ${f.info.name}`, retry: () => saveResults(f) });
+  const reportRes = reportImgs ? await call('export', { req: { output_dir: dir, stem: `${stemName}_report`, images: reportImgs, dpi: st.dpi, json: false } }, { label: 'Saving report PDF' }) : null;
+  [...(res.warnings || []), ...(reportRes?.warnings || [])].forEach((w) => toast(w, 'err', 9000));
   if (e.session) { const { saveSession } = await import('./app.js'); await saveSession(`${dir}\\${stemName}.sfsession.json`); }
   toast(`Saved ${res.written.length} file(s) to ${res.folder}`, 'ok');
   return res;
@@ -1326,7 +1343,7 @@ function statsTab(f) {
     tt.statsKey = JSON.stringify(tt.windows) + f.mode;
     call('time_stats', { path: f.path, mode: f.mode, windows: tt.windows }, { quiet: true }).then((r) => { tt.stats = r; emit('insp'); });
   }
-  const wIn = (key, j) => input(tt.windows[key] ? fmt(tt.windows[key][j], 6) : '', (v) => { commit('window'); tt.windows[key] = [...(tt.windows[key] || [0, 0])]; tt.windows[key][j] = num(v) ?? 0; emit(); }, { style: 'width:70px' });
+  const wIn = (key, j) => input(tt.windows[key] ? fmt(tt.windows[key][j], 6) : '', (v) => { commit('window'); tt.windows[key] = [...(tt.windows[key] || [0, 0])]; tt.windows[key][j] = num(v) ?? 0; emit(); }, { numeric: true, style: 'width:70px' });
   const dt = d?.time?.dt || {};
   const st = tt.stats || {};
   return h('div', { style: 'display:flex;flex-direction:column;gap:12px' },
@@ -1374,11 +1391,11 @@ function mapTab(f) {
     M.limits === 'manual' ? h('div', { class: 'card pad', style: 'display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr);gap:6px 8px;align-items:center' },
       h('span'), h('span', { class: 'lbl' }, 'Min'), h('span', { class: 'lbl' }, 'Max'),
       (M.scale === 'shared' ? ['shared'] : f.info.detectors).flatMap((det) => [h('span', {}, det === 'shared' ? 'All' : detLabel(f, det)),
-        input(M.manual[det]?.[0] ?? '', (v) => { M.manual[det] = [num(v), M.manual[det]?.[1] ?? null]; emit(); }), input(M.manual[det]?.[1] ?? '', (v) => { M.manual[det] = [M.manual[det]?.[0] ?? null, num(v)]; emit(); })])) : null,
+        input(M.manual[det]?.[0] ?? '', (v) => { M.manual[det] = [num(v), M.manual[det]?.[1] ?? null]; emit(); }, { numeric: true }), input(M.manual[det]?.[1] ?? '', (v) => { M.manual[det] = [M.manual[det]?.[0] ?? null, num(v)]; emit(); }, { numeric: true })])) : null,
     h('div', { class: 'f' }, h('span', { class: 'lbl' }, 'View bounds'),
       h('div', { style: 'display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr);gap:6px 8px;align-items:center' },
-        h('span', { class: 'muted' }, 'X'), input(M.bounds?.x?.[0] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), x: [num(v), M.bounds?.x?.[1] ?? null] } }), { placeholder: 'auto' }), input(M.bounds?.x?.[1] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), x: [M.bounds?.x?.[0] ?? null, num(v)] } }), { placeholder: 'auto' }),
-        h('span', { class: 'muted' }, 'Y'), input(M.bounds?.y?.[0] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), y: [num(v), M.bounds?.y?.[1] ?? null] } }), { placeholder: 'auto' }), input(M.bounds?.y?.[1] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), y: [M.bounds?.y?.[0] ?? null, num(v)] } }), { placeholder: 'auto' }))),
+        h('span', { class: 'muted' }, 'X'), input(M.bounds?.x?.[0] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), x: [num(v), M.bounds?.x?.[1] ?? null] } }), { numeric: true, placeholder: 'auto' }), input(M.bounds?.x?.[1] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), x: [M.bounds?.x?.[0] ?? null, num(v)] } }), { numeric: true, placeholder: 'auto' }),
+        h('span', { class: 'muted' }, 'Y'), input(M.bounds?.y?.[0] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), y: [num(v), M.bounds?.y?.[1] ?? null] } }), { numeric: true, placeholder: 'auto' }), input(M.bounds?.y?.[1] ?? '', (v) => set({ bounds: { ...(M.bounds || {}), y: [M.bounds?.y?.[0] ?? null, num(v)] } }), { numeric: true, placeholder: 'auto' }))),
     field('Pixels', seg([['physical', 'Physical size'], ['square', 'Square']], M.geometry, (v) => set({ geometry: v }))),
     h('div', { class: 'note' }, 'Maps are never stretched: physical keeps equal data units on both axes; square keeps every pixel square. Swapping axes keeps the geometry.'),
     h('div', { class: 'g2' }, field('Linecut', select([['none', 'None'], ['h', 'Horizontal'], ['v', 'Vertical'], ['cross', 'Both'], ['line', 'Line (two clicks)']], M.linecut, (v) => { if (v !== 'none' && v !== 'line' && !M.cursor) M.cursor = peakCell(f, f.detector); set({ linecut: v }); })),
@@ -1418,7 +1435,7 @@ function spotsTab(f) {
     h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', onclick: run }, 'Detect and fit'), f.info.detectors.length > 1 ? seg([['both', 'Both detectors'], ['active', 'Active']], o.scope, (v) => set({ scope: v })) : null),
     h('div', { class: 'g2' }, field('Analyze', select([['auto', 'Auto fluorescence'], ['value', 'Current observable'], ['signal', 'Signal'], ['reference', 'Reference'], ['difference', 'Difference']], o.source, (v) => set({ source: v }))),
       field('Polarity', select(['Auto', 'Bright', 'Dark', 'Bright and dark'], o.polarity, (v) => set({ polarity: v })))),
-    h('div', { class: 'g3' }, field('Max spots', input(o.max_spots ?? '', (v) => set({ max_spots: num(v) }), { placeholder: 'auto' })), field('Threshold (σ)', input(o.threshold, (v) => set({ threshold: num(v) || 3 }))), field('Min pixels', input(o.min_pixels, (v) => set({ min_pixels: num(v) || 4 }))), field('Background', input(o.bg_window || 'auto', (v) => set({ bg_window: num(v) || 0 })))),
+    h('div', { class: 'g3' }, field('Max spots', input(o.max_spots ?? '', (v) => set({ max_spots: num(v) }), { numeric: true, placeholder: 'auto' })), field('Threshold (σ)', input(o.threshold, (v) => set({ threshold: num(v) || 3 }), { numeric: true })), field('Min pixels', input(o.min_pixels, (v) => set({ min_pixels: num(v) || 4 }), { numeric: true })), field('Background', input(o.bg_window || 'auto', (v) => set({ bg_window: num(v) || 0 }), { numeric: true }))),
     h('div', { class: 'row wrap' }, check('Fitted shapes', M.showShapes, (v) => { M.showShapes = v; emit(); }), check('Centers', M.showCenters, (v) => { M.showCenters = v; emit(); }), check('Numbers', M.showNumbers, (v) => { M.showNumbers = v; emit(); })),
     h('div', { class: 'card pad' },
       h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, `${rows.length} spot${rows.length === 1 ? '' : 's'}`), h('span', { class: 'sp' }),
@@ -1483,10 +1500,10 @@ function spotCompareCard(f, sel) {
   if (!c) { card.append(h('span', { class: 'spinner' })); return card; }
   card.append(h('div', { class: 'kv' },
     h('span', { class: 'k' }, 'Center offset ΔX'), h('span', { class: 'v' }, fmt(c.dx, 4)), h('span', { class: 'k' }, 'Center offset ΔY'), h('span', { class: 'v' }, fmt(c.dy, 4)),
-    h('span', { class: 'k' }, '|Δ|'), h('span', { class: 'v' }, `${fmt(c.distance, 4)}${c.distance_px ? ` (≈ ${fmt(c.distance_px, 2)} px)` : ''}`),
+    h('span', { class: 'k' }, '|Δ|'), h('span', { class: 'v', title: 'Pixels: Δx and Δy each divided by that axis\'s own pixel spacing' }, `${fmt(c.distance, 4)}${c.distance_px ? ` (≈ ${fmt(c.distance_px, 2)} px)` : ''}`),
     h('span', { class: 'k' }, 'FWHM ratio (major, minor)'), h('span', { class: 'v' }, `${fmt(c.fwhm_major_ratio, 3)}, ${fmt(c.fwhm_minor_ratio, 3)}`),
     h('span', { class: 'k' }, 'Angle difference'), h('span', { class: 'v' }, `${fmt(c.angle_diff, 3)}°`), h('span', { class: 'k' }, 'Amplitude ratio'), h('span', { class: 'v' }, fmt(c.amplitude_ratio, 3)),
-    h('span', { class: 'k' }, 'Local profile correlation'), h('span', { class: 'v' }, fmt(c.profile_correlation, 3))),
+    h('span', { class: 'k' }, 'Local profile correlation'), h('span', { class: 'v', title: c.profile_correlation_note || '' }, c.profile_correlation_note ? 'n/a' : fmt(c.profile_correlation, 3))),
   h('div', { class: 'note' }, `Offsets in stage units from the fitted Gaussian centers (second minus first). ${auto ? 'Using the only spot on each detector.' : ''}`));
   return card;
 }
@@ -1504,7 +1521,7 @@ function mapCompareTab(f) {
     h('div', { class: 'note' }, 'Lists maps from loaded files. They must cover the same plane (XY, XZ, YZ), including opposite stored axis order. Add more files from the Library.'),
     field('Palette', seg(['Pink / teal', 'Green / magenta', 'Red / cyan'], M.palette, (v) => update({ palette: v }))),
     field('Normalization', seg([['independent', 'Independent'], ['shared', 'Shared']], M.overlayScale, (v) => update({ overlayScale: v }))),
-    field('Background removed (percentile)', input(M.background, (v) => update({ background: Math.min(100, Math.max(0, num(v) ?? 10)) }))),
+    field('Background removed (percentile)', input(M.background, (v) => update({ background: Math.min(100, Math.max(0, num(v) ?? 10)) }), { numeric: true })),
     h('div', { class: 'note' }, 'Different grids are combined on native pixel edges by copying each measured cell. No interpolation or extrapolation; uncovered area stays transparent.'),
     h('div', { class: 'row wrap' }, h('button', { class: 'btn primary', onclick: () => update({}) }, 'Show overlay'),
       h('button', { class: 'btn', disabled: !M.prevLayout, onclick: () => { M.layout = M.prevLayout || 'side'; M.prevLayout = null; emit(); } }, 'Restore previous view')));

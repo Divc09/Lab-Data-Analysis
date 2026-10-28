@@ -4,6 +4,7 @@ Everything scientific is delegated to the validated ``nvfit`` package (loaders,
 processing, fit workflows, NV metrics, spot detection, map overlays, batch).
 This module only adapts those results into JSON payloads for the interface.
 """
+
 from __future__ import annotations
 
 import base64
@@ -14,7 +15,10 @@ import math
 import hashlib
 import uuid
 from copy import deepcopy
+from functools import partial, wraps
+from inspect import signature
 import os
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +36,14 @@ from nvfit.analysis_identity import analysis_descriptor, result_envelope, source
 from nvfit.units import compatibility, trace_units, unit_scale
 from nvfit.fit_workflows import FitWorkflowConfig, aligned_sem, fit_non_ramsey
 from nvfit.io_mat import DETECTOR_LABELS, ExperimentDataset, ExperimentTrace, load_experiment_dataset
-from nvfit.iterations import iteration_matrix, selected_trace, selection_indices, iteration_sources, matrix_stats, combine_datasets
+from nvfit.iterations import (
+    iteration_matrix,
+    selected_trace,
+    selection_indices,
+    iteration_sources,
+    matrix_stats,
+    combine_datasets,
+)
 from nvfit.map_comparison import axis_edges, axis_key, build_map_overlay, compatible_axes
 from nvfit.models import MODEL_REGISTRY
 from nvfit.preprocess import smooth_trace
@@ -44,7 +55,108 @@ from nvfit import pro_batch
 
 from .params import param_meta
 
+
+def plain_endpoint(function):
+    """Declare a command/query endpoint that does not create an analysis result."""
+    function.__smartfitter_result_policy__ = "plain"
+    return function
+
+
+def owned_result(function):
+    """Declare a calculation that constructs its own richer result envelope."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        result = function(*args, **kwargs)
+        if not isinstance(result, dict) or not result.get("analysis"):
+            raise ValueError(f"{function.__name__} did not provide its analysis envelope.")
+        return result
+
+    wrapped.__smartfitter_result_policy__ = "owned"
+    return wrapped
+
+
+def analysis_result(function=None, *, aggregate=False, detector_argument="detector", reference_paths=()):
+    """Capture provenance at the calculation boundary, also for direct callers.
+
+    Each endpoint must declare this policy, owned_result, or plain_endpoint.
+    Registration rejects undeclared endpoints so a new calculation cannot
+    silently bypass result provenance.
+    """
+    if function is None:
+        return partial(
+            analysis_result, aggregate=aggregate, detector_argument=detector_argument, reference_paths=reference_paths
+        )
+    parameters = signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = parameters.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = dict(bound.arguments)
+        ws = values.pop("ws")
+        kind = function.__name__
+        if aggregate:
+            paths = values.get("paths") or []
+            revisions = {
+                source_path(path): ws.source_revision(path) if hasattr(ws, "source_revision") else None
+                for path in paths
+            }
+            descriptor = analysis_descriptor(
+                "aggregate",
+                values.get("detectors") or values.get("detector", "detector1"),
+                values.get("mode", "contrast"),
+                {"paths": [source_path(path) for path in paths], "opts": values.get("opts") or {}},
+            )
+            envelope = result_envelope(descriptor, revisions, clean(values), revisions, kind)
+        elif values.get("path"):
+            path = values["path"]
+            mode = values.get("mode", "contrast")
+            trace = ws.trace(path, values.get(detector_argument), mode)
+            settings = {key: value for key, value in values.items() if key not in ("path", "detector", "mode", "proc")}
+            envelope = analysis_for(
+                ws, path, trace.detector_id, mode, values.get("proc") or {}, clean(settings), kind=kind
+            )
+            dependencies = dict(envelope["dependencies"])
+            for key in reference_paths:
+                if values.get(key):
+                    dependencies[source_path(values[key])] = (
+                        ws.source_revision(values[key]) if hasattr(ws, "source_revision") else None
+                    )
+            envelope = result_envelope(
+                envelope["descriptor"], envelope["source_revision"], envelope["settings"], dependencies, kind
+            )
+        else:
+            envelope = result_envelope(analysis_descriptor("manual", None, "manual"), None, clean(values), kind=kind)
+        result = function(*args, **kwargs)
+        if not isinstance(result, dict):
+            raise ValueError(f"{kind} must return an analysis result object.")
+        result.setdefault("analysis", envelope)
+        return result
+
+    wrapped.__smartfitter_result_policy__ = "analysis"
+    return wrapped
+
+
+def bind_endpoint(function, workspace=None):
+    """Validate an endpoint's explicit result policy, then bind its workspace."""
+    if getattr(function, "__smartfitter_result_policy__", None) not in {"plain", "owned", "analysis"}:
+        raise ValueError(
+            f"Endpoint {getattr(function, '__name__', function)!r} must declare analysis_result, owned_result, or plain_endpoint."
+        )
+    return partial(function, workspace) if workspace is not None else function
+
+
 APP_VERSION = "2.0"
+
+
+def _file_stamp(stat: os.stat_result) -> tuple[int, int, int]:
+    """Cheap identity for cache keys: modification time, size and file id (inode / NTFS file index).
+
+    Modification time alone misses a replacement copied in with its timestamp preserved; the size or file id
+    then differs.  Content hashes (``source_revision``) are computed once per stamp, not on every access.
+    """
+    return (stat.st_mtime_ns, stat.st_size, getattr(stat, "st_ino", 0))
 SETTINGS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "SmartFitter"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 PEEK_CACHE_NAME = "peek_cache.json"
@@ -84,9 +196,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "recent_files": [],
     "watch_folders": [],
     "last_dir": "",
-    "plot_style": {},          # user default presentation (Plot editor "Save as my default")
+    "plot_style": {},  # user default presentation (Plot editor "Save as my default")
     "fit_presets": {},
-    "swap_2d_axes": True,       # matches the original app's default
+    "swap_2d_axes": True,  # matches the original app's default
     "pixel_geometry": "physical",
     "colormap": "viridis",
     "detector_labels": {"detector1": "Detector 1", "detector2": "Detector 2"},
@@ -128,9 +240,19 @@ def remember(kind: str, path: str, limit: int = 15) -> None:
 # ---------------------------------------------------------------------------
 
 TYPE_TAGS = {
-    "Rabi": "RABI", "Ramsey": "RAMSEY", "SpinEcho": "ECHO", "DynamicDecoupling": "DD", "T1": "T1",
-    "ODMR": "ODMR", "DEERFrequency": "DEER", "DEERDuration": "DEER", "DEERDecay": "DEER",
-    "DEERPosition": "DEER", "LineScan": "Z", "Scan2D": "XY", "TimeTrace": "TT",
+    "Rabi": "RABI",
+    "Ramsey": "RAMSEY",
+    "SpinEcho": "ECHO",
+    "DynamicDecoupling": "DD",
+    "T1": "T1",
+    "ODMR": "ODMR",
+    "DEERFrequency": "DEER",
+    "DEERDuration": "DEER",
+    "DEERDecay": "DEER",
+    "DEERPosition": "DEER",
+    "LineScan": "Z",
+    "Scan2D": "XY",
+    "TimeTrace": "TT",
 }
 
 
@@ -148,35 +270,43 @@ class Workspace:
         self._revisions: dict[str, tuple[tuple, dict]] = {}
 
     def source_revision(self, path: str) -> dict:
-        if path.startswith('combined:'):
+        if path.startswith("combined:"):
             recipe = self.combined[path]
-            return {'recipe':recipe,'sources':{r['path']:self.source_revision(r['path']) for r in recipe['runs']}}
+            return {"recipe": recipe, "sources": {r["path"]: self.source_revision(r["path"]) for r in recipe["runs"]}}
         p = Path(path)
-        if not p.exists() and type(self).dataset is not Workspace.dataset:
+        if not p.exists() and getattr(self.dataset, "__func__", None) is not Workspace.dataset:
             # Explicit in-memory dataset providers have no filesystem timestamp.
-            dataset=self.dataset(path)
-            digest=hashlib.sha256();size=0
-            for detector,tr in sorted(dataset.detectors.items()):
+            dataset = self.dataset(path)
+            digest = hashlib.sha256()
+            size = 0
+            for detector, tr in sorted(dataset.detectors.items()):
                 digest.update(detector.encode())
-                for name in ('x_ns','y','iteration_contrast','iteration_signal','iteration_reference','z2d'):
-                    value=getattr(tr,name,None)
-                    if value is None:continue
-                    value=np.asarray(value,dtype=float);digest.update(str(value.shape).encode());digest.update(value.tobytes());size+=value.nbytes
-            return {'sha256':digest.hexdigest(),'size':size,'virtual':True}
+                for name in ("x_ns", "y", "iteration_contrast", "iteration_signal", "iteration_reference", "z2d"):
+                    value = getattr(tr, name, None)
+                    if value is None:
+                        continue
+                    value = np.asarray(value, dtype=float)
+                    digest.update(str(value.shape).encode())
+                    digest.update(value.tobytes())
+                    size += value.nbytes
+            return {"sha256": digest.hexdigest(), "size": size, "virtual": True}
         stat = p.stat()
-        stamp = (stat.st_mtime_ns, stat.st_size)
+        stamp = _file_stamp(stat)
         key = source_path(str(p.resolve()))
         with self._lock:
             hit = self._revisions.get(key)
-            if hit and hit[0] == stamp: return hit[1]
+            if hit and hit[0] == stamp:
+                return hit[1]
         digest = hashlib.sha256()
-        with p.open('rb') as stream:
-            for block in iter(lambda:stream.read(1024*1024),b''): digest.update(block)
+        with p.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
         after = p.stat()
-        if (after.st_mtime_ns,after.st_size) != stamp:
-            raise ValueError(f'Source changed while reading: {p.name}; retry after acquisition finishes saving.')
-        revision = {'mtime_ns':str(stat.st_mtime_ns),'size':stat.st_size,'sha256':digest.hexdigest()}
-        with self._lock: self._revisions[key] = (stamp,revision)
+        if _file_stamp(after) != stamp:
+            raise ValueError(f"Source changed while reading: {p.name}; retry after acquisition finishes saving.")
+        revision = {"mtime_ns": str(stat.st_mtime_ns), "size": stat.st_size, "sha256": digest.hexdigest()}
+        with self._lock:
+            self._revisions[key] = (stamp, revision)
         return revision
 
     # -- datasets ---------------------------------------------------------
@@ -187,17 +317,17 @@ class Workspace:
                 raise ValueError("Combined dataset is not registered. Reopen its saved analysis session.")
             return combine_datasets(self.dataset, recipe, mode)
         p = str(Path(path))
-        mtime = Path(p).stat().st_mtime_ns
+        stamp = _file_stamp(Path(p).stat())
         key = (os.path.normcase(p), mode)
         with self._lock:
             hit = self._cache.get(key)
-            if hit and hit[0] == mtime:
+            if hit and hit[0] == stamp:
                 return hit[1]
         ds = load_experiment_dataset(p, mode)
-        if Path(p).stat().st_mtime_ns != mtime:
-            raise ValueError(f'Source changed while loading: {Path(p).name}; retry after saving.')
+        if _file_stamp(Path(p).stat()) != stamp:
+            raise ValueError(f"Source changed while loading: {Path(p).name}; retry after saving.")
         with self._lock:
-            self._cache[key] = (mtime, ds)
+            self._cache[key] = (stamp, ds)
             if len(self._cache) > 64:
                 self._cache.pop(next(iter(self._cache)))
         return ds
@@ -211,7 +341,7 @@ class Workspace:
             failure = ds.detector_errors.get(detector)
             label = DETECTOR_LABELS.get(detector, detector)
             raise ValueError(failure.message if failure else f"{label} is not available in {ds.file_name}.")
-        det = next((d for d in ds.available_detectors if d in ds.detectors), None)
+        det = next((d for d in (getattr(ds, "available_detectors", None) or list(ds.detectors)) if d in ds.detectors), None)
         if det is None:
             failure = next(iter(ds.detector_errors.values()), None)
             raise ValueError(failure.message if failure else "No detector data could be loaded.")
@@ -224,43 +354,50 @@ class Workspace:
             return describe(ds, next(iter(ds.detectors.values())))
         p = Path(path)
         try:
-            mtime = p.stat().st_mtime_ns
+            stamp = _file_stamp(p.stat())
         except OSError as exc:
             return {"path": str(p), "error": str(exc)}
+        mtime, size, ino = stamp
         key = os.path.normcase(str(p))
         hit = self._peek.get(key)
-        if hit and hit[0] == mtime:
+        if hit and hit[0] == stamp:
             return hit[1]
-        size = p.stat().st_size
         with self._lock:
             rec = self._disk_cache().get(key)
-        if rec and rec.get("mtime_ns") == mtime and rec.get("size") == size and isinstance(rec.get("info"), dict):
-            self._peek[key] = (mtime, rec["info"])
+        if (rec and rec.get("mtime_ns") == mtime and rec.get("size") == size and rec.get("ino") == ino
+                and isinstance(rec.get("info"), dict)):
+            self._peek[key] = (stamp, rec["info"])
             return rec["info"]
         info: dict[str, Any] = {"path": str(p), "name": p.name, "mtime": mtime / 1e9, "size": p.stat().st_size}
         try:
             ds = self.dataset(str(p), "contrast")
             tr = next(iter(ds.detectors.values()))
             meta = tr.metadata or {}
-            info.update({
-                "type": tr.experiment_type,
-                "tag": TYPE_TAGS.get(tr.experiment_type, tr.experiment_type[:4].upper()),
-                "dim": tr.scan_dim,
-                "detectors": len(ds.available_detectors),
-                "points": int(tr.z2d.size if tr.scan_dim == "scan2d" and tr.z2d is not None else len(tr.x_ns)),
-                "grid": list(tr.z2d.shape) if tr.z2d is not None and tr.scan_dim == "scan2d" else None,
-                "axes": list(tr.scan_axes),
-                "run_status": str(meta.get("run_status") or meta.get("save_type") or ""),
-                "iterations": f"{meta.get('completed_iterations')}/{meta.get('target_iterations')}" if meta.get("target_iterations") else "",
-                "reference_only": bool(meta.get("reference_only")),
-            })
+            info.update(
+                {
+                    "type": tr.experiment_type,
+                    "tag": TYPE_TAGS.get(tr.experiment_type, tr.experiment_type[:4].upper()),
+                    "dim": tr.scan_dim,
+                    "detectors": len(ds.available_detectors),
+                    "points": int(tr.z2d.size if tr.scan_dim == "scan2d" and tr.z2d is not None else len(tr.x_ns)),
+                    "grid": list(tr.z2d.shape) if tr.z2d is not None and tr.scan_dim == "scan2d" else None,
+                    "axes": list(tr.scan_axes),
+                    "run_status": str(meta.get("run_status") or meta.get("save_type") or ""),
+                    "iterations": (
+                        f"{meta.get('completed_iterations')}/{meta.get('target_iterations')}"
+                        if meta.get("target_iterations")
+                        else ""
+                    ),
+                    "reference_only": bool(meta.get("reference_only")),
+                }
+            )
         except Exception as exc:  # unreadable/unsupported file: keep it visible with the reason
             info.update({"type": "Unreadable", "tag": "?", "dim": "", "error": str(exc)[:300]})
-        self._peek[key] = (mtime, info)
+        self._peek[key] = (stamp, info)
         with self._lock:
             cache = self._disk_cache()
             cache.pop(key, None)
-            cache[key] = {"mtime_ns": mtime, "size": size, "info": json.loads(json.dumps(clean(info)))}
+            cache[key] = {"mtime_ns": mtime, "size": size, "ino": ino, "info": json.loads(json.dumps(clean(info)))}
             while len(cache) > PEEK_CACHE_MAX:
                 cache.pop(next(iter(cache)))
             self._disk_dirty = True
@@ -318,6 +455,7 @@ def list_dir(path: str) -> dict:
 # Trace payloads
 # ---------------------------------------------------------------------------
 
+
 def _iteration_matrix(tr: ExperimentTrace, mode: str) -> np.ndarray | None:
     return iteration_matrix(tr, mode)
 
@@ -337,33 +475,58 @@ def describe(ds: ExperimentDataset, tr: ExperimentTrace) -> dict:
     ref_only = reference_only(tr)
     observables = list(meta.get("available_observables") or (["reference"] if ref_only else list(MODES)))
     timing = meta.get("time_trace") if isinstance(meta.get("time_trace"), dict) else {}
-    return clean({
-        "path": ds.source_path,
-        "name": ds.file_name,
-        "type": tr.experiment_type,
-        "tag": TYPE_TAGS.get(tr.experiment_type, tr.experiment_type[:4].upper()),
-        "dim": tr.scan_dim,
-        "fit_allowed": bool(tr.fit_allowed) or tr.experiment_type == "TimeTrace",
-        "axes": list(tr.scan_axes),
-        "x_label": tr.x_label,
-        "raw_x_label": tr.raw_x_label,
-        "x_unit": meta.get("x_unit"),
-        "axis_units": meta.get("axis_units") if isinstance(meta.get("axis_units"), dict) else None,
-        "y_label": tr.y_label,
-        "detectors": list(ds.available_detectors),
-        "detector_labels": {k: v.detector_label for k, v in ds.detectors.items()},
-        "detector_errors": {k: v.message for k, v in ds.detector_errors.items()},
-        "detector_mode": ds.detector_mode,
-        "reference_only": ref_only,
-        "observables": observables,
-        "unit": meta.get("value_unit", ""),
-        "combined": meta.get("combined"),
-        "combined_recipe": ds.metadata.get("combined_recipe"),
-        "is_time_trace": bool(meta.get("is_time_trace")),
-        "irregular": bool(meta.get("time_sampling_irregular")),
-        "timing": {k: timing.get(k) for k in ("timing", "durationSeconds", "cadenceSeconds", "checkpointSeconds", "sourceExperiment", "fixedValue", "events", "failedPoints", "scheduledSeconds", "latenessSeconds", "nPoints")} if timing else None,
-        "metadata": {k: (v if isinstance(v, (int, float, bool)) or v is None else str(v)[:400]) for k, v in meta.items() if k not in ("time_trace", "source_point_indices")},
-    })
+    return clean(
+        {
+            "path": ds.source_path,
+            "name": ds.file_name,
+            "type": tr.experiment_type,
+            "tag": TYPE_TAGS.get(tr.experiment_type, tr.experiment_type[:4].upper()),
+            "dim": tr.scan_dim,
+            "fit_allowed": bool(tr.fit_allowed) or tr.experiment_type == "TimeTrace",
+            "axes": list(tr.scan_axes),
+            "x_label": tr.x_label,
+            "raw_x_label": tr.raw_x_label,
+            "x_unit": meta.get("x_unit"),
+            "axis_units": meta.get("axis_units") if isinstance(meta.get("axis_units"), dict) else None,
+            "y_label": tr.y_label,
+            "detectors": list(ds.available_detectors),
+            "detector_labels": {k: v.detector_label for k, v in ds.detectors.items()},
+            "detector_errors": {k: v.message for k, v in ds.detector_errors.items()},
+            "detector_mode": ds.detector_mode,
+            "reference_only": ref_only,
+            "observables": observables,
+            "unit": meta.get("value_unit", ""),
+            "combined": meta.get("combined"),
+            "combined_recipe": ds.metadata.get("combined_recipe"),
+            "is_time_trace": bool(meta.get("is_time_trace")),
+            "irregular": bool(meta.get("time_sampling_irregular")),
+            "timing": (
+                {
+                    k: timing.get(k)
+                    for k in (
+                        "timing",
+                        "durationSeconds",
+                        "cadenceSeconds",
+                        "checkpointSeconds",
+                        "sourceExperiment",
+                        "fixedValue",
+                        "events",
+                        "failedPoints",
+                        "scheduledSeconds",
+                        "latenessSeconds",
+                        "nPoints",
+                    )
+                }
+                if timing
+                else None
+            ),
+            "metadata": {
+                k: (v if isinstance(v, (int, float, bool)) or v is None else str(v)[:400])
+                for k, v in meta.items()
+                if k not in ("time_trace", "source_point_indices")
+            },
+        }
+    )
 
 
 def smoothing_window(n: int, requested: int) -> int:
@@ -378,14 +541,14 @@ def smoothing_window(n: int, requested: int) -> int:
     return w if w >= 3 else 1
 
 
-def analysis_for(ws, path, detector, mode, proc=None, settings=None, kind='fit'):
-    revision = ws.source_revision(path) if hasattr(ws,'source_revision') else None
+def analysis_for(ws, path, detector, mode, proc=None, settings=None, kind="fit"):
+    revision = ws.source_revision(path) if hasattr(ws, "source_revision") else None
     dependencies = {}
-    baseline = (proc or {}).get('baseline') or {}
-    if baseline.get('path') and hasattr(ws,'source_revision'):
-        dependencies[source_path(baseline['path'])] = ws.source_revision(baseline['path'])
-    settings = {k:v for k,v in (settings or {}).items() if k != 'apply_both'}
-    return result_envelope(analysis_descriptor(path,detector,mode,proc),revision,settings,dependencies,kind)
+    baseline = (proc or {}).get("baseline") or {}
+    if baseline.get("path") and hasattr(ws, "source_revision"):
+        dependencies[source_path(baseline["path"])] = ws.source_revision(baseline["path"])
+    settings = {k: v for k, v in (settings or {}).items() if k != "apply_both"}
+    return result_envelope(analysis_descriptor(path, detector, mode, proc), revision, settings, dependencies, kind)
 
 
 def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict | None = None) -> dict:
@@ -393,12 +556,12 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
     tr = ws.trace(path, detector, mode)
     proc = proc or {}
     info = describe(ds, tr)
-    analysis = analysis_for(ws,path,tr.detector_id,mode,proc,kind='data')
-    info['source_revision'] = analysis['source_revision']
-    if info['source_revision'] and 'mtime_ns' in info['source_revision']:
-        info['mtime'] = int(info['source_revision']['mtime_ns']) / 1e9
+    analysis = analysis_for(ws, path, tr.detector_id, mode, proc, kind="data")
+    info["source_revision"] = analysis["source_revision"]
+    if info["source_revision"] and "mtime_ns" in info["source_revision"]:
+        info["mtime"] = int(info["source_revision"]["mtime_ns"]) / 1e9
     out: dict[str, Any] = {"info": info, "detector": tr.detector_id, "mode": mode}
-    out['analysis'] = analysis
+    out["analysis"] = analysis
     if tr.scan_dim == "scan2d" and tr.z2d is not None:
         x2d, y2d = np.asarray(tr.x2d, float), np.asarray(tr.y2d, float)
         maps = {"value": tr.z2d}
@@ -407,7 +570,8 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
         if tr.reference2d is not None:
             maps["reference"] = tr.reference2d
         out["map"] = {
-            "x": arr(x2d[0, :]), "y": arr(y2d[:, 0]),
+            "x": arr(x2d[0, :]),
+            "y": arr(y2d[:, 0]),
             "x_label": tr.scan_axes[0] if len(tr.scan_axes) > 0 else "X",
             "y_label": tr.scan_axes[1] if len(tr.scan_axes) > 1 else "Y",
             "z": {k: arr(v) for k, v in maps.items()},
@@ -426,19 +590,22 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
     if base.get("path") and os.path.normcase(base["path"]) != os.path.normcase(path):
         # Subtract another loaded file (same observable), interpolated onto this file's axis.
         btr = ws.trace(base["path"], base.get("detector") or detector, mode)
-        xscale, yscale = compatibility(trace_units(tr),trace_units(btr),label='Baseline subtraction')
+        xscale, yscale = compatibility(trace_units(tr), trace_units(btr), label="Baseline subtraction")
         bx, by = np.asarray(btr.x_ns, float), np.asarray(btr.y, float)
-        bx, by = bx*xscale, by*yscale
+        bx, by = bx * xscale, by * yscale
         ok = np.isfinite(bx) & np.isfinite(by)
         order = np.argsort(bx[ok])
         bvals = np.interp(x, bx[ok][order], by[ok][order], left=np.nan, right=np.nan)
         y = y - bvals
         if its is not None:
             plot_its = its - bvals[:, None]
-        out["baseline_note"] = f"Subtracted {btr.file_name} ({btr.detector_label}); points outside its range are dropped."
+        out["baseline_note"] = (
+            f"Subtracted {btr.file_name} ({btr.detector_label}); points outside its range are dropped."
+        )
     steps = [AnalysisStep.from_dict(s) for s in proc.get("steps", []) if s.get("enabled", True)]
     ps = process_series(
-        x, y,
+        x,
+        y,
         bin_size=int(proc.get("bin", 1) or 1),
         roi=(proc.get("roi_min"), proc.get("roi_max")),
         excluded_raw_indices=set(int(i) for i in proc.get("excluded", [])),
@@ -457,23 +624,58 @@ def trace_payload(ws: Workspace, path: str, detector: str | None, mode: str, pro
     elif sem is not None and len(ps.source_groups) == len(ps.analysis_y) and not steps:
         proc_sem = np.array([math.sqrt(float(np.nansum(sem[g] ** 2))) / max(1, len(g)) for g in ps.source_groups])
     effective_window = smoothing_window(len(ps.analysis_y), smooth_w)
-    provenance = {"selected_iterations": [i + 1 for i in indices], "iteration_count": len(indices),
-                  "iteration_sources": iteration_sources(tr) if its is not None else [],
-                  "combined": info.get("combined"), "sem": "sample SD (ddof=1) / sqrt(n); undefined for n<2",
-                  "smoothing": {"method": "Savitzky-Golay", "requested_window": smooth_w, "window": effective_window, "polyorder": min(2, effective_window - 1)}}
+    provenance = {
+        "selected_iterations": [i + 1 for i in indices],
+        "iteration_count": len(indices),
+        "iteration_sources": iteration_sources(tr) if its is not None else [],
+        "combined": info.get("combined"),
+        "sem": "sample SD (ddof=1) / sqrt(n); undefined for n<2",
+        "smoothing": {
+            "method": "Savitzky-Golay",
+            "requested_window": smooth_w,
+            "window": effective_window,
+            "polyorder": min(2, effective_window - 1),
+        },
+    }
     out["provenance"] = provenance
-    out.update({
-        "raw": {"x": arr(x), "y": arr(y), "signal": arr(tr.signal), "reference": arr(tr.reference), "sem": arr(sem),
+    out.update(
+        {
+            "raw": {
+                "x": arr(x),
+                "y": arr(y),
+                "signal": arr(tr.signal),
+                "reference": arr(tr.reference),
+                "sem": arr(sem),
                 "raw_x": arr(tr.raw_x) if tr.raw_x is not None else None,
-                "trace_y": arr(tr.y) if out.get("baseline_note") else None},
-        "proc": {"x": arr(ps.analysis_x), "y": arr(ps.analysis_y), "fit_x": arr(ps.fit_x), "fit_y": arr(ps.fit_y),
-                 "groups": [g.tolist() for g in ps.source_groups], "sem": arr(proc_sem), "sd": arr(proc_sd),
-                 "smooth": arr(smooth_trace(ps.analysis_y, smooth_w)) if effective_window > 1 else None,
-                 "smoothing_window": effective_window, "provenance": ps.provenance},
-        "iterations": {"count": int(its.shape[1]), "selected": indices, "values": arr(its.T),
-                       "x": arr(ps.fit_x), "processed_values": arr(processed_its.T) if processed_its is not None else None,
-                       "sources": iteration_sources(original)} if its is not None else None,
-    })
+                "trace_y": arr(tr.y) if out.get("baseline_note") else None,
+            },
+            "proc": {
+                "x": arr(ps.analysis_x),
+                "y": arr(ps.analysis_y),
+                "fit_x": arr(ps.fit_x),
+                "fit_y": arr(ps.fit_y),
+                "groups": [g.tolist() for g in ps.source_groups],
+                "derived": list(ps.derived),
+                "sem": arr(proc_sem),
+                "sd": arr(proc_sd),
+                "smooth": arr(smooth_trace(ps.analysis_y, smooth_w)) if effective_window > 1 else None,
+                "smoothing_window": effective_window,
+                "provenance": ps.provenance,
+            },
+            "iterations": (
+                {
+                    "count": int(its.shape[1]),
+                    "selected": indices,
+                    "values": arr(its.T),
+                    "x": arr(ps.fit_x),
+                    "processed_values": arr(processed_its.T) if processed_its is not None else None,
+                    "sources": iteration_sources(original),
+                }
+                if its is not None
+                else None
+            ),
+        }
+    )
     if tr.experiment_type == "TimeTrace":
         out["time"] = _time_trace_extras(tr)
     return clean(out)
@@ -497,13 +699,22 @@ def _time_trace_extras(tr: ExperimentTrace) -> dict:
     events = timing.get("events") or []
     if not isinstance(events, list):
         events = []
-    return clean({
-        "dt": {"median": float(np.median(dt)) if dt.size else None, "mean": float(np.mean(dt)) if dt.size else None,
-               "sd": float(np.std(dt)) if dt.size else None, "p5": float(np.percentile(dt, 5)) if dt.size else None,
-               "p95": float(np.percentile(dt, 95)) if dt.size else None, "max": float(np.max(dt)) if dt.size else None},
-        "retries": retries, "events": events,
-        "scheduled": timing.get("scheduledSeconds"), "lateness": timing.get("latenessSeconds"),
-    })
+    return clean(
+        {
+            "dt": {
+                "median": float(np.median(dt)) if dt.size else None,
+                "mean": float(np.mean(dt)) if dt.size else None,
+                "sd": float(np.std(dt)) if dt.size else None,
+                "p5": float(np.percentile(dt, 5)) if dt.size else None,
+                "p95": float(np.percentile(dt, 95)) if dt.size else None,
+                "max": float(np.max(dt)) if dt.size else None,
+            },
+            "retries": retries,
+            "events": events,
+            "scheduled": timing.get("scheduledSeconds"),
+            "lateness": timing.get("latenessSeconds"),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +732,12 @@ def _locks(spec: dict) -> dict | None:
         lo, hi = item.get("min"), item.get("max")
         if value is None and lo is None and hi is None and not lock:
             continue
-        locks[name] = (float(value) if value is not None else float("nan"), lock,
-                       float(lo) if lo is not None else None, float(hi) if hi is not None else None)
+        locks[name] = (
+            float(value) if value is not None else float("nan"),
+            lock,
+            float(lo) if lo is not None else None,
+            float(hi) if hi is not None else None,
+        )
     return locks or None
 
 
@@ -531,7 +746,9 @@ def _evaluate(result: FitResult, x: np.ndarray, x_data: np.ndarray) -> np.ndarra
     try:
         check = evaluate_result(result, x_data)
         ref = np.asarray(result.y_fit, float)
-        if check.shape != ref.shape or not np.allclose(check, ref, rtol=1e-6, atol=1e-9 * max(1.,float(np.nanmax(np.abs(ref))))):
+        if check.shape != ref.shape or not np.allclose(
+            check, ref, rtol=1e-6, atol=1e-9 * max(1.0, float(np.nanmax(np.abs(ref))))
+        ):
             return None
         return evaluate_result(result, x)
     except Exception:
@@ -552,32 +769,53 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     window = smoothing_window(len(y), int(proc.get("smooth", 1) or 1)) if spec.get("fit_smoothed") else 1
     if spec.get("fit_smoothed"):
         if window <= 1:
-            raise ValueError("Fit smoothed requires an effective smoothing window of at least 3 points. Set it in Process.")
+            raise ValueError(
+                "Fit smoothed requires an effective smoothing window of at least 3 points. Set it in Process."
+            )
         y = smooth_trace(y, int(proc.get("smooth", 1) or 1))
-    provenance = {**data["provenance"], "fit_target": "smoothed" if spec.get("fit_smoothed") else "raw_mean",
-                  "fit_transformed": transformed, "smoothing_window": window,
-                  "uncertainty_note": "Smoothing correlates samples and underestimates ordinary fit uncertainties; no corrected estimate is supplied. SEM weights are disabled." if window > 1 else ""}
+    provenance = {
+        **data["provenance"],
+        "fit_target": "smoothed" if spec.get("fit_smoothed") else "raw_mean",
+        "fit_transformed": transformed,
+        "smoothing_window": window,
+        "uncertainty_note": (
+            "Smoothing correlates samples and underestimates ordinary fit uncertainties; no corrected estimate is supplied. SEM weights are disabled."
+            if window > 1
+            else ""
+        ),
+    }
     review = proc.get("iteration_review")
     if review and review.get("retained") == proc.get("iterations"):
         provenance["iteration_review"] = review
     tr = replace(tr, metadata={**(tr.metadata or {}), "fit_provenance": provenance})
     if not transformed and not proc.get("steps") and int(proc.get("bin", 1) or 1) > 1:
         # Feed the existing weighting routines the SEM of binned iteration means on the actual fit grid.
-        tr = replace(tr, x_ns=x.copy(), y_sem=np.asarray(data["proc"]["sem"], float) if data["proc"]["sem"] is not None else None,
-                     iteration_contrast=None, iteration_signal=None, iteration_reference=None, iteration_valid=None)
+        tr = replace(
+            tr,
+            x_ns=x.copy(),
+            y_sem=np.asarray(data["proc"]["sem"], float) if data["proc"]["sem"] is not None else None,
+            iteration_contrast=None,
+            iteration_signal=None,
+            iteration_reference=None,
+            iteration_valid=None,
+        )
     lo, hi = spec.get("range_min"), spec.get("range_max")
+    if lo is not None and hi is not None and float(lo) > float(hi):
+        raise ValueError(f"The fit range starts ({lo}) above where it ends ({hi}); swap or clear the limits.")
     keep = np.isfinite(x) & np.isfinite(y)
     if lo is not None:
         keep &= x >= float(lo)
     if hi is not None:
         keep &= x <= float(hi)
     x, y = x[keep], y[keep]
-    sem = data['proc'].get('sem')
-    sem = np.asarray(sem,float) if sem is not None else None
-    usable_sem = sem is not None and sem.shape == keep.shape and not proc.get('steps') and not spec.get('fit_smoothed')
+    sem = data["proc"].get("sem")
+    sem = np.asarray(sem, float) if sem is not None else None
+    usable_sem = sem is not None and sem.shape == keep.shape and not proc.get("steps") and not spec.get("fit_smoothed")
     tr = replace(tr, x_ns=x.copy(), y=y.copy(), y_sem=sem[keep] if usable_sem else None)
     if len(x) < 5:
-        raise ValueError("Fewer than 5 points in the fit range.")
+        raise ValueError(f"Fewer than 5 finite points in the fit range (found {len(x)}); widen the range or reduce binning.")
+    if np.unique(x).size < 3:
+        raise ValueError("The fit range holds fewer than 3 distinct x values; no model can be identified.")
     exp_type = spec.get("experiment") or tr.experiment_type
     model = spec.get("model") or "Auto"
     if model == "Auto" and tr.experiment_type == "LineScan" and not spec.get("experiment"):
@@ -596,7 +834,8 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
         multistart=int(spec.get("multistart", 20)),
         gaussian_peak_count=int(spec.get("peaks", 1)),
         rabi_use_sem=bool(spec.get("sem_weights", True)) and not spec.get("fit_smoothed"),
-        sem_weights=bool(spec.get("sem_weights_all", False)) and not spec.get("fit_smoothed"),  # non-Rabi SEM weighting is opt-in (UI default off)
+        sem_weights=bool(spec.get("sem_weights_all", False))
+        and not spec.get("fit_smoothed"),  # non-Rabi SEM weighting is opt-in (UI default off)
         rabi_pi_lock=bool(spec.get("pi_lock", False)),
         rabi_pi_ns=float(spec.get("pi_ns", 200.0)),
         rabi_pi2_ns=float(spec.get("pi2_ns", 100.0)),
@@ -611,15 +850,18 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
         t1_model_family=str(spec.get("t1_family", "Regular exponential")),
         custom_expr=str(spec.get("custom_expr", "")),
         custom_spec=spec.get("custom_spec"),
+        parameter_model=spec.get("params_model"),
     )
     return tr, x, y, exp_type, cfg, _locks(spec)
 
 
-def fit_dispatch(tr: ExperimentTrace, x: np.ndarray, y: np.ndarray, exp_type: str, cfg: FitWorkflowConfig, locks, spec: dict):
+def fit_dispatch(
+    tr: ExperimentTrace, x: np.ndarray, y: np.ndarray, exp_type: str, cfg: FitWorkflowConfig, locks, spec: dict
+):
     """Run the model-family fit; returns (FitResult, ramsey candidate summaries | None)."""
     family = FIT_FAMILY.get(exp_type, exp_type)
-    request = PreparedFit.create(x, y, family, cfg, locks, tr, spec.get('ramsey_model', 'Auto'))
-    return request.run(robust=bool(spec.get('robust')))
+    request = PreparedFit.create(x, y, family, cfg, locks, tr, spec.get("ramsey_model", "Auto"))
+    return request.run(robust=bool(spec.get("robust")))
 
 
 def _conf_band(result: FitResult, dense_x: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
@@ -628,42 +870,53 @@ def _conf_band(result: FitResult, dense_x: np.ndarray, x: np.ndarray, y: np.ndar
         return None
     try:
         covariance = np.asarray(result.covariance, float)
-        free = np.asarray(result.free_mask if result.free_mask is not None else [True]*len(result.params), bool)
+        free = np.asarray(result.free_mask if result.free_mask is not None else [True] * len(result.params), bool)
         if not np.all(np.isfinite(covariance[np.ix_(free, free)])):
             return None
         columns = []
         for i, value in enumerate(result.params):
             if not free[i]:
-                columns.append(np.zeros_like(dense_x, dtype=float)); continue
+                columns.append(np.zeros_like(dense_x, dtype=float))
+                continue
             step = 1e-6 * max(abs(value), 1e-3)
             hi, lo = result.params.copy(), result.params.copy()
-            hi[i] += step; lo[i] -= step
-            columns.append((evaluate_result(replace(result,params=hi), dense_x)-evaluate_result(replace(result,params=lo), dense_x))/(2*step))
+            hi[i] += step
+            lo[i] -= step
+            columns.append(
+                (
+                    evaluate_result(replace(result, params=hi), dense_x)
+                    - evaluate_result(replace(result, params=lo), dense_x)
+                )
+                / (2 * step)
+            )
         jac = np.column_stack(columns)
-        variance = np.einsum('ij,jk,ik->i',jac,covariance,jac)
-        return np.sqrt(np.maximum(variance,0.))
+        variance = np.einsum("ij,jk,ik->i", jac, covariance, jac)
+        return np.sqrt(np.maximum(variance, 0.0))
     except Exception:
         return None
 
 
 def run_fit(ws: Workspace, path: str, detector: str | None, mode: str, proc: dict, spec: dict) -> dict:
     tr, x, y, exp_type, cfg, locks = fit_inputs(ws, path, detector, mode, proc, spec)
-    analysis = analysis_for(ws,path,tr.detector_id,mode,proc,spec)
+    analysis = analysis_for(ws, path, tr.detector_id, mode, proc, spec)
     t0 = time.perf_counter()
     result, candidates = fit_dispatch(tr, x, y, exp_type, cfg, locks, spec)
     elapsed = time.perf_counter() - t0
 
-    return _fit_payload(tr,x,y,exp_type,result,candidates,elapsed,analysis)
+    return _fit_payload(tr, x, y, exp_type, result, candidates, elapsed, analysis)
 
 
-def _fit_payload(tr,x,y,exp_type,result,candidates=None,elapsed=0.,analysis=None):
-    mode=tr.mode
+def _fit_payload(tr, x, y, exp_type, result, candidates=None, elapsed=0.0, analysis=None):
+    mode = tr.mode
     profile_name = tr.experiment_type if tr.experiment_type in PROFILES else FIT_FAMILY.get(tr.experiment_type, "Rabi")
     profile = PROFILES.get(profile_name) or PROFILES.get("Rabi")
-    status, reason = classify_status(r2=float(result.r2) if np.isfinite(result.r2) else -1.0,
-                                     bound_hits=int(sum(result.bound_hits)), profile=profile)
+    status, reason = classify_status(
+        r2=float(result.r2) if np.isfinite(result.r2) else -1.0, bound_hits=int(sum(result.bound_hits)), profile=profile
+    )
     if not result.success:
-        status, reason = "WARN" if status == "PASS" else status, f"{reason}; optimizer: {result.message.splitlines()[0]}"
+        status, reason = (
+            "WARN" if status == "PASS" else status
+        ), f"{reason}; optimizer: {result.message.splitlines()[0]}"
     try:
         metrics = pro_batch._extract_nv_metrics(exp_type, result, tr.metadata)
     except Exception as exc:
@@ -678,8 +931,20 @@ def _fit_payload(tr,x,y,exp_type,result,candidates=None,elapsed=0.,analysis=None
         if bounds is not None:
             envelope = {"x": arr(dense_x), "upper": arr(bounds[0]), "lower": arr(bounds[1])}
     plot_y = extras.pop("plot_y", None)
-    band=_conf_band(result,dense_x,x,np.asarray(plot_y,float) if plot_y is not None else y) if dense_y is not None else None
-    uncertainty={**(result.uncertainty or {}),'band_available':band is not None,'band_note':'1-sigma uncertainty of model mean from retained fit covariance' if band is not None else 'Band unavailable: fit covariance or model evaluator missing/invalid'}
+    band = (
+        _conf_band(result, dense_x, x, np.asarray(plot_y, float) if plot_y is not None else y)
+        if dense_y is not None
+        else None
+    )
+    uncertainty = {
+        **(result.uncertainty or {}),
+        "band_available": band is not None,
+        "band_note": (
+            "1-sigma uncertainty of model mean from retained fit covariance"
+            if band is not None
+            else "Band unavailable: fit covariance or model evaluator missing/invalid"
+        ),
+    }
     params = []
     errs = np.asarray(result.errors, float)
     for i, name in enumerate(result.param_names):
@@ -688,53 +953,86 @@ def _fit_payload(tr,x,y,exp_type,result,candidates=None,elapsed=0.,analysis=None
         val = float(result.params[i])
         # A standard error many orders below the value usually means a degenerate covariance.
         reliable = math.isfinite(err) and err > 0 and (val == 0 or err / max(abs(val), 1e-300) > 1e-7)
-        fixed=result.free_mask is not None and not bool(result.free_mask[i])
+        fixed = result.free_mask is not None and not bool(result.free_mask[i])
         unit, desc = meta.units, meta.description
-        native_time=(tr.metadata or {}).get('x_unit') or ('s' if tr.experiment_type=='TimeTrace' else 'ns')
-        if tr.scan_dim=='time' and tr.experiment_type!='TimeTrace':
-            if unit=='ns':unit=native_time
-            if unit=='GHz':unit={'ps':'THz','ns':'GHz','us':'MHz','µs':'MHz','μs':'MHz','ms':'kHz','s':'Hz'}.get(native_time,'1/'+native_time)
+        native_time = (tr.metadata or {}).get("x_unit") or ("s" if tr.experiment_type == "TimeTrace" else "ns")
+        if tr.scan_dim == "time" and tr.experiment_type != "TimeTrace":
+            if unit == "ns":
+                unit = native_time
+            if unit == "GHz":
+                unit = {"ps": "THz", "ns": "GHz", "us": "MHz", "µs": "MHz", "μs": "MHz", "ms": "kHz", "s": "Hz"}.get(
+                    native_time, "1/" + native_time
+                )
         if result.model_name.startswith("T1"):
             if name == "T1":
                 unit = tr.metadata.get("x_unit") or "ns"
                 desc = "T1 timescale in the file's x units (not display-calibrated units)."
             elif name in ("A", "y0"):
                 normalized = extras.get("t1_prep_mode") == "normalized_1_minus_data"
-                unit = "normalized a.u." if normalized else ("dimensionless contrast" if mode == "contrast" else tr.metadata.get("value_unit") or "a.u.")
-                desc = f"{name} in normalized 1 - data space." if normalized else f"{name} in the measured {mode} space."
-        params.append({"name": name, "symbol": meta.symbol, "unit": unit, "desc": desc,
-                       "value": val, "error": 0. if fixed else err if reliable else None,"locked":fixed,
-                       "bound_hit": bool(result.bound_hits[i]) if i < len(result.bound_hits) else False})
-    residuals = y - np.asarray(result.y_fit, float) if plot_y is None else np.asarray(plot_y, float) - np.asarray(result.y_fit, float)
-    return clean({
-        "analysis": analysis,
-        "model": result.model_name,
-        "experiment": exp_type,
-        "selection": result.selection_note,
-        "provenance": (tr.metadata or {}).get("fit_provenance"),
-        "message": result.message,
-        "success": result.success,
-        "status": status, "reason": reason,
-        "r2": result.r2, "rmse": result.rmse, "aic": result.aic, "bic": result.bic, "dw": result.durbin_watson,
-        "bound_hits": int(sum(result.bound_hits)),
-        "params": params,
-        "metrics": metrics,
-        "x": arr(x), "y_fit": arr(result.y_fit), "residuals": arr(residuals),
-        "plot_y": arr(plot_y) if plot_y is not None else None,
-        "plot_y_label": extras.pop("plot_y_label", None),
-        "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(band)} if dense_y is not None else None,
-        "envelope": envelope,
-        "candidates": candidates,
-        "uncertainty": uncertainty,
-        "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
-        "elapsed_s": elapsed,
-        "raw": fit_result_to_dict(result),
-    })
+                unit = (
+                    "normalized a.u."
+                    if normalized
+                    else ("dimensionless contrast" if mode == "contrast" else tr.metadata.get("value_unit") or "a.u.")
+                )
+                desc = (
+                    f"{name} in normalized 1 - data space." if normalized else f"{name} in the measured {mode} space."
+                )
+        params.append(
+            {
+                "name": name,
+                "symbol": meta.symbol,
+                "unit": unit,
+                "desc": desc,
+                "value": val,
+                "error": 0.0 if fixed else err if reliable else None,
+                "locked": fixed,
+                "bound_hit": bool(result.bound_hits[i]) if i < len(result.bound_hits) else False,
+            }
+        )
+    residuals = (
+        y - np.asarray(result.y_fit, float)
+        if plot_y is None
+        else np.asarray(plot_y, float) - np.asarray(result.y_fit, float)
+    )
+    return clean(
+        {
+            "analysis": analysis,
+            "model": result.model_name,
+            "experiment": exp_type,
+            "selection": result.selection_note,
+            "provenance": (tr.metadata or {}).get("fit_provenance"),
+            "message": result.message,
+            "success": result.success,
+            "status": status,
+            "reason": reason,
+            "r2": result.r2,
+            "rmse": result.rmse,
+            "aic": result.aic,
+            "bic": result.bic,
+            "dw": result.durbin_watson,
+            "bound_hits": int(sum(result.bound_hits)),
+            "params": params,
+            "metrics": metrics,
+            "x": arr(x),
+            "y_fit": arr(result.y_fit),
+            "residuals": arr(residuals),
+            "plot_y": arr(plot_y) if plot_y is not None else None,
+            "plot_y_label": extras.pop("plot_y_label", None),
+            "dense": {"x": arr(dense_x), "y": arr(dense_y), "band": arr(band)} if dense_y is not None else None,
+            "envelope": envelope,
+            "candidates": candidates,
+            "uncertainty": uncertainty,
+            "extras": {k: v for k, v in extras.items() if not isinstance(v, (np.ndarray,)) or np.size(v) < 64},
+            "elapsed_s": elapsed,
+            "raw": fit_result_to_dict(result),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # 2D maps: spots and overlays
 # ---------------------------------------------------------------------------
+
 
 def _map_arrays(ws: Workspace, path: str, detector: str, mode: str, source: str = "value"):
     tr = ws.trace(path, detector, mode)
@@ -765,39 +1063,65 @@ def _map_arrays(ws: Workspace, path: str, detector: str, mode: str, source: str 
     return tr, x, y, np.asarray(z, float)
 
 
+@analysis_result
 def spots(ws: Workspace, path: str, detector: str, mode: str, opts: dict) -> dict:
     tr, x, y, z = _map_arrays(ws, path, detector, mode, opts.get("source", "auto"))
-    polarity = {"Auto": "auto", "Bright": "bright", "Dark": "dark", "Bright and dark": "both"}.get(opts.get("polarity", "Auto"), "auto")
-    res = detect_fluorescent_spots(x, y, z, polarity=polarity,
-                                   threshold_sigma=float(opts.get("threshold", 3.0)),
-                                   min_pixels=int(opts.get("min_pixels", 4)),
-                                   max_spots=int(opts.get("max_spots", 12)),
-                                   background_window_pixels=int(opts.get("bg_window", 0) or 0))
+    polarity = {"Auto": "auto", "Bright": "bright", "Dark": "dark", "Bright and dark": "both"}.get(
+        opts.get("polarity", "Auto"), "auto"
+    )
+    res = detect_fluorescent_spots(
+        x,
+        y,
+        z,
+        polarity=polarity,
+        threshold_sigma=float(opts.get("threshold", 3.0)),
+        min_pixels=int(opts.get("min_pixels", 4)),
+        max_spots=int(opts.get("max_spots", 12)),
+        background_window_pixels=int(opts.get("bg_window", 0) or 0),
+    )
     rows = []
     for s in res.spots:
         d = asdict(s)
-        d.update({
-            "fwhm_major": s.sigma_major * FWHM_PER_SIGMA, "fwhm_minor": s.sigma_minor * FWHM_PER_SIGMA,
-            "hwhm_major": s.sigma_major * FWHM_PER_SIGMA / 2, "hwhm_minor": s.sigma_minor * FWHM_PER_SIGMA / 2,
-            "axis_ratio": s.sigma_major / s.sigma_minor if s.sigma_minor else None,
-            "detector": tr.detector_id,
-        })
+        d.update(
+            {
+                "fwhm_major": s.sigma_major * FWHM_PER_SIGMA,
+                "fwhm_minor": s.sigma_minor * FWHM_PER_SIGMA,
+                "hwhm_major": s.sigma_major * FWHM_PER_SIGMA / 2,
+                "hwhm_minor": s.sigma_minor * FWHM_PER_SIGMA / 2,
+                "axis_ratio": s.sigma_major / s.sigma_minor if s.sigma_minor else None,
+                "detector": tr.detector_id,
+            }
+        )
         rows.append(d)
-    return clean({"spots": rows, "noise_sigma": res.noise_sigma, "bg_window": res.background_window_pixels,
-                  "polarities": list(res.tested_polarities), "source_map": arr(z)})
+    return clean(
+        {
+            "spots": rows,
+            "noise_sigma": res.noise_sigma,
+            "bg_window": res.background_window_pixels,
+            "polarities": list(res.tested_polarities),
+            "source_map": arr(z),
+        }
+    )
 
 
 def compare_spots(ws: Workspace, a: dict, b: dict, mode: str) -> dict:
     dx, dy = b["center_x"] - a["center_x"], b["center_y"] - a["center_y"]
-    out = {"dx": dx, "dy": dy, "distance": math.hypot(dx, dy),
-           "fwhm_major_ratio": b["fwhm_major"] / a["fwhm_major"] if a.get("fwhm_major") else None,
-           "fwhm_minor_ratio": b["fwhm_minor"] / a["fwhm_minor"] if a.get("fwhm_minor") else None,
-           "angle_diff": b["angle_deg"] - a["angle_deg"],
-           "amplitude_ratio": b["amplitude"] / a["amplitude"] if a.get("amplitude") else None}
+    out = {
+        "dx": dx,
+        "dy": dy,
+        "distance": math.hypot(dx, dy),
+        "fwhm_major_ratio": b["fwhm_major"] / a["fwhm_major"] if a.get("fwhm_major") else None,
+        "fwhm_minor_ratio": b["fwhm_minor"] / a["fwhm_minor"] if a.get("fwhm_minor") else None,
+        "angle_diff": b["angle_deg"] - a["angle_deg"],
+        "amplitude_ratio": b["amplitude"] / a["amplitude"] if a.get("amplitude") else None,
+    }
+    x1 = y1 = None
     try:
         _, x1, y1, z1 = _map_arrays(ws, a["path"], a["detector"], mode, a.get("source", "auto"))
         _, x2, y2, z2 = _map_arrays(ws, b["path"], b["detector"], mode, b.get("source", "auto"))
-        if z1.shape == z2.shape:
+        # Equal shapes are not enough: shifted or reversed grids would pair unrelated cells. Correlate only
+        # maps measured on the same coordinates (within a small fraction of a pixel).
+        if z1.shape == z2.shape and _same_grid(x1, x2) and _same_grid(y1, y2):
             cx, cy = (a["center_x"] + b["center_x"]) / 2, (a["center_y"] + b["center_y"]) / 2
             r = 2.0 * max(a.get("fwhm_major", 0), b.get("fwhm_major", 0))
             mx = np.abs(x1 - cx) <= r
@@ -806,50 +1130,111 @@ def compare_spots(ws: Workspace, a: dict, b: dict, mode: str) -> dict:
             ok = np.isfinite(p) & np.isfinite(q)
             if ok.sum() >= 4:
                 out["profile_correlation"] = float(np.corrcoef(p[ok], q[ok])[0, 1])
-    except Exception:
-        pass
-    pixel = None
-    try:
-        pixel = abs(float(np.median(np.diff(x1))))
-    except Exception:
-        pass
-    out["distance_px"] = out["distance"] / pixel if pixel else None
+        else:
+            out["profile_correlation_note"] = "Not computed: the two maps are not on the same measured grid."
+    except Exception as exc:
+        out["profile_correlation_note"] = f"Not computed: {exc}"
+    # Pixel distance uses each axis's own spacing, so anisotropic pixels are counted correctly.
+    px, py = _median_step(x1), _median_step(y1)
+    if px and py:
+        out["dx_px"], out["dy_px"] = dx / px, dy / py
+        out["distance_px"] = math.hypot(dx / px, dy / py)
+    else:
+        out["distance_px"] = None
     return clean(out)
 
 
+def _median_step(axis) -> float | None:
+    try:
+        step = abs(float(np.median(np.diff(np.asarray(axis, dtype=float)))))
+    except Exception:
+        return None
+    return step if math.isfinite(step) and step > 0 else None
+
+
+def _same_grid(u, v, tol: float = 1e-3) -> bool:
+    u, v = np.asarray(u, dtype=float), np.asarray(v, dtype=float)
+    if u.shape != v.shape:
+        return False
+    step = _median_step(u) or 1.0
+    return bool(np.allclose(u, v, rtol=0.0, atol=tol * step))
+
+
 def map_overlay(ws: Workspace, first: dict, second: dict, opts: dict) -> dict:
-    first_analysis=analysis_for(ws,first['path'],first['detector'],first.get('mode','contrast'),{'map_source':first.get('source','value')},kind='map')
-    second_analysis=analysis_for(ws,second['path'],second['detector'],second.get('mode','contrast'),{'map_source':second.get('source','value')},kind='map')
-    t1, x1, y1, z1 = _map_arrays(ws, first["path"], first["detector"], first.get("mode", "contrast"), first.get("source", "value"))
-    t2, x2, y2, z2 = _map_arrays(ws, second["path"], second["detector"], second.get("mode", "contrast"), second.get("source", "value"))
+    first_analysis = analysis_for(
+        ws,
+        first["path"],
+        first["detector"],
+        first.get("mode", "contrast"),
+        {"map_source": first.get("source", "value")},
+        kind="map",
+    )
+    second_analysis = analysis_for(
+        ws,
+        second["path"],
+        second["detector"],
+        second.get("mode", "contrast"),
+        {"map_source": second.get("source", "value")},
+        kind="map",
+    )
+    t1, x1, y1, z1 = _map_arrays(
+        ws, first["path"], first["detector"], first.get("mode", "contrast"), first.get("source", "value")
+    )
+    t2, x2, y2, z2 = _map_arrays(
+        ws, second["path"], second["detector"], second.get("mode", "contrast"), second.get("source", "value")
+    )
     if not compatible_axes(tuple(t1.scan_axes), tuple(t2.scan_axes)):
         raise ValueError("The maps are not in the same plane.")
     if axis_key(t1.scan_axes[0]) != axis_key(t2.scan_axes[0]):  # opposite stored order: transpose the second map
         x2, y2, z2 = y2, x2, z2.T
-    def map_unit(tr,axis):
-        units=(tr.metadata or {}).get('axis_units') or {}
-        if not isinstance(units,dict): units={}
-        return units.get(axis_key(axis),units.get(axis,(tr.metadata or {}).get('x_unit') or ''))
-    x2=x2*unit_scale(map_unit(t2,t1.scan_axes[0]),map_unit(t1,t1.scan_axes[0]))
-    y2=y2*unit_scale(map_unit(t2,t1.scan_axes[1]),map_unit(t1,t1.scan_axes[1]))
-    obs1=first.get('source','value');obs2=second.get('source','value')
-    obs1=first.get('mode','contrast') if obs1=='value' else obs1
-    obs2=second.get('mode','contrast') if obs2=='value' else obs2
-    if obs1!=obs2:raise ValueError('Map comparison requires matching source observables.')
-    value_unit=lambda tr:'dimensionless' if obs1=='contrast' else (tr.metadata or {}).get('value_unit') or 'a.u.'
-    z2=z2*unit_scale(value_unit(t2),value_unit(t1))
-    ov = build_map_overlay((x1, y1, z1), (x2, y2, z2), shared=bool(opts.get("shared")),
-                           background_percentile=float(opts.get("background", 10.0)),
-                           palette=str(opts.get("palette", "Pink / teal")))
+
+    def map_unit(tr, axis):
+        units = (tr.metadata or {}).get("axis_units") or {}
+        if not isinstance(units, dict):
+            units = {}
+        return units.get(axis_key(axis), units.get(axis, (tr.metadata or {}).get("x_unit") or ""))
+
+    x2 = x2 * unit_scale(map_unit(t2, t1.scan_axes[0]), map_unit(t1, t1.scan_axes[0]))
+    y2 = y2 * unit_scale(map_unit(t2, t1.scan_axes[1]), map_unit(t1, t1.scan_axes[1]))
+    obs1 = first.get("source", "value")
+    obs2 = second.get("source", "value")
+    obs1 = first.get("mode", "contrast") if obs1 == "value" else obs1
+    obs2 = second.get("mode", "contrast") if obs2 == "value" else obs2
+    if obs1 != obs2:
+        raise ValueError("Map comparison requires matching source observables.")
+    value_unit = lambda tr: "dimensionless" if obs1 == "contrast" else (tr.metadata or {}).get("value_unit") or "a.u."
+    z2 = z2 * unit_scale(value_unit(t2), value_unit(t1))
+    ov = build_map_overlay(
+        (x1, y1, z1),
+        (x2, y2, z2),
+        shared=bool(opts.get("shared")),
+        background_percentile=float(opts.get("background", 10.0)),
+        palette=str(opts.get("palette", "Pink / teal")),
+    )
     png = _overlay_png(ov.x_edges, ov.y_edges, ov.rgba, swap=bool(opts.get("swap")))
-    request={'first':first,'second':second,'opts':opts}
-    analysis=result_envelope(first_analysis['descriptor'],first_analysis['source_revision'],request,
-        {source_path(second['path']):second_analysis['source_revision']},'map_overlay')
-    return clean({"x_edges": arr(ov.x_edges), "y_edges": arr(ov.y_edges), "png": png, "ranges": ov.ranges,
-                  "request":request,"analysis":analysis,"analyses":[first_analysis,second_analysis],
-                  "units":{"x":map_unit(t1,t1.scan_axes[0]),"y":map_unit(t1,t1.scan_axes[1]),"value":value_unit(t1)},
-                  "x_label": t1.scan_axes[0], "y_label": t1.scan_axes[1],
-                  "cells": {"primary": arr(ov.primary), "secondary": arr(ov.secondary), "rgba": arr(ov.rgba)}})
+    request = {"first": first, "second": second, "opts": opts}
+    analysis = result_envelope(
+        first_analysis["descriptor"],
+        first_analysis["source_revision"],
+        request,
+        {source_path(second["path"]): second_analysis["source_revision"]},
+        "map_overlay",
+    )
+    return clean(
+        {
+            "x_edges": arr(ov.x_edges),
+            "y_edges": arr(ov.y_edges),
+            "png": png,
+            "ranges": ov.ranges,
+            "request": request,
+            "analysis": analysis,
+            "analyses": [first_analysis, second_analysis],
+            "units": {"x": map_unit(t1, t1.scan_axes[0]), "y": map_unit(t1, t1.scan_axes[1]), "value": value_unit(t1)},
+            "x_label": t1.scan_axes[0],
+            "y_label": t1.scan_axes[1],
+            "cells": {"primary": arr(ov.primary), "secondary": arr(ov.secondary), "rgba": arr(ov.rgba)},
+        }
+    )
 
 
 def _overlay_png(xe: np.ndarray, ye: np.ndarray, rgba: np.ndarray, swap: bool = False, max_px: int = 1200) -> str:
@@ -878,6 +1263,8 @@ def _overlay_png(xe: np.ndarray, ye: np.ndarray, rgba: np.ndarray, swap: bool = 
 # Time traces
 # ---------------------------------------------------------------------------
 
+
+@analysis_result
 def time_stats(ws: Workspace, path: str, mode: str, windows: dict) -> dict:
     ds = ws.dataset(path, mode)
     out = {}
@@ -906,9 +1293,17 @@ def periodogram(ws: Workspace, path: str, detector: str, mode: str) -> dict:
     tr = ws.trace(path, detector, mode)
     x, y = np.asarray(tr.x_ns, float), np.asarray(tr.y, float)
     ok = np.isfinite(x) & np.isfinite(y)
-    x, y = x[ok], y[ok] - np.mean(y[ok])
+    x, y = x[ok], y[ok]
+    steps = np.diff(np.unique(x))
+    if len(x) < 4 or len(steps) < 3:
+        raise ValueError(f"A periodogram needs at least 4 samples at distinct times; this trace has {len(steps) + 1 if len(x) else 0}.")
+    if float(np.ptp(y)) <= np.finfo(float).eps * max(1.0, float(np.max(np.abs(y)))):
+        raise ValueError("The signal is constant, so it has no periodic content to show.")
+    y = y - np.mean(y)
     span = float(x.max() - x.min())
-    dt = float(np.median(np.diff(x)))
+    dt = float(np.median(steps))  # spacing between distinct timestamps; duplicates would give zero
+    if 1.0 / span >= 0.5 / dt:
+        raise ValueError("The trace is too short for its sampling: the lowest resolvable frequency is not below Nyquist.")
     f = np.linspace(1.0 / span, 0.5 / dt, 2000)
     p = lombscargle(x, y, 2 * np.pi * f, normalize=True)
     return clean({"freq_hz": arr(f), "power": arr(p), "nyquist_hz": 0.5 / dt})
@@ -917,6 +1312,7 @@ def periodogram(ws: Workspace, path: str, detector: str, mode: str) -> dict:
 # ---------------------------------------------------------------------------
 # Batch
 # ---------------------------------------------------------------------------
+
 
 def _row_key(r: dict) -> tuple:
     return (r.get("relative_path") or r.get("file") or "", r.get("detector_id") or "")
@@ -970,120 +1366,222 @@ def _read_csv(path: Path) -> list[dict]:
 
 def batch_run_record(output_dir):
     from nvfit.batch_manifest import load_manifest
-    path=Path(output_dir)/'batch_manifest.json'
-    return load_manifest(path,validate_sources=False) if path.exists() else None
+
+    path = Path(output_dir) / "batch_manifest.json"
+    return load_manifest(path, validate_sources=False) if path.exists() else None
 
 
 def batch_start(ws: Workspace, opts: dict) -> str:
-    opts=deepcopy(opts)
+    opts = deepcopy(opts)
     from nvfit.batch_manifest import load_manifest
-    replay=load_manifest(opts['manifest_path']) if opts.get('manifest_path') else None
-    output_dir=replay['options']['output_dir'] if replay else opts['output_dir']
-    job_id='batch'+uuid.uuid4().hex
-    job={'id':job_id,'state':'running','done':0,'total':0,'log':[],'rows':[],'error':None,'output_dir':output_dir,'cancel':False,'manifest_path':None}
+
+    replay = load_manifest(opts["manifest_path"]) if opts.get("manifest_path") else None
+    output_dir = replay["options"]["output_dir"] if replay else opts["output_dir"]
+    job_id = "batch" + uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "state": "running",
+        "done": 0,
+        "total": 0,
+        "log": [],
+        "rows": [],
+        "error": None,
+        "output_dir": output_dir,
+        "cancel": False,
+        "manifest_path": None,
+    }
     with ws._lock:
-        if any(j['state']=='running' and os.path.normcase(j['output_dir'])==os.path.normcase(output_dir) for j in ws.jobs.values()):
-            raise ValueError('A batch is already writing this output folder.')
-        ws.jobs[job_id]=job
-    def progress(done,total,name,message):
-        job['done'],job['total']=done,total
-        job['log'].append(f'[{done}/{total}] {name}: {message}')
-        record=batch_run_record(output_dir)
+        if any(
+            j["state"] == "running" and os.path.normcase(j["output_dir"]) == os.path.normcase(output_dir)
+            for j in ws.jobs.values()
+        ):
+            raise ValueError("A batch is already writing this output folder.")
+        ws.jobs[job_id] = job
+
+    def progress(done, total, name, message):
+        job["done"], job["total"] = done, total
+        job["log"].append(f"[{done}/{total}] {name}: {message}")
+        record = batch_run_record(output_dir)
         if record:
-            job['manifest_path']=record['manifest_path']
-            job['unfinished_count']=sum(r['state']=='pending' for r in record['rows'])
-            job['discovery_complete']=record.get('discovery_complete',True)
-            job['rows']=[r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')]
+            job["manifest_path"] = record["manifest_path"]
+            job["unfinished_count"] = sum(r["state"] == "pending" for r in record["rows"])
+            job["discovery_complete"] = record.get("discovery_complete", True)
+            job["rows"] = [r["summary"] for r in record["rows"] if r["state"] in ("completed", "preserved")]
+
     def work():
         try:
-            runtime={'progress_callback':progress,'cancel_requested':lambda:job['cancel']}
+            runtime = {"progress_callback": progress, "cancel_requested": lambda: job["cancel"]}
             if replay:
-                result=pro_batch.replay_batch(opts['manifest_path'],selected_rows=opts.get('rows'),resume_unfinished=bool(opts.get('resume_unfinished')),**runtime)
+                result = pro_batch.replay_batch(
+                    opts["manifest_path"],
+                    selected_rows=opts.get("rows"),
+                    resume_unfinished=bool(opts.get("resume_unfinished")),
+                    **runtime,
+                )
             else:
-                result=pro_batch.run_batch(input_dir=Path(opts['input_dir']),output_dir=Path(output_dir),
-                    mode=opts.get('mode','contrast'),bin_size=int(opts.get('bin',1)),smooth_window=int(opts.get('smooth',1)),
-                    roi_min=opts.get('roi_min'),roi_max=opts.get('roi_max'),
-                    single_file=Path(opts['single_file']) if opts.get('single_file') else None,
-                    model_override=opts.get('model') or None,multistart=int(opts.get('multistart',12)),robust=bool(opts.get('robust')),
-                    odmr_multipeak=bool(opts.get('odmr_multi')),dpi=int(opts.get('dpi',180)),write_origin_bundles=bool(opts.get('origin',True)),
-                    recursive=bool(opts.get('recursive')),skip_checkpoints=bool(opts.get('skip_checkpoints')),detector=opts.get('detector','all'),
-                    detector_labels=opts.get('detector_labels'),ui_options=opts,**runtime)
-            if result:job.update(result)
-            else:job.update(state='finished',rows=read_batch_summary(output_dir))
+                result = pro_batch.run_batch(
+                    input_dir=Path(opts["input_dir"]),
+                    output_dir=Path(output_dir),
+                    mode=opts.get("mode", "contrast"),
+                    bin_size=int(opts.get("bin", 1)),
+                    smooth_window=int(opts.get("smooth", 1)),
+                    roi_min=opts.get("roi_min"),
+                    roi_max=opts.get("roi_max"),
+                    single_file=Path(opts["single_file"]) if opts.get("single_file") else None,
+                    model_override=opts.get("model") or None,
+                    multistart=int(opts.get("multistart", 12)),
+                    robust=bool(opts.get("robust")),
+                    odmr_multipeak=bool(opts.get("odmr_multi")),
+                    dpi=int(opts.get("dpi", 180)),
+                    write_origin_bundles=bool(opts.get("origin", True)),
+                    recursive=bool(opts.get("recursive")),
+                    skip_checkpoints=bool(opts.get("skip_checkpoints")),
+                    detector=opts.get("detector", "all"),
+                    detector_labels=opts.get("detector_labels"),
+                    ui_options=opts,
+                    **runtime,
+                )
+            if result:
+                job.update(result)
+            else:
+                job.update(state="finished", rows=read_batch_summary(output_dir))
         except KeyboardInterrupt:
-            job['state']='cancelled'
+            job["state"] = "cancelled"
         except Exception as exc:
-            job['state'],job['error']='failed',str(exc)
+            job["state"], job["error"] = "failed", str(exc)
         finally:
-            if job.get('manifest_path'):
-                record=load_manifest(job['manifest_path'],validate_sources=False)
-                job.update(done=record['completed_count'],total=len(record['requested_rows']),
-                    unfinished_count=sum(r['state']=='pending' for r in record['rows']),
-                    discovery_complete=record.get('discovery_complete',True),
-                    rows=[r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')])
-    threading.Thread(target=work,daemon=True).start()
+            if job.get("manifest_path"):
+                record = load_manifest(job["manifest_path"], validate_sources=False)
+                job.update(
+                    done=record["completed_count"],
+                    total=len(record["requested_rows"]),
+                    unfinished_count=sum(r["state"] == "pending" for r in record["rows"]),
+                    discovery_complete=record.get("discovery_complete", True),
+                    rows=[r["summary"] for r in record["rows"] if r["state"] in ("completed", "preserved")],
+                )
+
+    threading.Thread(target=work, daemon=True).start()
     return job_id
 
 
-def batch_import(ws,manifest_path,row_key):
+def batch_import(ws, manifest_path, row_key):
     from nvfit.batch_manifest import load_manifest, fingerprint
-    manifest=load_manifest(manifest_path)
-    row=next((r for r in manifest['rows'] if r['row_id']==row_key),None)
-    if not row or not row.get('summary') or row['summary']['status'] not in ('PASS','WARN'):
-        raise ValueError('This row has no ordinary converged fit to import.')
-    output=next((o for o in row.get('outputs',[]) if o['path'].endswith('_result.json')),None)
-    if not output or fingerprint(output['path'])['sha256']!=output['revision']['sha256']:
-        raise ValueError('The stored result is missing or changed.')
-    saved=json.loads(Path(output['path']).read_text(encoding='utf-8'))
-    series=saved.get('series')
-    if not series:raise ValueError('This older run lacks stored curves; start a new batch before importing.')
-    options=manifest['options'];mode=saved['provenance']['mode'];path=row['source_path'];det=row['detector_id']
-    proc={'bin':options['bin_size'],'smooth':options['smooth_window'],'roi_min':options['roi_min'],'roi_max':options['roi_max'],
-          'iterations':None,'excluded':[],'exclusion_ranges':[],'steps':[]}
-    extras=saved.get('fit_extras') or {}
-    custom=manifest.get('auxiliary',{}).get('custom_model')
-    if custom:extras['custom_spec']=custom
-    spec={'model':'CustomModel' if custom else 'Auto','experiment':saved['experiment_type'],'multistart':options['multistart'],
-          'robust':options['robust'],'odmr_multi':options['odmr_multipeak'],'odmr_peaks':4,'odmr_auto_peaks':True,'odmr_polarity':'Auto',
-          'rabi_mode':'Single reliable Rabi','sem_weights':True,'sem_weights_all':False,
-          't1_prep':{'normalized_1_minus_data':'Normalize then 1-data','direct_decay':'Direct decay','direct':'Direct T1'}.get(extras.get('t1_prep_mode'),'Auto'),
-          't1_family':'Stretched exponential' if extras.get('t1_model_family')=='stretched' else 'Regular exponential',
-          'range_min':None,'range_max':None,'fit_smoothed':options['smooth_window']>1,'params':{},'custom_spec':custom,
-          'batch_options':options}
-    names=list(saved['params']);metrics=saved['metrics']
-    result=FitResult(model_name=saved['selected_model'],param_names=names,params=np.array([saved['params'][n] for n in names],float),
-        errors=np.array([saved['errors'].get(n) for n in names],float),y_fit=np.asarray(series['y_fit'],float),
-        r2=metrics['r2'],rmse=metrics['rmse'],aic=metrics['aic'],bic=metrics['bic'],durbin_watson=metrics['durbin_watson'],
-        bound_hits=[bool(saved['bound_hits'].get(n)) for n in names],success=metrics['success'],message=metrics['message'],
-        extras=extras,selection_note=saved['selection_note'],covariance=np.asarray(saved['covariance'],float) if saved.get('covariance') is not None else None,
-        free_mask=saved.get('free_mask'),uncertainty=saved.get('uncertainty') or {})
-    analysis=analysis_for(ws,path,det,mode,proc,spec)
-    analysis['imported_from']={'run_id':manifest['run_id'],'row_id':row_key,'manifest_path':manifest_path}
-    tr=ws.trace(path,det,mode)
-    fit=_fit_payload(tr,np.asarray(series['x'],float),np.asarray(series['input_y'],float),saved['experiment_type'],result,analysis=analysis)
-    fit.update(status=saved['status'],reason=saved['status_reason'],metrics=saved['nv_metrics'])
-    data=trace_payload(ws,path,det,mode,proc)
-    data['proc'].update(x=series['x'],y=series['input_y'],fit_x=series['x'],fit_y=series['input_y'],smooth=None)
-    return clean({'path':path,'detector':det,'mode':mode,'proc':proc,'spec':spec,'data':{det:data},'fit':fit})
+
+    manifest = load_manifest(manifest_path)
+    row = next((r for r in manifest["rows"] if r["row_id"] == row_key), None)
+    if not row or not row.get("summary") or row["summary"]["status"] not in ("PASS", "WARN"):
+        raise ValueError("This row has no ordinary converged fit to import.")
+    output = next((o for o in row.get("outputs", []) if o["path"].endswith("_result.json")), None)
+    if not output or fingerprint(output["path"])["sha256"] != output["revision"]["sha256"]:
+        raise ValueError("The stored result is missing or changed.")
+    saved = json.loads(Path(output["path"]).read_text(encoding="utf-8"))
+    series = saved.get("series")
+    if not series:
+        raise ValueError("This older run lacks stored curves; start a new batch before importing.")
+    options = manifest["options"]
+    mode = saved["provenance"]["mode"]
+    path = row["source_path"]
+    det = row["detector_id"]
+    proc = {
+        "bin": options["bin_size"],
+        "smooth": options["smooth_window"],
+        "roi_min": options["roi_min"],
+        "roi_max": options["roi_max"],
+        "iterations": None,
+        "excluded": [],
+        "exclusion_ranges": [],
+        "steps": [],
+    }
+    extras = saved.get("fit_extras") or {}
+    custom = manifest.get("auxiliary", {}).get("custom_model")
+    if custom:
+        extras["custom_spec"] = custom
+    spec = {
+        "model": "CustomModel" if custom else "Auto",
+        "experiment": saved["experiment_type"],
+        "multistart": options["multistart"],
+        "robust": options["robust"],
+        "odmr_multi": options["odmr_multipeak"],
+        "odmr_peaks": 4,
+        "odmr_auto_peaks": True,
+        "odmr_polarity": "Auto",
+        "rabi_mode": "Single reliable Rabi",
+        "sem_weights": True,
+        "sem_weights_all": False,
+        "t1_prep": {
+            "normalized_1_minus_data": "Normalize then 1-data",
+            "direct_decay": "Direct decay",
+            "direct": "Direct T1",
+        }.get(extras.get("t1_prep_mode"), "Auto"),
+        "t1_family": "Stretched exponential" if extras.get("t1_model_family") == "stretched" else "Regular exponential",
+        "range_min": None,
+        "range_max": None,
+        "fit_smoothed": options["smooth_window"] > 1,
+        "params": {},
+        "custom_spec": custom,
+        "batch_options": options,
+    }
+    names = list(saved["params"])
+    metrics = saved["metrics"]
+    result = FitResult(
+        model_name=saved["selected_model"],
+        param_names=names,
+        params=np.array([saved["params"][n] for n in names], float),
+        errors=np.array([saved["errors"].get(n) for n in names], float),
+        y_fit=np.asarray(series["y_fit"], float),
+        r2=metrics["r2"],
+        rmse=metrics["rmse"],
+        aic=metrics["aic"],
+        bic=metrics["bic"],
+        durbin_watson=metrics["durbin_watson"],
+        bound_hits=[bool(saved["bound_hits"].get(n)) for n in names],
+        success=metrics["success"],
+        message=metrics["message"],
+        extras=extras,
+        selection_note=saved["selection_note"],
+        covariance=np.asarray(saved["covariance"], float) if saved.get("covariance") is not None else None,
+        free_mask=saved.get("free_mask"),
+        uncertainty=saved.get("uncertainty") or {},
+    )
+    analysis = analysis_for(ws, path, det, mode, proc, spec)
+    analysis["imported_from"] = {"run_id": manifest["run_id"], "row_id": row_key, "manifest_path": manifest_path}
+    tr = ws.trace(path, det, mode)
+    fit = _fit_payload(
+        tr,
+        np.asarray(series["x"], float),
+        np.asarray(series["input_y"], float),
+        saved["experiment_type"],
+        result,
+        analysis=analysis,
+    )
+    fit.update(status=saved["status"], reason=saved["status_reason"], metrics=saved["nv_metrics"])
+    data = trace_payload(ws, path, det, mode, proc)
+    data["proc"].update(x=series["x"], y=series["input_y"], fit_x=series["x"], fit_y=series["input_y"], smooth=None)
+    return clean(
+        {"path": path, "detector": det, "mode": mode, "proc": proc, "spec": spec, "data": {det: data}, "fit": fit}
+    )
 
 
-def batch_rerun(ws,manifest_path,rows):
-    if not rows:raise ValueError('Choose at least one row to rerun.')
-    return batch_start(ws,{'manifest_path':manifest_path,'rows':list(rows)})
+def batch_rerun(ws, manifest_path, rows):
+    if not rows:
+        raise ValueError("Choose at least one row to rerun.")
+    return batch_start(ws, {"manifest_path": manifest_path, "rows": list(rows)})
 
 
-def batch_resume(ws,manifest_path):
+def batch_resume(ws, manifest_path):
     from nvfit.batch_manifest import load_manifest
-    record=load_manifest(manifest_path)
-    pending=[r['row_id'] for r in record['rows'] if r['state'] in ('pending','not_requested')]
-    if not pending and record.get('discovery_complete',True):
-        raise ValueError('This run has no unfinished rows.')
-    return batch_start(ws,{'manifest_path':manifest_path,'rows':pending,'resume_unfinished':True})
+
+    record = load_manifest(manifest_path)
+    pending = [r["row_id"] for r in record["rows"] if r["state"] in ("pending", "not_requested")]
+    if not pending and record.get("discovery_complete", True):
+        raise ValueError("This run has no unfinished rows.")
+    return batch_start(ws, {"manifest_path": manifest_path, "rows": pending, "resume_unfinished": True})
 
 
 def read_batch_summary(output_dir: str) -> list[dict]:
-    record=batch_run_record(output_dir)
-    if record:return [r['summary'] for r in record['rows'] if r['state'] in ('completed','preserved')]
+    record = batch_run_record(output_dir)
+    if record:
+        return [r["summary"] for r in record["rows"] if r["state"] in ("completed", "preserved")]
     path = Path(output_dir) / "batch_summary.csv"
     if not path.exists():
         return []
@@ -1092,29 +1590,55 @@ def read_batch_summary(output_dir: str) -> list[dict]:
 
 
 def batch_cli(opts: dict) -> str:
-    parts = ["python -m nvfit.pro_batch"]
+    """Command line reproducing every option batch_start passes to run_batch (Windows quoting)."""
+    if opts.get("manifest_path"):
+        args = ["python", "-m", "nvfit.pro_batch", "--manifest", str(opts["manifest_path"])]
+        for row in opts.get("rows") or []:
+            args += ["--row", str(row)]
+        return subprocess.list2cmdline(args)
+    args = ["python", "-m", "nvfit.pro_batch"]
     if opts.get("single_file"):
-        parts.append(f'--single-file "{opts["single_file"]}"')
+        args += ["--single-file", str(opts["single_file"])]
     else:
-        parts.append(f'--input-dir "{opts.get("input_dir", "")}"')
-    parts.append(f'--output-dir "{opts.get("output_dir", "")}"')
+        args += ["--input-dir", str(opts.get("input_dir", ""))]
+    args += ["--output-dir", str(opts.get("output_dir", ""))]
     if opts.get("mode", "contrast") != "contrast":
-        parts.append(f"--mode {opts['mode']}")
-    parts.append(f"--detector {opts.get('detector', 'all')}")
-    for flag, key, default in (("--bin-size", "bin", 1), ("--smooth-window", "smooth", 1), ("--multistart", "multistart", 12)):
+        args += ["--mode", str(opts["mode"])]
+    args += ["--detector", str(opts.get("detector", "all"))]
+    labels = opts.get("detector_labels") or {}
+    for det, default in (("detector1", "Detector 1"), ("detector2", "Detector 2")):
+        if labels.get(det) and labels[det] != default:
+            args += [f"--{det}-label", str(labels[det])]
+    for flag, key, default in (
+        ("--bin-size", "bin", 1),
+        ("--smooth-window", "smooth", 1),
+        ("--multistart", "multistart", 12),
+        ("--dpi", "dpi", 180),
+    ):
         if int(opts.get(key, default)) != default:
-            parts.append(f"{flag} {int(opts[key])}")
+            args += [flag, str(int(opts[key]))]
+    for flag, key in (("--roi-min", "roi_min"), ("--roi-max", "roi_max")):
+        if opts.get(key) is not None:
+            args += [flag, repr(float(opts[key]))]
     if opts.get("model"):
-        parts.append(f"--model-override {opts['model']}")
-    for flag, key in (("--robust", "robust"), ("--odmr-multipeak", "odmr_multi"), ("--recursive", "recursive"), ("--skip-checkpoints", "skip_checkpoints")):
+        args += ["--model-override", str(opts["model"])]
+    for flag, key in (
+        ("--robust", "robust"),
+        ("--odmr-multipeak", "odmr_multi"),
+        ("--recursive", "recursive"),
+        ("--skip-checkpoints", "skip_checkpoints"),
+    ):
         if opts.get(key):
-            parts.append(flag)
-    return " ".join(parts)
+            args.append(flag)
+    if not opts.get("origin", True):
+        args.append("--no-origin-bundle")
+    return subprocess.list2cmdline(args)
 
 
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
+
 
 def _decode_data_url(data: str) -> bytes:
     return base64.b64decode(data.split(",", 1)[1] if "," in data else data)
@@ -1151,20 +1675,29 @@ def svg_to_pdf_bytes(svg: str) -> bytes:
 
 def validate_analysis(ws, envelope):
     from nvfit.analysis_identity import scientific_revision, canonical
+
     try:
-        expected=result_envelope(envelope['descriptor'],envelope['source_revision'],envelope['settings'],envelope['dependencies'],envelope['kind'])
-        if expected['signature']!=envelope['signature'] or envelope.get('unverified'):
-            return {'fresh':False,'reason':'Unverified result signature'}
-        sources=dict(envelope.get('dependencies') or {})
-        path=envelope['descriptor']['source']
-        if path=='aggregate':sources.update(envelope['source_revision'])
-        else:sources[path]=envelope['source_revision']
-        for path,revision in sources.items():
-            if canonical(scientific_revision(ws.source_revision(path)))!=canonical(scientific_revision(revision)):
-                return {'fresh':False,'reason':f'Source changed: {path}'}
-        return {'fresh':True,'reason':''}
-    except (OSError,KeyError,ValueError) as exc:
-        return {'fresh':False,'reason':str(exc)}
+        expected = result_envelope(
+            envelope["descriptor"],
+            envelope["source_revision"],
+            envelope["settings"],
+            envelope["dependencies"],
+            envelope["kind"],
+        )
+        if expected["signature"] != envelope["signature"] or envelope.get("unverified"):
+            return {"fresh": False, "reason": "Unverified result signature"}
+        sources = dict(envelope.get("dependencies") or {})
+        path = envelope["descriptor"]["source"]
+        if path == "aggregate":
+            sources.update(envelope["source_revision"])
+        elif path != "manual":
+            sources[path] = envelope["source_revision"]
+        for path, revision in sources.items():
+            if canonical(scientific_revision(ws.source_revision(path))) != canonical(scientific_revision(revision)):
+                return {"fresh": False, "reason": f"Source changed: {path}"}
+        return {"fresh": True, "reason": ""}
+    except (OSError, KeyError, ValueError) as exc:
+        return {"fresh": False, "reason": str(exc)}
 
 
 def export_results(ws: Workspace, req: dict) -> dict:
@@ -1174,14 +1707,20 @@ def export_results(ws: Workspace, req: dict) -> dict:
         combine_datasets(ws.dataset, recipe, req.get("mode", "contrast"))
         with ws._lock:
             ws.combined[recipe["path"]] = recipe
-    for envelope in (req.get('analysis'),(req.get('fit') or {}).get('analysis'),(req.get('map_comparison') or {}).get('analysis')):
+    for envelope in (
+        req.get("analysis"),
+        (req.get("fit") or {}).get("analysis"),
+        (req.get("map_comparison") or {}).get("analysis"),
+    ):
         if envelope:
-            validation=validate_analysis(ws,envelope)
-            if not validation['fresh']:raise ValueError('Export source changed; reload before saving. '+validation['reason'])
+            validation = validate_analysis(ws, envelope)
+            if not validation["fresh"]:
+                raise ValueError("Export source changed; reload before saving. " + validation["reason"])
     out_dir = Path(req["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = req["stem"]
     written = []
+    warnings: list[str] = []
     images = req.get("images") or {}
     if images.get("png"):
         p = out_dir / f"{stem}_fit.png"
@@ -1198,25 +1737,47 @@ def export_results(ws: Workspace, req: dict) -> dict:
             p.write_bytes(svg_to_pdf_bytes(images["pdf_svg"]))
             written.append(str(p))
             pdf_done = True
-        except Exception:  # fall back to the raster PDF below
-            pass
+        except Exception as exc:  # fall back to the raster PDF below, and say so
+            vector_error = str(exc) or exc.__class__.__name__
+        else:
+            vector_error = None
     if images.get("pdf_png") and not pdf_done:
         from PIL import Image
 
         p = out_dir / Path(req.get("pdf_filename") or f"{stem}_fit.pdf").name
-        Image.open(io.BytesIO(_decode_data_url(images["pdf_png"]))).convert("RGB").save(p, "PDF", resolution=float(req.get("dpi", 300)))
+        Image.open(io.BytesIO(_decode_data_url(images["pdf_png"]))).convert("RGB").save(
+            p, "PDF", resolution=float(req.get("dpi", 300))
+        )
         written.append(str(p))
+        if images.get("pdf_svg"):
+            warnings.append(
+                f"{p.name} is a raster (bitmap) PDF at {float(req.get('dpi', 300)):g} dpi: "
+                f"vector conversion failed ({vector_error}). Text and lines will not scale."
+            )
+    elif (images.get("pdf_svg") or images.get("pdf_png")) and not pdf_done:
+        warnings.append(f"PDF was not written: vector conversion failed ({vector_error}) and no raster fallback was supplied.")
     if images.get("report_png"):
         p = out_dir / f"{stem}_report.png"
         p.write_bytes(_decode_data_url(images["report_png"]))
         written.append(str(p))
     doc = {
-        "app": f"SmartFitter {APP_VERSION}", "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "analysis":req.get("analysis"), "historical_results":req.get("historical_results"),
-        "source": req.get("source"), "detector": req.get("detector"), "mode": req.get("mode"),
-        "processing": req.get("processing"), "fit_spec": req.get("fit_spec"), "fit": req.get("fit"),
-        "spots": req.get("spots"), "map_comparison": req.get("map_comparison"), "plot_state": req.get("plot_state"),
-        "provenance": req.get("provenance"), "iteration_fits": req.get("iteration_fits"), "iteration_sensitivity": req.get("iteration_sensitivity"), "combined_recipe": req.get("combined_recipe"),
+        "app": f"SmartFitter {APP_VERSION}",
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "analysis": req.get("analysis"),
+        "historical_results": req.get("historical_results"),
+        "source": req.get("source"),
+        "detector": req.get("detector"),
+        "mode": req.get("mode"),
+        "processing": req.get("processing"),
+        "fit_spec": req.get("fit_spec"),
+        "fit": req.get("fit"),
+        "spots": req.get("spots"),
+        "map_comparison": req.get("map_comparison"),
+        "plot_state": req.get("plot_state"),
+        "provenance": req.get("provenance"),
+        "iteration_fits": req.get("iteration_fits"),
+        "iteration_sensitivity": req.get("iteration_sensitivity"),
+        "combined_recipe": req.get("combined_recipe"),
     }
     if req.get("json", True):
         p = out_dir / f"{stem}_result.json"
@@ -1246,17 +1807,50 @@ def export_results(ws: Workspace, req: dict) -> dict:
             fp = fit.get("provenance") or {}
             with p.open("w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["x", "y", "y_smooth", "y_fit", "residual", "fit_target_y", "x_unit", "y_unit", "fit_space", "fit_target", "smoothing_window", "selected_iterations", "iteration_sources", "uncertainty_note"])
+                w.writerow(
+                    [
+                        "x",
+                        "y",
+                        "y_smooth",
+                        "y_fit",
+                        "residual",
+                        "fit_target_y",
+                        "x_unit",
+                        "y_unit",
+                        "fit_space",
+                        "fit_target",
+                        "smoothing_window",
+                        "selected_iterations",
+                        "iteration_sources",
+                        "uncertainty_note",
+                    ]
+                )
                 sm = data["proc"].get("smooth") or [None] * len(data["proc"]["x"])
+
                 def at(key, i):
                     values = fit.get(key) or []
                     return values[i] if i is not None and i < len(values) else None
+
                 for xv, yv, sv in zip(data["proc"]["x"], data["proc"]["y"], sm):
                     i = fx.get(round(xv, 12)) if xv is not None else None
-                    w.writerow([xv, yv, sv, at("y_fit", i), at("residuals", i), at("plot_y", i),
-                                data["info"].get("x_unit"), "dimensionless" if req.get("mode", "contrast") == "contrast" else data["info"].get("unit"),
-                                fit.get("plot_y_label") or req.get("mode", "contrast"), fp.get("fit_target"), fp.get("smoothing_window"),
-                                json.dumps(fp.get("selected_iterations", [])), json.dumps(fp.get("iteration_sources", [])), fp.get("uncertainty_note", "")])
+                    w.writerow(
+                        [
+                            xv,
+                            yv,
+                            sv,
+                            at("y_fit", i),
+                            at("residuals", i),
+                            at("plot_y", i),
+                            data["info"].get("x_unit"),
+                            "dimensionless" if req.get("mode", "contrast") == "contrast" else data["info"].get("unit"),
+                            fit.get("plot_y_label") or req.get("mode", "contrast"),
+                            fp.get("fit_target"),
+                            fp.get("smoothing_window"),
+                            json.dumps(fp.get("selected_iterations", [])),
+                            json.dumps(fp.get("iteration_sources", [])),
+                            fp.get("uncertainty_note", ""),
+                        ]
+                    )
             written.append(str(p))
     if req.get("detectors_raw") and src:
         ds = ws.dataset(src, req.get("mode", "contrast"))
@@ -1264,24 +1858,55 @@ def export_results(ws: Workspace, req: dict) -> dict:
             p = out_dir / f"{stem}__detectors_raw.csv"
             with p.open("w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["detector_id", "detector_label", "x", "y_coord", "signal", "reference", "contrast", "difference"])
+                w.writerow(
+                    ["detector_id", "detector_label", "x", "y_coord", "signal", "reference", "contrast", "difference"]
+                )
                 for det, tr in ds.detectors.items():
                     if tr.scan_dim == "scan2d" and tr.signal2d is not None and tr.reference2d is not None:
                         xs, ys = np.asarray(tr.x2d, float), np.asarray(tr.y2d, float)
                         for r, c in np.ndindex(xs.shape):
                             s, ref = tr.signal2d[r, c], tr.reference2d[r, c]
-                            w.writerow([det, tr.detector_label, xs[r, c], ys[r, c], s, ref, (ref - s) / ref if ref else "", ref - s])
+                            w.writerow(
+                                [
+                                    det,
+                                    tr.detector_label,
+                                    xs[r, c],
+                                    ys[r, c],
+                                    s,
+                                    ref,
+                                    (ref - s) / ref if ref else "",
+                                    ref - s,
+                                ]
+                            )
                     else:
                         for i, xv in enumerate(tr.x_ns):
                             s, ref = tr.signal[i], tr.reference[i]
-                            w.writerow([det, tr.detector_label, xv, "", s, ref, (ref - s) / ref if ref else "", ref - s])
+                            w.writerow(
+                                [det, tr.detector_label, xv, "", s, ref, (ref - s) / ref if ref else "", ref - s]
+                            )
             written.append(str(p))
     if req.get("time_trace") and src:
         ds = ws.dataset(src, req.get("mode", "reference"))
         p = out_dir / f"{stem}__time_trace.csv"
         with p.open("w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            w.writerow(["source_file", "detector_id", "source_point_index", "elapsed_s", "reference", "signal", "contrast", "difference", "scheduled_start_s", "lateness_s", "retries", "n_points", "recorded_units"])
+            w.writerow(
+                [
+                    "source_file",
+                    "detector_id",
+                    "source_point_index",
+                    "elapsed_s",
+                    "reference",
+                    "signal",
+                    "contrast",
+                    "difference",
+                    "scheduled_start_s",
+                    "lateness_s",
+                    "retries",
+                    "n_points",
+                    "recorded_units",
+                ]
+            )
             for tr in ds.detectors.values():
                 meta = tr.metadata or {}
                 timing = meta.get("time_trace") if isinstance(meta.get("time_trace"), dict) else {}
@@ -1294,15 +1919,28 @@ def export_results(ws: Workspace, req: dict) -> dict:
                         return v if math.isfinite(v) else ""
                     except Exception:
                         return ""
+
                 for i, t in enumerate(tr.x_ns):
                     ref, sig = tr.reference[i], tr.signal[i]
                     contrast = (ref - sig) / ref if np.isfinite(sig) and ref else float("nan")
                     src_i = int(idx[i]) if i < len(idx) else i
-                    w.writerow([tr.source_path, tr.detector_id, src_i, t, val(tr.reference, i),
-                                "" if ref_only else val(tr.signal, i), "" if ref_only or not np.isfinite(contrast) else contrast,
-                                "" if ref_only else ref - sig, val(timing.get("scheduledSeconds") or [], src_i),
-                                val(timing.get("latenessSeconds") or [], src_i), val(timing.get("failedPoints") or [], src_i),
-                                val(timing.get("nPoints") or [], src_i), meta.get("value_unit", "counts")])
+                    w.writerow(
+                        [
+                            tr.source_path,
+                            tr.detector_id,
+                            src_i,
+                            t,
+                            val(tr.reference, i),
+                            "" if ref_only else val(tr.signal, i),
+                            "" if ref_only or not np.isfinite(contrast) else contrast,
+                            "" if ref_only else ref - sig,
+                            val(timing.get("scheduledSeconds") or [], src_i),
+                            val(timing.get("latenessSeconds") or [], src_i),
+                            val(timing.get("failedPoints") or [], src_i),
+                            val(timing.get("nPoints") or [], src_i),
+                            meta.get("value_unit", "counts"),
+                        ]
+                    )
         written.append(str(p))
     if req.get("spots_csv") and req.get("spots"):
         p = out_dir / f"{stem}__spots.csv"
@@ -1314,13 +1952,26 @@ def export_results(ws: Workspace, req: dict) -> dict:
             w.writerows(rows)
         written.append(str(p))
     if req.get("map_comparison_csv") and (req.get("map_comparison") or req.get("map_comparison_request")):
-        mc = req.get('map_comparison') or map_overlay(ws, *req["map_comparison_request"])
+        mc = req.get("map_comparison") or map_overlay(ws, *req["map_comparison_request"])
         p = out_dir / f"{stem}__map_comparison.csv"
         xe, ye = mc["x_edges"], mc["y_edges"]
         prim, sec, rgba = mc["cells"]["primary"], mc["cells"]["secondary"], mc["cells"]["rgba"]
         with p.open("w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            w.writerow(["x_low", "x_high", "y_low", "y_high", "primary_recorded", "secondary_recorded", "red", "green", "blue", "coverage"])
+            w.writerow(
+                [
+                    "x_low",
+                    "x_high",
+                    "y_low",
+                    "y_high",
+                    "primary_recorded",
+                    "secondary_recorded",
+                    "red",
+                    "green",
+                    "blue",
+                    "coverage",
+                ]
+            )
             for r in range(len(prim)):
                 for c in range(len(prim[r])):
                     w.writerow([xe[c], xe[c + 1], ye[r], ye[r + 1], prim[r][c], sec[r][c], *rgba[r][c]])
@@ -1330,4 +1981,4 @@ def export_results(ws: Workspace, req: dict) -> dict:
             p = out_dir / f"{stem}{name}"
             p.write_text(text, encoding="utf-8")
             written.append(str(p))
-    return {"written": written, "folder": str(out_dir)}
+    return {"written": written, "folder": str(out_dir), "warnings": warnings}

@@ -1726,10 +1726,57 @@ def _detector_failure(
     )
 
 
+class _V73Opaque:
+    """A MATLAB class object in a v7.3 file (datetime, string...), kept undecoded like scipy's MatlabOpaque."""
+
+    def __init__(self, matlab_class: str) -> None:
+        self.matlab_class = matlab_class
+
+    def __repr__(self) -> str:
+        return f"<MATLAB {self.matlab_class or 'object'}>"
+
+
+class _V73Struct:
+    """Attribute view of a decoded v7.3 struct, matching scipy's mat_struct (``_fieldnames`` + attributes)."""
+
+    def __init__(self, fields: dict) -> None:
+        self._fieldnames = list(fields)
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+def _as_loadmat_value(value: Any) -> Any:
+    """Convert AutoFind's plain v7.3 decoding to what loadmat(struct_as_record=False, squeeze_me=True) yields."""
+    if isinstance(value, dict):
+        if set(value) == {"opaque"}:
+            return _V73Opaque(str(value["opaque"]))  # not decoded, as for v5 files
+        return _V73Struct({k: _as_loadmat_value(v) for k, v in value.items()})
+    if isinstance(value, list):
+        out = np.empty(len(value), dtype=object)
+        for i, item in enumerate(value):
+            out[i] = _as_loadmat_value(item)
+        return out
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        out = np.empty(value.shape, dtype=object)
+        for i in np.ndindex(value.shape):
+            out[i] = _as_loadmat_value(value[i])
+        return out
+    return value
+
+
+def load_mat_file(path: str | Path) -> dict[str, Any]:
+    """Read a .mat file of either format into loadmat's struct-object form; v7.3 uses the HDF5 reader."""
+    from .autofind import is_v73, read_mat
+
+    if is_v73(path):
+        return {key: _as_loadmat_value(value) for key, value in read_mat(path).items()}
+    return loadmat(Path(path), struct_as_record=False, squeeze_me=True)
+
+
 def load_experiment_dataset(path: str | Path, mode: DataMode = "contrast") -> ExperimentDataset:
     mat_path = Path(path)
     mode = _canonical_mode(mode)
-    raw = loadmat(mat_path, struct_as_record=False, squeeze_me=True)
+    raw = load_mat_file(mat_path)
     metadata: dict[str, object] = {}
     available_detectors: tuple[str, ...] = ("detector1",)
     detector_mode = "single"

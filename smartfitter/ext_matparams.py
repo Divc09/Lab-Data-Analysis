@@ -1,17 +1,25 @@
 """Acquisition parameters saved in the .mat file (params / scanInfo / metadata structs), flattened for the Info tab.
 
 Values are shown as stored: no unit conversion, no interpretation. Large arrays are summarised, not dumped."""
+
 from __future__ import annotations
+
+from . import core
 
 from pathlib import Path
 
 import numpy as np
-from scipy.io import loadmat
+from nvfit.io_mat import load_mat_file
 from scipy.io.matlab import MatlabOpaque, mat_struct
 
 SECTIONS = ("params", "scanInfo", "metadata", "Data")
-_MAX_ITEMS = 12      # arrays up to this many elements are listed in full
+_MAX_ITEMS = 12  # arrays up to this many elements are listed in full
 _MAX_DEPTH = 4
+
+
+def _is_struct(value) -> bool:
+    """A MATLAB struct from either file format (scipy mat_struct, or the v7.3 view with the same _fieldnames)."""
+    return isinstance(value, mat_struct) or hasattr(value, "_fieldnames")
 
 
 def _fmt(value) -> str:
@@ -27,29 +35,45 @@ def _fmt(value) -> str:
 
 
 def _flatten(value, prefix: str, out: list, depth: int, skip_numeric: bool) -> None:
-    if isinstance(value, mat_struct):
+    if _is_struct(value):
         if depth >= _MAX_DEPTH:
             out.append([prefix, f"struct ({len(value._fieldnames)} fields)"])
             return
         for name in value._fieldnames:
             _flatten(getattr(value, name), f"{prefix}.{name}", out, depth + 1, skip_numeric)
         return
-    if isinstance(value, MatlabOpaque):  # MATLAB string/datetime objects cannot be decoded outside MATLAB
+    if isinstance(value, MatlabOpaque) or hasattr(value, "matlab_class"):  # MATLAB string/datetime objects cannot be decoded outside MATLAB
         out.append([prefix, "(MATLAB object: open in MATLAB to read)"])
         return
     if isinstance(value, np.ndarray):
         # {label, value; ...} cells such as metadata.dataInfo read as named settings
-        if value.dtype == object and value.ndim == 2 and value.shape[1] == 2 and all(isinstance(v, str) for v in value[:, 0]):
+        if (
+            value.dtype == object
+            and value.ndim == 2
+            and value.shape[1] == 2
+            and all(isinstance(v, str) for v in value[:, 0])
+        ):
             for label, v in value:
                 _flatten(v, f"{prefix}.{label}", out, depth + 1, skip_numeric)
             return
         if value.dtype == object:
             # struct lists (e.g. pulse-sequence steps): one compact row per element
-            if 0 < value.size <= 64 and all(isinstance(v, mat_struct) for v in value.ravel()):
+            if 0 < value.size <= 64 and all(_is_struct(v) for v in value.ravel()):
                 for i, v in enumerate(value.ravel()):
-                    out.append([f"{prefix}[{i + 1}]", " · ".join(f"{n} {_fmt(getattr(v, n))}" for n in v._fieldnames if not isinstance(getattr(v, n), mat_struct))])
+                    out.append(
+                        [
+                            f"{prefix}[{i + 1}]",
+                            " · ".join(
+                                f"{n} {_fmt(getattr(v, n))}"
+                                for n in v._fieldnames
+                                if not _is_struct(getattr(v, n))
+                            ),
+                        ]
+                    )
                 return
-            if value.size <= _MAX_ITEMS and all(isinstance(v, (str, bytes, int, float, np.generic)) for v in value.ravel()):
+            if value.size <= _MAX_ITEMS and all(
+                isinstance(v, (str, bytes, int, float, np.generic)) for v in value.ravel()
+            ):
                 out.append([prefix, ", ".join(_fmt(v) for v in value.ravel())])
             elif value.size <= _MAX_ITEMS and depth < _MAX_DEPTH:
                 for i, v in enumerate(value.ravel()):
@@ -67,8 +91,9 @@ def _flatten(value, prefix: str, out: list, depth: int, skip_numeric: bool) -> N
     out.append([prefix, _fmt(value)])
 
 
+@core.plain_endpoint
 def mat_params(ws, path):
-    raw = loadmat(Path(path), struct_as_record=False, squeeze_me=True)
+    raw = load_mat_file(path)
     sections = []
     for key in SECTIONS:
         if key not in raw:

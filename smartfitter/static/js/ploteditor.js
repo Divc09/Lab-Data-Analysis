@@ -48,7 +48,7 @@ export function openSeriesEditor(f, key, x, y) {
       h('div', { class: 'g2' },
         field('Line', seg([...DASH, ['none', 'None']], hasLine ? s.dash : 'none', (v) => set(v === 'none' ? { mode: 'markers' } : { dash: v, mode: hasMarker ? 'lines+markers' : 'lines' }))),
         field('Marker', seg([...MARKERS.slice(0, 3), ['none', 'None']], hasMarker ? s.marker : 'none', (v) => set(v === 'none' ? { mode: 'lines' } : { marker: v, mode: hasLine ? 'lines+markers' : 'markers' })))),
-      h('div', { class: 'g3' }, field('Width', input(s.width, (v) => set({ width: num(v) ?? 1.5 }))), field('Marker size', input(s.size, (v) => set({ size: num(v) ?? 6 }))), field('Opacity', input(s.opacity, (v) => set({ opacity: Math.min(1, Math.max(0.05, num(v) ?? 1)) })))),
+      h('div', { class: 'g3' }, field('Width', input(s.width, (v) => set({ width: num(v) ?? 1.5 }), { numeric: true })), field('Marker size', input(s.size, (v) => set({ size: num(v) ?? 6 }), { numeric: true })), field('Opacity', input(s.opacity, (v) => set({ opacity: Math.min(1, Math.max(0.05, num(v) ?? 1)) }), { numeric: true }))),
       h('div', { class: 'row wrap' }, check('On plot', s.visible !== false, (v) => set({ visible: v })), check('In legend', s.legend !== false, (v) => set({ legend: v })),
         h('span', { class: 'sp' }), h('button', { class: 'btn sm', onclick: () => { commit('reset series'); delete f.style.series[key]; emit(); draw(); } }, 'Reset')));
     if (o) pop.append(h('details', {}, h('summary', {}, 'File-level legend template & fit settings'), seriesOptions(f, o)));
@@ -294,7 +294,7 @@ function seriesTab(f) {
     })),
     field('Colour palette', select([['lab', 'Lab default (blue, orange, teal, magenta)'], ['okabe', 'Colour-blind safe (Okabe–Ito)'], ['gray', 'Grayscale']], st.palette, (v) => { commit('palette'); f.style.palette = v; emit(); })),
     kindOf(f) === '1d' ? field('Uncertainty display', seg([['band', 'Band'], ['bars', 'Error bars']], f.errorMode, (v) => { f.errorMode = v; f.layers.band = true; emit(); })) : null,
-    h('div', { class: 'g2' }, field('Default line width', input(st.line, (v) => { commit('line width'); f.style.line = num(v) ?? 1.6; emit(); })), field('Default marker size', input(st.marker, (v) => { commit('marker size'); f.style.marker = num(v) ?? 6; emit(); }))));
+    h('div', { class: 'g2' }, field('Default line width', input(st.line, (v) => { commit('line width'); f.style.line = num(v) ?? 1.6; emit(); }, { numeric: true })), field('Default marker size', input(st.marker, (v) => { commit('marker size'); f.style.marker = num(v) ?? 6; emit(); }, { numeric: true }))));
 }
 
 function legendTab(f) {
@@ -304,13 +304,13 @@ function legendTab(f) {
   return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
     check('Show legend', f.layers.legend, (v) => { commit('legend'); f.layers.legend = v; emit(); }),
     field('Legend title', input(L.title || '', (title) => set({ title }))),
-    h('div', { class: 'g2' }, field('Anchor X (plot fraction)', input(L.x ?? '', (v) => set({ x: num(v), y: L.y ?? 0.99 }))), field('Anchor Y', input(L.y ?? '', (v) => set({ x: L.x ?? 0.01, y: num(v) })))),
+    h('div', { class: 'g2' }, field('Anchor X (plot fraction)', input(L.x ?? '', (v) => set({ x: num(v), y: L.y ?? 0.99 }), { numeric: true })), field('Anchor Y', input(L.y ?? '', (v) => set({ x: L.x ?? 0.01, y: num(v) }), { numeric: true }))),
     field('Position', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right'], ['outside', 'Outside'], ['below', 'Below']], L.x != null ? '' : L.pos, (v) => set({ pos: v, x: null, y: null }))),
     h('div', { class: 'note' }, 'Or drag the legend on the plot; the position is remembered.'),
-    h('div', { class: 'g2' }, field('Columns', input(L.cols || 1, (v) => set({ cols: Math.max(1, num(v) || 1) }))), field('Font size (px)', input(L.size || '', (v) => set({ size: num(v) }), { placeholder: 'auto' }))),
+    h('div', { class: 'g2' }, field('Columns', input(L.cols || 1, (v) => set({ cols: Math.max(1, num(v) || 1) }), { numeric: true })), field('Font size (px)', input(L.size || '', (v) => set({ size: num(v) }), { numeric: true, placeholder: 'auto' }))),
     check('Frame', L.frame !== false, (v) => set({ frame: v })),
     h('div', { class: 'g3' }, field('Text colour', input(L.color || '#1D2330', (color) => set({ color }))), field('Background (CSS colour)', input(L.bg || 'rgba(255,255,255,0.92)', (bg) => set({ bg }))), field('Border colour', input(L.edge || '#D9DDE4', (edge) => set({ edge })))),
-    field('Border width (px)', input(L.borderwidth ?? 1, (v) => set({ borderwidth: Math.max(0, num(v) ?? 1) }))),
+    field('Border width (px)', input(L.borderwidth ?? 1, (v) => set({ borderwidth: Math.max(0, num(v) ?? 1) }), { numeric: true })),
     h('div', { class: 'note' }, 'Edit each file’s result parameters, template, precision and units in Series → Style & legend. Double-click legend text to rename in place; Alt-click opens full trace styling.'));
 }
 
@@ -330,11 +330,11 @@ function axisCard(f, ax, label) {
   ticks.addEventListener('change', () => { try { set({ ticks: parseTickTable(ticks.value) }); } catch (e) { toast(e.message, 'err'); } });
   return h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, h('span', { style: 'font-weight:600' }, label),
     field('Label', input(a.title ?? '', (v) => set({ title: v === '' ? null : v }), { placeholder: 'automatic' })),
-    h('div', { class: 'g3' }, field('Min', input(a.min ?? '', (v) => set({ min: num(v) }), { placeholder: 'auto' })), field('Max', input(a.max ?? '', (v) => set({ max: num(v) }), { placeholder: 'auto' })),
+    h('div', { class: 'g3' }, field('Min', input(a.min ?? '', (v) => set({ min: num(v) }), { numeric: true, placeholder: 'auto' })), field('Max', input(a.max ?? '', (v) => set({ max: num(v) }), { numeric: true, placeholder: 'auto' })),
       field('Scale', select([['', 'Linear'], ['log', 'Log']], a.log ? 'log' : '', (v) => set({ log: v === 'log' })))),
-    h('div', { class: 'g3' }, field('Major every', input(a.dtick ?? '', (v) => set({ dtick: num(v) }), { placeholder: 'auto' })), field('Minor per major', input(a.minor ?? '', (v) => set({ minor: num(v) }), { placeholder: 'off' })),
+    h('div', { class: 'g3' }, field('Major every', input(a.dtick ?? '', (v) => set({ dtick: num(v) }), { numeric: true, placeholder: 'auto' })), field('Minor per major', input(a.minor ?? '', (v) => set({ minor: num(v) }), { numeric: true, placeholder: 'off' })),
       field('Format', select([['auto', 'Auto'], ['fixed1', '0.0'], ['fixed2', '0.00'], ['fixed3', '0.000'], ['sci', 'Scientific'], ['eng', 'Engineering (k, M)'], ['percent', 'Percent']], a.format || 'auto', (v) => set({ format: v })))),
-    field('First major tick', input(a.tick0 ?? '', (v) => set({ tick0: num(v) }), { placeholder: 'auto' })),
+    field('First major tick', input(a.tick0 ?? '', (v) => set({ tick0: num(v) }), { numeric: true, placeholder: 'auto' })),
     h('details', { open: !!f.display.editorDetails?.[`ticks:${ax}`], ontoggle: (e) => { f.display.editorDetails ||= {}; f.display.editorDetails[`ticks:${ax}`] = e.target.open; } }, h('summary', {}, 'Explicit tick table…'), h('div', { class: 'note' }, 'One position, label per row, in displayed axis units. For log axes use positive positions; major spacing is in decades. Empty restores automatic ticks.'), ticks,
       h('button', { class: 'btn sm', onclick: () => set({ ticks: [] }) }, 'Clear tick table')));
 }
@@ -363,15 +363,15 @@ function insetTab(f) {
   return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
     h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, h('span', { style: 'font-weight:600' }, 'Inset zoom'),
       check('Show inset', !!ins.enabled, (v) => setI({ enabled: v })),
-      h('div', { class: 'g2' }, field('Zoom from x', input(ins.x0 ?? '', (v) => setI({ x0: num(v) }))), field('Zoom to x', input(ins.x1 ?? '', (v) => setI({ x1: num(v) })))),
+      h('div', { class: 'g2' }, field('Zoom from x', input(ins.x0 ?? '', (v) => setI({ x0: num(v) }), { numeric: true })), field('Zoom to x', input(ins.x1 ?? '', (v) => setI({ x1: num(v) }), { numeric: true }))),
       field('Corner', seg([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right']], ins.pos || 'ur', (v) => setI({ pos: v }))),
-      field('Size (fraction of plot width)', input(ins.size ?? 0.35, (v) => setI({ size: Math.min(0.7, Math.max(0.1, num(v) ?? 0.35)) }))),
+      field('Size (fraction of plot width)', input(ins.size ?? 0.35, (v) => setI({ size: Math.min(0.7, Math.max(0.1, num(v) ?? 0.35)) }), { numeric: true })),
       check('Automatic y range', yAuto, (v) => setI({ y: v ? null : { y0: 0, y1: 1 } })),
-      yAuto ? null : h('div', { class: 'g2' }, field('y min', input(ins.y.y0, (v) => setI({ y: { ...ins.y, y0: num(v) } }))), field('y max', input(ins.y.y1, (v) => setI({ y: { ...ins.y, y1: num(v) } })))),
+      yAuto ? null : h('div', { class: 'g2' }, field('y min', input(ins.y.y0, (v) => setI({ y: { ...ins.y, y0: num(v) } }), { numeric: true })), field('y max', input(ins.y.y1, (v) => setI({ y: { ...ins.y, y1: num(v) } }), { numeric: true }))),
       h('div', { class: 'note' }, 'Magnifies the data and fit between the two x values; a dashed box marks the region on the main plot. Use Add > Inset to start from the current zoom.')),
     h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, h('span', { style: 'font-weight:600' }, 'Broken x axis'),
       check('Hide an x interval', !!xb.enabled, (v) => setB({ enabled: v }), { disabled: !!blocked }),
-      h('div', { class: 'g2' }, field('Gap starts at x', input(xb.from ?? '', (v) => setB({ from: num(v) }))), field('Gap ends at x', input(xb.to ?? '', (v) => setB({ to: num(v) })))),
+      h('div', { class: 'g2' }, field('Gap starts at x', input(xb.from ?? '', (v) => setB({ from: num(v) }), { numeric: true })), field('Gap ends at x', input(xb.to ?? '', (v) => setB({ to: num(v) }), { numeric: true }))),
       h('div', { class: 'note' }, blocked ? `Broken axis is switched off while the ${blocked} is shown.` : 'Two x panels share the y axis; useful for long Rabi or T1 scans. Needs from < to inside the data range.')));
 }
 
@@ -405,9 +405,9 @@ function textTab(f) {
   })));
   else out.append(h('div', { class: 'note' }, 'Fit values appear here after a fit; custom static rows work without fitting.'));
   out.append(h('button', { class: 'btn sm', onclick: () => setCfg({ static: [...(cfg.static || []), { key: `static:${Date.now()}`, label: 'Custom row', text: 'Note' }] }) }, 'Add static annotation row'),
-    h('div', { class: 'g2' }, field('Box font size (px)', input(cfg.size || '', (v) => setCfg({ size: num(v) }))), field('Alignment', select(['left', 'center', 'right'], cfg.align || 'left', (align) => setCfg({ align })))),
+    h('div', { class: 'g2' }, field('Box font size (px)', input(cfg.size || '', (v) => setCfg({ size: num(v) }), { numeric: true })), field('Alignment', select(['left', 'center', 'right'], cfg.align || 'left', (align) => setCfg({ align })))),
     h('div', { class: 'g3' }, field('Text colour', input(cfg.color || '#1D2330', (color) => setCfg({ color }))), field('Background', input(cfg.bg || 'rgba(255,255,255,0.92)', (bg) => setCfg({ bg }))), field('Border', input(cfg.edge || '#D9DDE4', (edge) => setCfg({ edge })))),
-    h('div', { class: 'g2' }, field('Padding (px)', input(cfg.padding ?? 6, (v) => setCfg({ padding: num(v) ?? 6 }))), check('Frame', cfg.frame !== false, (frame) => setCfg({ frame }))));
+    h('div', { class: 'g2' }, field('Padding (px)', input(cfg.padding ?? 6, (v) => setCfg({ padding: num(v) ?? 6 }), { numeric: true })), check('Frame', cfg.frame !== false, (frame) => setCfg({ frame }))));
   out.append(h('div', { class: 'g2' }, field('Number format', select([['pm', 'Value ± error'], ['sig4', '4 significant']], cfg.format, (v) => { commit('format'); f.style.results = { ...(f.style.results || {}), format: v }; emit(); })),
     field('Box position', select([['ul', 'Upper left'], ['ur', 'Upper right'], ['ll', 'Lower left'], ['lr', 'Lower right']], cfg.pos, (v) => { commit('results position'); f.style.results = { ...(f.style.results || {}), pos: v, x: null, y: null }; emit(); }))));
   out.append(h('span', { class: 'lbl', style: 'margin-top:6px' }, 'Added items'));
@@ -415,9 +415,9 @@ function textTab(f) {
   if (!shapes.length) out.append(h('div', { class: 'note' }, 'Use Add above for text, arrows, reference lines, shaded regions and fit-value lines.'));
   shapes.forEach((d, i) => {
     const upd = (patch) => { commit('edit item'); Object.assign(d, patch); emit(); };
-    const pos = d.kind === 'vline' ? [field('x', input(d.x, (v) => upd({ x: num(v) })))] : d.kind === 'hline' ? [field('y', input(d.y, (v) => upd({ y: num(v) })))]
-      : d.kind === 'region' ? [field('from x', input(d.x0, (v) => upd({ x0: num(v) }))), field('to x', input(d.x1, (v) => upd({ x1: num(v) })))]
-        : [field('x', input(d.x, (v) => upd({ x: num(v) }))), field('y', input(d.y, (v) => upd({ y: num(v) })))];
+    const pos = d.kind === 'vline' ? [field('x', input(d.x, (v) => upd({ x: num(v) }), { numeric: true }))] : d.kind === 'hline' ? [field('y', input(d.y, (v) => upd({ y: num(v) }), { numeric: true }))]
+      : d.kind === 'region' ? [field('from x', input(d.x0, (v) => upd({ x0: num(v) }), { numeric: true })), field('to x', input(d.x1, (v) => upd({ x1: num(v) }), { numeric: true }))]
+        : [field('x', input(d.x, (v) => upd({ x: num(v) }), { numeric: true })), field('y', input(d.y, (v) => upd({ y: num(v) }), { numeric: true }))];
     out.append(h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:6px' },
       h('div', { class: 'row' }, h('span', { class: 'lbl' }, { vline: 'Vertical line', hline: 'Horizontal line', region: 'Shaded region', text: 'Text', arrow: 'Arrow' }[d.kind]), h('span', { class: 'sp' }),
         h('input', { type: 'color', value: d.color || '#7a4fd6', oninput: (e) => upd({ color: e.target.value }) }),
@@ -432,9 +432,9 @@ function styleTab(f) {
   const set = (patch, label = 'style') => { commit(label); Object.assign(f.style, patch); emit(); };
   return h('div', { style: 'display:flex;flex-direction:column;gap:10px' },
     field('Preset', seg([['presentation', 'Presentation'], ['paper', 'Paper'], ['dense', 'Dense']], st.preset, (v) => applyPreset(f, v))),
-    h('div', { class: 'g2' }, field('Export width (in)', input(st.width_in, (v) => set({ width_in: num(v) || 8.5 }))), field('Export height (in)', input(st.height_in, (v) => set({ height_in: num(v) || 5.5 }))),
-      field('Font', select(['Arial', 'Helvetica', 'Times New Roman', 'Calibri', 'Segoe UI', 'Courier New'], st.font, (v) => set({ font: v }))), field('Base size (px)', input(st.base, (v) => set({ base: num(v) || 14 })))),
-    field('DPI', input(st.dpi, (v) => set({ dpi: num(v) || 300 }))),
+    h('div', { class: 'g2' }, field('Export width (in)', input(st.width_in, (v) => set({ width_in: num(v) || 8.5 }), { numeric: true })), field('Export height (in)', input(st.height_in, (v) => set({ height_in: num(v) || 5.5 }), { numeric: true })),
+      field('Font', select(['Arial', 'Helvetica', 'Times New Roman', 'Calibri', 'Segoe UI', 'Courier New'], st.font, (v) => set({ font: v }))), field('Base size (px)', input(st.base, (v) => set({ base: num(v) || 14 }), { numeric: true }))),
+    field('DPI', input(st.dpi, (v) => set({ dpi: num(v) || 300 }), { numeric: true })),
     field('Background', seg([['white', 'White'], ['transparent', 'Transparent']], st.bg, (v) => set({ bg: v }))),
     h('div', { class: 'row wrap' }, check('Grid', st.grid, (v) => set({ grid: v })), check('Box frame', st.mirror, (v) => set({ mirror: v })),
       kindOf(f) === '1d' ? check('Residual panel', f.layers.res, (v) => { f.layers.res = v; emit(); }) : null),

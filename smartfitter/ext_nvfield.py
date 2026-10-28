@@ -16,6 +16,7 @@ from . import core
 _TO_GHZ = {"ghz": 1.0, "mhz": 1e-3, "khz": 1e-6, "hz": 1e-9}
 
 
+@core.analysis_result
 def nv_field(ws, freqs_ghz, errs=None, fit_D=False, fit_E=False, mode="auto", D=2.870, E=0.0):
     """Field from explicit resonance frequencies [GHz]; errs = 1-sigma per line [GHz]."""
     res = fit_field(freqs_ghz, errs, mode=mode, D=float(D), E=float(E), fit_D=bool(fit_D), fit_E=bool(fit_E))
@@ -29,6 +30,7 @@ def _centres(fit: dict) -> tuple[list[float], list[float | None]]:
     return [by[n]["value"] for n in names], [by[n].get("error") for n in names]
 
 
+@core.analysis_result
 def nv_field_from_fit(ws, path, detector=None, mode="contrast", proc=None, spec=None):
     """Run the ODMR multi-peak fit, then convert fitted centres (x0, x0_1, ...) to a field."""
     spec = dict(spec or {})
@@ -55,8 +57,14 @@ def nv_field_from_fit(ws, path, detector=None, mode="contrast", proc=None, spec=
         s_ghz = np.asarray(errs, float) * k
     res = fit_field(f_ghz, s_ghz, mode=nv_mode, fit_D=fit_D, fit_E=fit_E).to_dict()
     res["notes"] = list(res["notes"]) + [f"x unit {unit} ({how}); centres converted to GHz."]
-    return core.clean({"field": res, "centres_ghz": f_ghz.tolist(), "centre_errors_ghz": None if s_ghz is None else s_ghz.tolist(),
-                       "fit": {k2: fit[k2] for k2 in ("model", "r2", "status", "reason", "params", "x", "y_fit") if k2 in fit}})
+    return core.clean(
+        {
+            "field": res,
+            "centres_ghz": f_ghz.tolist(),
+            "centre_errors_ghz": None if s_ghz is None else s_ghz.tolist(),
+            "fit": {k2: fit[k2] for k2 in ("model", "r2", "status", "reason", "params", "x", "y_fit") if k2 in fit},
+        }
+    )
 
 
 ENDPOINTS = {"nv_field": nv_field, "nv_field_from_fit": nv_field_from_fit}

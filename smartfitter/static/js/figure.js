@@ -107,9 +107,9 @@ export function renderFigure(root) {
   const set = (patch) => { Object.assign(F, patch); emit(); };
   const right = h('aside', { class: 'inspector' }, h('div', { class: 'insp-body' },
     field('Size', seg([['slide', 'Slide 16:9'], ['two', 'Paper 2-col'], ['one', 'Paper 1-col'], ['custom', 'Custom']], F.size, (v) => set({ size: v, preset: v === 'slide' ? 'presentation' : 'paper', base: v === 'slide' ? 14 : 8 }))),
-    F.size === 'custom' ? h('div', { class: 'g2' }, field('Width (in)', input(F.w, (v) => set({ w: num(v) || 7 }))), field('Height (in)', input(F.h, (v) => set({ h: num(v) || 4 })))) : null,
-    h('div', { class: 'g3' }, field('Columns', select([[0, 'Auto'], [1, '1'], [2, '2'], [3, '3'], [4, '4']], F.cols, (v) => set({ cols: Number(v) }))), field('DPI', input(F.dpi, (v) => set({ dpi: num(v) || 300 }))),
-      field('Base (pt)', input(F.base || FONT_PT[F.preset], (v) => set({ base: num(v) || 9 })))),
+    F.size === 'custom' ? h('div', { class: 'g2' }, field('Width (in)', input(F.w, (v) => set({ w: num(v) || 7 }), { numeric: true })), field('Height (in)', input(F.h, (v) => set({ h: num(v) || 4 }), { numeric: true }))) : null,
+    h('div', { class: 'g3' }, field('Columns', select([[0, 'Auto'], [1, '1'], [2, '2'], [3, '3'], [4, '4']], F.cols, (v) => set({ cols: Number(v) }))), field('DPI', input(F.dpi, (v) => set({ dpi: num(v) || 300 }), { numeric: true })),
+      field('Base (pt)', input(F.base || FONT_PT[F.preset], (v) => set({ base: num(v) || 9 }), { numeric: true }))),
     field('Panel labels', seg([['a', 'a'], ['(a)', '(a)'], ['A', 'A'], ['off', 'Off']], F.labels, (v) => set({ labels: v }))),
     field('Font', select(['Arial', 'Helvetica', 'Times New Roman', 'Calibri'], F.font, (v) => set({ font: v }))),
     h('div', { class: 'card pad note' }, 'Every panel keeps its source file, detector, fit and processing; the exported JSON records them so the figure can be rebuilt.'),
@@ -159,7 +159,7 @@ async function save(data, ext, vectorSvg) {
   const target = p.toLowerCase().endsWith(`.${ext}`) ? p : `${p}.${ext}`;
   if (ext === 'svg') await call('write_text', { path: target, text: data });
   else if (ext === 'png') await call('write_data_url', { path: target, data });
-  else await call('export', { req: { output_dir: dirname(target), stem: stem(target).replace(/_fit$/, ''), pdf_filename: basename(target), images: { pdf_png: data, pdf_svg: vectorSvg }, dpi: S.figure.dpi, json: false } });
+  else (await call('export', { req: { output_dir: dirname(target), stem: stem(target).replace(/_fit$/, ''), pdf_filename: basename(target), images: { pdf_png: data, pdf_svg: vectorSvg }, dpi: S.figure.dpi, json: false } })).warnings?.forEach((w) => toast(w, 'err', 9000));
   // The sidecar is a full analysis session (files, processing, fits, styles, figure panels + snapshots), so opening it
   // (Open session, or opening the .json from the Library) rebuilds the figure exactly; `figure_export` is a readable summary.
   const summary = { size: geometry(), labels: S.figure.labels, panels: S.figure.panels.map((p) => ({ path: p.path, detector: p.det, title: p.title, fit: S.files[p.path]?.fit?.[p.det] ? { model: S.files[p.path].fit[p.det].model, r2: S.files[p.path].fit[p.det].r2 } : null })) };

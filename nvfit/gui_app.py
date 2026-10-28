@@ -1532,7 +1532,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.live_readout_lbl = QLabel("Point readout: click a sample · Ctrl/Shift-click for multiple")
         self.live_readout_lbl.setObjectName("MutedLabel")
         self.live_readout_lbl.setMinimumHeight(24)
-        self.live_readout_lbl.setToolTip("Shows the nearest data coordinates. Ctrl/Shift-click to keep multiple 1D samples highlighted; click again or press Escape to clear.")
+        self.live_readout_lbl.setToolTip(
+            "Shows the nearest data coordinates. Ctrl/Shift-click to keep multiple 1D samples highlighted; click again or press Escape to clear."
+        )
         readout_bar = QFrame()
         readout_bar.setObjectName("ReadoutBar")
         readout_row = QHBoxLayout(readout_bar)
@@ -1578,7 +1580,9 @@ class SmartFitterMainWindow(QMainWindow):
         data_gl.addWidget(self.btn_load, 0, 0, 1, 2)
         self.btn_load.setProperty("drawerHidden", True)
         self.btn_load.setVisible(False)
-        self.load_help_lbl = QLabel("Open one file to inspect and fit it, or drag files into the window to load them quickly.")
+        self.load_help_lbl = QLabel(
+            "Open one file to inspect and fit it, or drag files into the window to load them quickly."
+        )
         self.load_help_lbl.setWordWrap(True)
         self.load_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         self.load_help_lbl.setProperty("drawerHidden", True)
@@ -1586,7 +1590,24 @@ class SmartFitterMainWindow(QMainWindow):
         data_gl.addWidget(self.load_help_lbl, 1, 0, 1, 2)
 
         self.profile_combo = NoScrollComboBox()
-        self.profile_combo.addItems(["Auto", "Ramsey", "Rabi", "SpinEcho", "DynamicDecoupling", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "LineScan", "Scan2D", "TimeTrace"])
+        self.profile_combo.addItems(
+            [
+                "Auto",
+                "Ramsey",
+                "Rabi",
+                "SpinEcho",
+                "DynamicDecoupling",
+                "T1",
+                "ODMR",
+                "DEERFrequency",
+                "DEERDuration",
+                "DEERDecay",
+                "DEERPosition",
+                "LineScan",
+                "Scan2D",
+                "TimeTrace",
+            ]
+        )
         self.profile_combo.setToolTip("Choose the experiment family. Auto follows the detected type from the file.")
         self.profile_combo.currentTextChanged.connect(self.apply_profile_defaults)
         data_gl.addWidget(QLabel("Experiment type"), 2, 0)
@@ -1601,7 +1622,9 @@ class SmartFitterMainWindow(QMainWindow):
 
         self.detector_combo = NoScrollComboBox()
         self.detector_combo.addItem("Detector 1", "detector1")
-        self.detector_combo.setToolTip("Select the independent detector stream used for plotting, processing, and fitting.")
+        self.detector_combo.setToolTip(
+            "Select the independent detector stream used for plotting, processing, and fitting."
+        )
         self.detector_combo.currentIndexChanged.connect(self._on_detector_changed)
         self.edit_detector_labels_btn = QPushButton("Labels…")
         self.edit_detector_labels_btn.setToolTip("Edit session-local detector labels used in plots and exports.")
@@ -1616,7 +1639,9 @@ class SmartFitterMainWindow(QMainWindow):
         data_gl.addWidget(detector_row, 4, 1)
 
         self.compare_detectors_chk = QCheckBox("Compare detectors")
-        self.compare_detectors_chk.setToolTip("Show the inactive detector for visual comparison without including it in the fit.")
+        self.compare_detectors_chk.setToolTip(
+            "Show the inactive detector for visual comparison without including it in the fit."
+        )
         self.compare_detectors_chk.setChecked(False)
         self.compare_detectors_chk.toggled.connect(self._on_compare_detectors_toggled)
         data_gl.addWidget(self.compare_detectors_chk, 5, 0, 1, 2)
@@ -1630,7 +1655,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.overlay_box = overlay_box
         ov_gl = QGridLayout(overlay_box)
         self.overlay_layout = ov_gl
-        overlay_help = QLabel("Select a file and click Plot selected (or double-click it). Check compatible 1D files to draw them together.")
+        overlay_help = QLabel(
+            "Select a file and click Plot selected (or double-click it). Check compatible 1D files to draw them together."
+        )
         self.overlay_help_lbl = overlay_help
         overlay_help.setWordWrap(True)
         overlay_help.setObjectName("MutedLabel")
@@ -1648,7 +1675,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_plot_selected_file.clicked.connect(self.on_plot_selected_file)
         ov_gl.addWidget(self.btn_plot_selected_file, 2, 0, 1, 2)
         self.btn_show_all_overlays = QPushButton("Show all")
-        self.btn_show_all_overlays.setToolTip("Check every loaded non-primary trace and fit the view to the combined data range.")
+        self.btn_show_all_overlays.setToolTip(
+            "Check every loaded non-primary trace and fit the view to the combined data range."
+        )
         self.btn_show_all_overlays.clicked.connect(self.on_show_all_overlays)
         ov_gl.addWidget(self.btn_show_all_overlays, 3, 0)
         self.btn_primary_only = QPushButton("Primary only")
@@ -1661,7 +1690,9 @@ class SmartFitterMainWindow(QMainWindow):
         ov_gl.addWidget(self.btn_clear_overlay, 4, 0, 1, 2)
         self.overlay_list = QListWidget()
         self.overlay_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.overlay_list.setToolTip("Highlight a row and use Plot selected, or double-click it, to make that file primary. Only compatible 1D traces can be checked as overlays.")
+        self.overlay_list.setToolTip(
+            "Highlight a row and use Plot selected, or double-click it, to make that file primary. Only compatible 1D traces can be checked as overlays."
+        )
         self.overlay_list.itemChanged.connect(self._on_overlay_item_changed)
         self.overlay_list.itemDoubleClicked.connect(self.on_overlay_set_primary)
         for key in ("Return", "Enter"):
@@ -1678,7 +1709,21 @@ class SmartFitterMainWindow(QMainWindow):
         ov_gl.addWidget(QLabel("Baseline subtract"), 6, 0)
         ov_gl.addWidget(self.baseline_combo, 6, 1)
         self.compare_metric_combo = NoScrollComboBox()
-        self.compare_metric_combo.addItems(["r2", "T2_star_ns", "T2_dd_ns", "T1_ns", "pi_time_ns", "pi_time_ns_nominal", "first_peak_ns", "delay_ns", "rabi_freq_MHz", "center_freq", "fwhm"])
+        self.compare_metric_combo.addItems(
+            [
+                "r2",
+                "T2_star_ns",
+                "T2_dd_ns",
+                "T1_ns",
+                "pi_time_ns",
+                "pi_time_ns_nominal",
+                "first_peak_ns",
+                "delay_ns",
+                "rabi_freq_MHz",
+                "center_freq",
+                "fwhm",
+            ]
+        )
         self.compare_metric_combo.setToolTip("Metric used in overlay comparison table.")
         ov_gl.addWidget(QLabel("Compare metric"), 7, 0)
         ov_gl.addWidget(self.compare_metric_combo, 7, 1)
@@ -1724,7 +1769,9 @@ class SmartFitterMainWindow(QMainWindow):
         st_layout = QVBoxLayout(strategy_box)
         self.strategy_layout = st_layout
         self.strategy_box = strategy_box
-        strategy_help = QLabel("Start with the detected experiment type and default analysis mode. Use advanced controls only when you need to override model assumptions or manual constraints.")
+        strategy_help = QLabel(
+            "Start with the detected experiment type and default analysis mode. Use advanced controls only when you need to override model assumptions or manual constraints."
+        )
         strategy_help.setWordWrap(True)
         strategy_help.setStyleSheet("QLabel { color: #aab6c8; }")
         strategy_help.setProperty("drawerHidden", True)
@@ -1733,9 +1780,26 @@ class SmartFitterMainWindow(QMainWindow):
 
         # Common settings
         common_form = QFormLayout()
-        
+
         self.model_combo = NoScrollComboBox()
-        self.model_combo.addItems(["RamseyAuto", "RamseySimple", "RamseyHyperfine", "Rabi", "SpinEcho", "T1", "ODMR", "DEERFrequency", "DEERDuration", "DEERDecay", "GaussianPeaks", "LineScan", "TimeTraceDecay", "CustomModel"])
+        self.model_combo.addItems(
+            [
+                "RamseyAuto",
+                "RamseySimple",
+                "RamseyHyperfine",
+                "Rabi",
+                "SpinEcho",
+                "T1",
+                "ODMR",
+                "DEERFrequency",
+                "DEERDuration",
+                "DEERDecay",
+                "GaussianPeaks",
+                "LineScan",
+                "TimeTraceDecay",
+                "CustomModel",
+            ]
+        )
         self.model_combo.setCurrentText("LineScan")
         self.model_combo.setToolTip("Analysis mode used for fitting.")
         self.model_combo.currentTextChanged.connect(self._update_contextual_visibility)
@@ -1746,7 +1810,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.multistart_spin.setValue(20)
         self.multistart_spin.setToolTip("How many seeded fit attempts to try before keeping the best result.")
         common_form.addRow("Multistart", self.multistart_spin)
-        self.multistart_help_lbl = QLabel("Multistart tries the optimizer from several seeded guesses and keeps the strongest solution. Higher values can improve stability but take longer.")
+        self.multistart_help_lbl = QLabel(
+            "Multistart tries the optimizer from several seeded guesses and keeps the strongest solution. Higher values can improve stability but take longer."
+        )
         self.multistart_help_lbl.setWordWrap(True)
         self.multistart_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         self.multistart_help_lbl.setProperty("drawerHidden", True)
@@ -1760,23 +1826,27 @@ class SmartFitterMainWindow(QMainWindow):
         self.gaussian_peak_count_spin = NoScrollSpinBox()
         self.gaussian_peak_count_spin.setRange(1, 8)
         self.gaussian_peak_count_spin.setValue(1)
-        self.gaussian_peak_count_spin.setToolTip("Fit this many positive Gaussian peaks plus a constant background in the selected ROI.")
+        self.gaussian_peak_count_spin.setToolTip(
+            "Fit this many positive Gaussian peaks plus a constant background in the selected ROI."
+        )
         gaussian_layout.addRow("Number of peaks", self.gaussian_peak_count_spin)
         st_layout.addWidget(self.gaussian_container)
 
         # Rabi specific
         self.rabi_container = QGroupBox("Rabi Settings")
         rabi_layout = QFormLayout(self.rabi_container)
-        
+
         self.rabi_mode_combo = NoScrollComboBox()
-        self.rabi_mode_combo.addItems([
-            "Adaptive pulse-area (recommended)",
-            "Phase-ramp (recommended physical fit)",
-            "Long damped Rabi",
-            "Chirped cosine (best overlay)",
-            "Constant-frequency damped cosine",
-            "Auto compare (advanced)",
-        ])
+        self.rabi_mode_combo.addItems(
+            [
+                "Adaptive pulse-area (recommended)",
+                "Phase-ramp (recommended physical fit)",
+                "Long damped Rabi",
+                "Chirped cosine (best overlay)",
+                "Constant-frequency damped cosine",
+                "Auto compare (advanced)",
+            ]
+        )
         self.rabi_mode_combo.setCurrentIndex(0)
         self.rabi_mode_combo.setToolTip("Choose the internal Rabi fit model family.")
         self.rabi_mode_combo.currentTextChanged.connect(self._update_rabi_model_help)
@@ -1785,17 +1855,17 @@ class SmartFitterMainWindow(QMainWindow):
         self.rabi_model_help_lbl.setWordWrap(True)
         self.rabi_model_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         rabi_layout.addRow(self.rabi_model_help_lbl)
-        
+
         self.rabi_pi_lock_chk = QCheckBox("Lock to pi / pi/2")
         self.rabi_pi_lock_chk.setToolTip("When enabled, convert specified pi or pi/2 times to frequency and lock f.")
         rabi_layout.addRow(self.rabi_pi_lock_chk)
-        
+
         self.rabi_pi_ns = NoScrollDoubleSpinBox()
         self.rabi_pi_ns.setDecimals(3)
         self.rabi_pi_ns.setRange(0.001, 1e9)
         self.rabi_pi_ns.setValue(200.0)
         rabi_layout.addRow("pi time (ns)", self.rabi_pi_ns)
-        
+
         self.rabi_pi2_ns = NoScrollDoubleSpinBox()
         self.rabi_pi2_ns.setDecimals(3)
         self.rabi_pi2_ns.setRange(0.001, 1e9)
@@ -1806,21 +1876,27 @@ class SmartFitterMainWindow(QMainWindow):
         self.rabi_dead_time_ns.setDecimals(3)
         self.rabi_dead_time_ns.setRange(-1e6, 1e9)
         self.rabi_dead_time_ns.setValue(0.0)
-        self.rabi_dead_time_ns.setToolTip("Optional manual timing-offset override used when locking pi or pi/2. The adaptive Rabi model fits delay explicitly; other models use saved RF-ramp metadata when available.")
+        self.rabi_dead_time_ns.setToolTip(
+            "Optional manual timing-offset override used when locking pi or pi/2. The adaptive Rabi model fits delay explicitly; other models use saved RF-ramp metadata when available."
+        )
         self.rabi_dead_time_ns.valueChanged.connect(self._on_rabi_dead_time_changed)
         rabi_layout.addRow("Delay override (ns)", self.rabi_dead_time_ns)
         self.rabi_sem_weight_chk = QCheckBox("Use iteration SEM weights")
         self.rabi_sem_weight_chk.setChecked(True)
-        self.rabi_sem_weight_chk.setToolTip("When full per-iteration contrast data are available, weight the fit by the SEM of each programmed pulse point.")
+        self.rabi_sem_weight_chk.setToolTip(
+            "When full per-iteration contrast data are available, weight the fit by the SEM of each programmed pulse point."
+        )
         rabi_layout.addRow(self.rabi_sem_weight_chk)
-        
+
         st_layout.addWidget(self.rabi_container)
 
         self.t1_container = QGroupBox("T1 Settings")
         t1_layout = QFormLayout(self.t1_container)
         self.t1_prep_combo = NoScrollComboBox()
         self.t1_prep_combo.addItems(["Auto", "Direct T1", "Normalize then 1-data"])
-        self.t1_prep_combo.setToolTip("Choose whether T1 should be fit directly or after normalization followed by 1-data.")
+        self.t1_prep_combo.setToolTip(
+            "Choose whether T1 should be fit directly or after normalization followed by 1-data."
+        )
         self.t1_prep_combo.currentTextChanged.connect(self._update_equation_display)
         t1_layout.addRow("T1 preprocessing", self.t1_prep_combo)
         self.t1_model_combo = NoScrollComboBox()
@@ -1834,7 +1910,7 @@ class SmartFitterMainWindow(QMainWindow):
         # ODMR specific
         self.odmr_container = QGroupBox("ODMR Settings")
         odmr_layout = QFormLayout(self.odmr_container)
-        
+
         self.odmr_display_combo = NoScrollComboBox()
         self.odmr_display_combo.addItems(["Peaks (measured view)", "Dips (inverted view)"])
         self.odmr_display_combo.setToolTip("ODMR display only: show measured peaks or invert them to a dip view.")
@@ -1843,63 +1919,67 @@ class SmartFitterMainWindow(QMainWindow):
         self.odmr_polarity_combo = NoScrollComboBox()
         self.odmr_polarity_combo.addItems(["Auto", "Peak", "Dip"])
         self.odmr_polarity_combo.setCurrentText("Peak")
-        self.odmr_polarity_combo.setToolTip("Choose whether ODMR should be fit as positive peaks, negative dips, or selected automatically.")
+        self.odmr_polarity_combo.setToolTip(
+            "Choose whether ODMR should be fit as positive peaks, negative dips, or selected automatically."
+        )
         odmr_layout.addRow("ODMR fit polarity", self.odmr_polarity_combo)
-        
+
         self.odmr_ranges = QLineEdit("")
         self.odmr_ranges.setToolTip("Optional fit-center ranges, comma-separated. Example: 2.18-2.19,2.205-2.21")
         odmr_layout.addRow("ODMR peak fit ranges", self.odmr_ranges)
-        
+
         self.odmr_peak_pick_only = QCheckBox("ODMR multi-peak: peak-pick only")
         self.odmr_peak_pick_only.setChecked(False)
-        self.odmr_peak_pick_only.setToolTip("If multiple ODMR resonances are found, report peak locations instead of single-peak fit.")
+        self.odmr_peak_pick_only.setToolTip(
+            "If multiple ODMR resonances are found, report peak locations instead of single-peak fit."
+        )
         odmr_layout.addRow(self.odmr_peak_pick_only)
-        
+
         self.odmr_multipeak_fit_chk = QCheckBox("ODMR multi-peak fit")
         self.odmr_multipeak_fit_chk.setChecked(False)
         self.odmr_multipeak_fit_chk.setToolTip("Fit multiple Lorentzian peaks to ODMR data.")
         odmr_layout.addRow(self.odmr_multipeak_fit_chk)
-        
+
         self.odmr_peak_count_spin = NoScrollSpinBox()
         self.odmr_peak_count_spin.setRange(1, 8)
         self.odmr_peak_count_spin.setValue(2)
         self.odmr_peak_count_spin.setToolTip("Number of ODMR peaks for multi-peak fit.")
         odmr_layout.addRow("ODMR peak count", self.odmr_peak_count_spin)
-        
+
         self.odmr_auto_peak_count_chk = QCheckBox("Auto peak count from peak-pick")
         self.odmr_auto_peak_count_chk.setChecked(True)
         odmr_layout.addRow(self.odmr_auto_peak_count_chk)
-        
+
         self.odmr_cal_scale = NoScrollDoubleSpinBox()
         self.odmr_cal_scale.setDecimals(6)
         self.odmr_cal_scale.setRange(1e-9, 1e9)
         self.odmr_cal_scale.setValue(1.0)
         self.odmr_cal_scale.setToolTip("Axis scale to physical units (e.g., MHz per axis unit).")
         odmr_layout.addRow("ODMR axis scale", self.odmr_cal_scale)
-        
+
         self.odmr_cal_offset = NoScrollDoubleSpinBox()
         self.odmr_cal_offset.setDecimals(6)
         self.odmr_cal_offset.setRange(-1e9, 1e9)
         self.odmr_cal_offset.setValue(0.0)
         self.odmr_cal_offset.setToolTip("Axis offset in calibrated units.")
         odmr_layout.addRow("ODMR axis offset", self.odmr_cal_offset)
-        
+
         st_layout.addWidget(self.odmr_container)
 
         # Custom Model specific
         self.custom_container = QWidget()
         custom_layout = QHBoxLayout(self.custom_container)
-        custom_layout.setContentsMargins(0,0,0,0)
-        
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+
         btn_custom_model = QPushButton("Load Custom JSON")
         btn_custom_model.setToolTip("Load user-defined model spec (name, expression, params, bounds, seed).")
         btn_custom_model.clicked.connect(self.on_load_custom_model)
         custom_layout.addWidget(btn_custom_model)
-        
+
         btn_seed_custom = QPushButton("Seed from Current")
         btn_seed_custom.clicked.connect(self.on_seed_custom_from_current_model)
         custom_layout.addWidget(btn_seed_custom)
-        
+
         st_layout.addWidget(self.custom_container)
 
         # Equation Preview (Latex)
@@ -1927,15 +2007,19 @@ class SmartFitterMainWindow(QMainWindow):
 
         self.quality_gate_chk = QCheckBox("Use profile quality gate")
         self.quality_gate_chk.setChecked(True)
-        self.quality_gate_chk.setToolTip("Classify PASS/WARN/FAIL using experiment-specific quality thresholds. This does not change the fit itself.")
+        self.quality_gate_chk.setToolTip(
+            "Classify PASS/WARN/FAIL using experiment-specific quality thresholds. This does not change the fit itself."
+        )
         st_layout.addWidget(self.quality_gate_chk)
-        self.quality_gate_help_lbl = QLabel("Fit = run once on the current trace. Robust Fit = compare the current fit against trimmed-data candidates to find a more stable solution when early or late points distort the result.")
+        self.quality_gate_help_lbl = QLabel(
+            "Fit = run once on the current trace. Robust Fit = compare the current fit against trimmed-data candidates to find a more stable solution when early or late points distort the result."
+        )
         self.quality_gate_help_lbl.setWordWrap(True)
         self.quality_gate_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         self.quality_gate_help_lbl.setProperty("drawerHidden", True)
         self.quality_gate_help_lbl.setVisible(False)
         st_layout.addWidget(self.quality_gate_help_lbl)
-        
+
         right_inner_layout.addWidget(strategy_box)
 
         advanced_box = QGroupBox("Advanced")
@@ -1951,7 +2035,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_select_point.setVisible(False)
         mk_gl.addWidget(self.btn_select_point, 0, 0)
         self.btn_exclude_selected = QPushButton("Exclude selected from fit")
-        self.btn_exclude_selected.setToolTip("Reversibly omit the currently pinned 1D sample from fitting. The MAT file is never changed.")
+        self.btn_exclude_selected.setToolTip(
+            "Reversibly omit the currently pinned 1D sample from fitting. The MAT file is never changed."
+        )
         self.btn_exclude_selected.clicked.connect(self.on_exclude_selected_point)
         mk_gl.addWidget(self.btn_exclude_selected, 0, 1)
         self.mask_xmin = QLineEdit("")
@@ -1985,7 +2071,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.point_readout_lbl = QLabel("Point readout: none")
         self.point_readout_lbl.setWordWrap(True)
         self.point_readout_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
-        self.point_readout_lbl.setToolTip("Last selected or hovered sample coordinate. Ctrl/Shift-click 1D samples to keep more than one highlighted.")
+        self.point_readout_lbl.setToolTip(
+            "Last selected or hovered sample coordinate. Ctrl/Shift-click 1D samples to keep more than one highlighted."
+        )
         mk_gl.addWidget(self.point_readout_lbl, 4, 0, 1, 2)
         self.mask_list = QListWidget()
         self.mask_list.setMaximumHeight(96)
@@ -1997,12 +2085,16 @@ class SmartFitterMainWindow(QMainWindow):
         self.analysis_box = analysis_box
         analysis_layout = QGridLayout(analysis_box)
         self.analysis_kind_combo = NoScrollComboBox()
-        self.analysis_kind_combo.addItems(["Baseline", "Detrend", "Normalize", "Derivative", "Integral", "Resample", "Expression"])
+        self.analysis_kind_combo.addItems(
+            ["Baseline", "Detrend", "Normalize", "Derivative", "Integral", "Resample", "Expression"]
+        )
         self.analysis_kind_combo.currentTextChanged.connect(self._sync_analysis_step_fields)
         self.analysis_option_combo = NoScrollComboBox()
         self.analysis_value_edit = QLineEdit()
         self.analysis_value_edit.setPlaceholderText("Optional value")
-        self.analysis_value_edit.setToolTip("Resample uses a point count; Expression uses x, y, abs, sin, cos, exp, log, sqrt, or clip.")
+        self.analysis_value_edit.setToolTip(
+            "Resample uses a point count; Expression uses x, y, abs, sin, cos, exp, log, sqrt, or clip."
+        )
         add_step = QPushButton("Add transform")
         add_step.clicked.connect(self.on_add_analysis_step)
         remove_step = QPushButton("Remove selected")
@@ -2011,7 +2103,9 @@ class SmartFitterMainWindow(QMainWindow):
         clear_steps.clicked.connect(self.on_clear_analysis_steps)
         self.analysis_list = QListWidget()
         self.analysis_list.setMaximumHeight(100)
-        self.analysis_list.setToolTip("Ordered display and measurement transforms. Fitting remains on the untransformed processed trace.")
+        self.analysis_list.setToolTip(
+            "Ordered display and measurement transforms. Fitting remains on the untransformed processed trace."
+        )
         analysis_layout.addWidget(QLabel("Transform"), 0, 0)
         analysis_layout.addWidget(self.analysis_kind_combo, 0, 1)
         analysis_layout.addWidget(QLabel("Option"), 1, 0)
@@ -2116,7 +2210,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.show_reference_layer_chk.toggled.connect(self._refresh_plot_only)
         self.show_difference_layer_chk = QCheckBox("Difference layer")
         self.show_difference_layer_chk.setChecked(False)
-        self.show_difference_layer_chk.setToolTip("Overlay reference-signal without changing the active fit observable.")
+        self.show_difference_layer_chk.setToolTip(
+            "Overlay reference-signal without changing the active fit observable."
+        )
         self.show_difference_layer_chk.toggled.connect(self._refresh_plot_only)
         self.show_iteration_layer_chk = QCheckBox("Iteration")
         self.show_iteration_layer_chk.setChecked(False)
@@ -2224,7 +2320,9 @@ class SmartFitterMainWindow(QMainWindow):
         annotation_box = QGroupBox("Annotations")
         self.annotation_box = annotation_box
         ann_gl = QGridLayout(annotation_box)
-        ann_help = QLabel("Control the on-plot info box separately from the legend. Compact mode is intended for routine fitting; detailed mode is for screenshots and presentation exports.")
+        ann_help = QLabel(
+            "Control the on-plot info box separately from the legend. Compact mode is intended for routine fitting; detailed mode is for screenshots and presentation exports."
+        )
         ann_help.setWordWrap(True)
         ann_help.setStyleSheet("QLabel { color: #aab6c8; }")
         ann_help.setProperty("drawerHidden", True)
@@ -2233,7 +2331,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.annotation_mode_combo = NoScrollComboBox()
         self.annotation_mode_combo.addItems(["Off", "Compact", "Detailed"])
         self.annotation_mode_combo.setCurrentText("Off")
-        self.annotation_mode_combo.setToolTip("Show no annotation before fitting, or choose the fit-summary detail level.")
+        self.annotation_mode_combo.setToolTip(
+            "Show no annotation before fitting, or choose the fit-summary detail level."
+        )
         self.annotation_mode_combo.currentTextChanged.connect(self._on_annotation_mode_changed)
         ann_gl.addWidget(QLabel("Annotation mode"), 1, 0)
         ann_gl.addWidget(self.annotation_mode_combo, 1, 1)
@@ -2275,7 +2375,9 @@ class SmartFitterMainWindow(QMainWindow):
 
         self.scan_tools_box = QGroupBox("Scan")
         scan_gl = QGridLayout(self.scan_tools_box)
-        self.scan_help_lbl = QLabel("Cursor shows the current inspected scan location. Linecut view extracts a 1D profile through a 2D map; choose None to view only the map. It is hidden for 1D scans because the loaded trace is already the linecut.")
+        self.scan_help_lbl = QLabel(
+            "Cursor shows the current inspected scan location. Linecut view extracts a 1D profile through a 2D map; choose None to view only the map. It is hidden for 1D scans because the loaded trace is already the linecut."
+        )
         self.scan_help_lbl.setWordWrap(True)
         self.scan_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         self.scan_help_lbl.setProperty("drawerHidden", True)
@@ -2286,7 +2388,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.scan_cursor_lbl.setStyleSheet("QLabel { color: #8fd3ff; }")
         scan_gl.addWidget(self.scan_cursor_lbl, 1, 0, 1, 2)
         self.scan_linecut_combo = NoScrollComboBox()
-        self.scan_linecut_combo.addItems(["None", "Cursor horizontal", "Cursor vertical", "Best-point horizontal", "Best-point vertical"])
+        self.scan_linecut_combo.addItems(
+            ["None", "Cursor horizontal", "Cursor vertical", "Best-point horizontal", "Best-point vertical"]
+        )
         self.scan_linecut_combo.currentTextChanged.connect(self._on_scan_linecut_changed)
         self.scan_linecut_lbl = QLabel("Linecut view")
         scan_gl.addWidget(self.scan_linecut_lbl, 2, 0)
@@ -2358,7 +2462,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_button_icon(self.btn_fit, "fa5s.play")
         self.btn_fit.clicked.connect(self.on_fit)
         ex_gl.addWidget(self.btn_fit, 0, 0)
-        
+
         self.btn_robust_fit = QPushButton("Robust Fit")
         self._set_button_icon(self.btn_robust_fit, "fa5s.shield-alt")
         self.btn_robust_fit.setToolTip("Run multiple fits with varying data ranges to find the most stable result.")
@@ -2367,10 +2471,14 @@ class SmartFitterMainWindow(QMainWindow):
         self.btn_cancel_fit = QPushButton("Cancel")
         self.btn_cancel_fit.setVisible(False)
         self.btn_cancel_fit.setProperty("drawerHidden", True)
-        self.btn_cancel_fit.setToolTip("Cancel the current request. A solver already in progress may finish in the background, but its result will be discarded.")
+        self.btn_cancel_fit.setToolTip(
+            "Cancel the current request. A solver already in progress may finish in the background, but its result will be discarded."
+        )
         self.btn_cancel_fit.clicked.connect(self.cancel_current_fit)
         ex_gl.addWidget(self.btn_cancel_fit, 0, 2)
-        self.fit_help_lbl = QLabel("Fit runs the current model once on the current trace. Robust Fit compares that result to trimmed-data candidates and keeps the most stable overall solution.")
+        self.fit_help_lbl = QLabel(
+            "Fit runs the current model once on the current trace. Robust Fit compares that result to trimmed-data candidates and keeps the most stable overall solution."
+        )
         self.fit_help_lbl.setWordWrap(True)
         self.fit_help_lbl.setStyleSheet("QLabel { color: #aab6c8; }")
         self.fit_help_lbl.setProperty("drawerHidden", True)
@@ -2408,7 +2516,14 @@ class SmartFitterMainWindow(QMainWindow):
         self.report_content_lbl.setVisible(False)
         ex_gl.addWidget(self.report_content_lbl, 7, 0, 1, 2)
         self.report_metric_checks: dict[str, QCheckBox] = {}
-        self.fit_export_widgets = [self.btn_fit, self.btn_robust_fit, self.fit_help_lbl, self.exp_report_png_chk, self.exp_report_pdf_chk, self.report_content_lbl]
+        self.fit_export_widgets = [
+            self.btn_fit,
+            self.btn_robust_fit,
+            self.fit_help_lbl,
+            self.exp_report_png_chk,
+            self.exp_report_pdf_chk,
+            self.report_content_lbl,
+        ]
         report_metric_defs = [
             ("r2", "R²"),
             ("rmse", "RMSE"),
@@ -2440,7 +2555,23 @@ class SmartFitterMainWindow(QMainWindow):
         cc = 0
         for key, label in report_metric_defs:
             chk = QCheckBox(label)
-            chk.setChecked(key in {"r2", "rmse", "T2_star_ns", "T1_ns", "T2rho_ns", "pi_time_ns", "programmed_pi_time_ns", "delay_ns", "rabi_freq_MHz", "D", "E", "fwhm"})
+            chk.setChecked(
+                key
+                in {
+                    "r2",
+                    "rmse",
+                    "T2_star_ns",
+                    "T1_ns",
+                    "T2rho_ns",
+                    "pi_time_ns",
+                    "programmed_pi_time_ns",
+                    "delay_ns",
+                    "rabi_freq_MHz",
+                    "D",
+                    "E",
+                    "fwhm",
+                }
+            )
             self.report_metric_checks[key] = chk
             chk.setProperty("drawerHidden", True)
             chk.setVisible(False)
@@ -2459,7 +2590,9 @@ class SmartFitterMainWindow(QMainWindow):
         self.metadata_progress_bar = QProgressBar()
         self.metadata_progress_bar.setRange(0, 100)
         self.metadata_progress_bar.setValue(0)
-        self.metadata_progress_bar.setToolTip("Completed iterations divided by target iterations when scan metadata provides it.")
+        self.metadata_progress_bar.setToolTip(
+            "Completed iterations divided by target iterations when scan metadata provides it."
+        )
         right_inner_layout.addWidget(self.metadata_progress_bar)
 
         results_box = QGroupBox("Results summary")
@@ -6343,11 +6476,11 @@ class SmartFitterMainWindow(QMainWindow):
         else:
             latex_eq = self.equation_map.get(m, "Model equation unavailable.")
             code_eq = self.equation_expr_template.get(m, "")
-        
+
         # 1. Update Preview (Latex)
         if m == "CustomModel" and self.ctx.custom_model_spec:
             latex_eq = f"Custom: {self.ctx.custom_model_spec.get('name', 'User Model')}"
-        
+
         self.eq_preview_ax.clear()
         self.eq_preview_ax.axis("off")
         disp = latex_eq if ("$" in latex_eq or "Custom" in latex_eq) else f"${latex_eq}$"
@@ -6362,7 +6495,7 @@ class SmartFitterMainWindow(QMainWindow):
         self.equation_display.blockSignals(True)
         if m == "CustomModel" and self.ctx.custom_model_spec:
             code_eq = str(self.ctx.custom_model_spec.get("expression", ""))
-        
+
         if self.equation_display.toPlainText() != code_eq:
             self.equation_display.setPlainText(code_eq)
         self.equation_display.blockSignals(False)
@@ -6370,7 +6503,7 @@ class SmartFitterMainWindow(QMainWindow):
     def _on_equation_edited(self):
         m = self.model_combo.currentText()
         new_expr = self.equation_display.toPlainText()
-        
+
         if m != "CustomModel":
             self.on_seed_custom_from_current_model(initial_expr=new_expr)
         else:
@@ -6385,7 +6518,7 @@ class SmartFitterMainWindow(QMainWindow):
                 expr = self.equation_display.toPlainText().strip()
             else:
                 expr = self.equation_expr_template.get(m, "")
-        
+
         if not expr:
             expr = "y0 + A*np.cos(2*np.pi*f*t)"
 
@@ -6399,7 +6532,7 @@ class SmartFitterMainWindow(QMainWindow):
             "seed": [0.0, 0.02, 0.003, 0.0],
         }
         self.ctx.custom_model_spec = default
-        
+
         self.model_combo.blockSignals(True)
         self.model_combo.setCurrentText("CustomModel")
         self.model_combo.blockSignals(False)
@@ -11230,7 +11363,9 @@ class SmartFitterMainWindow(QMainWindow):
             self.ctx.fit_result = None
             self.ctx.odmr_peaks = None
             self._set_status("N/A", "scan data plotted only; fitting disabled")
-            self.summary_text.setPlainText("\n".join(self._trace_summary_lines(self.ctx.trace) + ["No fit performed for spatial scan data."]))
+            self.summary_text.setPlainText(
+                "\n".join(self._trace_summary_lines(self.ctx.trace) + ["No fit performed for spatial scan data."])
+            )
             return
         if not _detector_chain and self._detector_scope_is_both() and self._primary_dataset is not None:
             active = self._active_detector_id()
@@ -11281,8 +11416,18 @@ class SmartFitterMainWindow(QMainWindow):
                 if len(peaks):
                     y_disp, _ = self._display_y(y_target)
                     if self.plot_opts.show_peaks:
-                        peaks_line = self.ax_main.plot(x[peaks], y_disp[peaks], "rx", ms=8, mew=2, label="Detected peaks")[0]
-                        self._register_series("odmr:peaks", "Detected peaks", [peaks_line], handle=peaks_line, axis=self.ax_main, x_values=[x[peaks]], y_values=[y_disp[peaks]])
+                        peaks_line = self.ax_main.plot(
+                            x[peaks], y_disp[peaks], "rx", ms=8, mew=2, label="Detected peaks"
+                        )[0]
+                        self._register_series(
+                            "odmr:peaks",
+                            "Detected peaks",
+                            [peaks_line],
+                            handle=peaks_line,
+                            axis=self.ax_main,
+                            x_values=[x[peaks]],
+                            y_values=[y_disp[peaks]],
+                        )
                     self._apply_combined_legend()
                     self.canvas.draw_idle()
                 self._set_status("PASS", f"ODMR peak-pick mode, {len(peak_x)} peaks")
@@ -11301,9 +11446,10 @@ class SmartFitterMainWindow(QMainWindow):
         self._set_status("Fitting", f"{'Robust ' if robust else ''}please wait...")
 
         # Capture every fit input before entering the worker thread.
-        is_ramsey_auto = (model_name == "RamseyAuto")
-        
+        is_ramsey_auto = model_name == "RamseyAuto"
+
         fit_config = {
+            "parameter_model": self.ctx.fit_result.model_name if self.ctx.fit_result is not None else None,
             "gaussian_peak_count": self.gaussian_peak_count_spin.value(),
             "multistart": int(self.multistart_spin.value()),
             "rabi_use_sem": self.rabi_sem_weight_chk.isChecked(),
@@ -11322,7 +11468,11 @@ class SmartFitterMainWindow(QMainWindow):
             "t1_prep_mode": self.t1_prep_combo.currentText(),
             "t1_model_family": self.t1_model_combo.currentText(),
             "custom_spec": self.ctx.custom_model_spec,
-            "custom_expr": self.custom_expr_edit.text().strip() if hasattr(self, "custom_expr_edit") else self.equation_display.toPlainText().strip(),
+            "custom_expr": (
+                self.custom_expr_edit.text().strip()
+                if hasattr(self, "custom_expr_edit")
+                else self.equation_display.toPlainText().strip()
+            ),
             "trace_experiment_type": self.ctx.trace.experiment_type if self.ctx.trace is not None else model_name,
             "trace": self.ctx.trace,
         }
@@ -11585,7 +11735,9 @@ class SmartFitterMainWindow(QMainWindow):
                 self._set_status("WARN", "Fit result discarded because the analysis changed")
                 if self.ctx.trace is not None:
                     self._store_active_detector_state()
-                    self._dual_fit_summaries[self.ctx.trace.detector_id] = "Fit result discarded because the analysis changed."
+                    self._dual_fit_summaries[self.ctx.trace.detector_id] = (
+                        "Fit result discarded because the analysis changed."
+                    )
                 self._continue_dual_fit()
                 return
             result_obj = outcome.result
@@ -11593,7 +11745,7 @@ class SmartFitterMainWindow(QMainWindow):
         self._active_fit_request = None
         self._set_ui_busy(False)
         # result_obj is either FitResult or RamseySelectionResult
-        
+
         result: FitResult | None = None
         summary_header = "Single-model fit"
         summary_extra = ""
@@ -11604,16 +11756,25 @@ class SmartFitterMainWindow(QMainWindow):
             result = result_obj.best
             summary_header = f"Selected by: {result_obj.selected_by}"
             summary_extra = "\n".join(
-                [f"- {c.model_name}: R²={c.r2:.4f}, BIC={c.bic:.2f}, bound_hits={sum(c.bound_hits)}" for c in result_obj.candidates]
+                [
+                    f"- {c.model_name}: R²={c.r2:.4f}, BIC={c.bic:.2f}, bound_hits={sum(c.bound_hits)}"
+                    for c in result_obj.candidates
+                ]
             )
         else:
             result = result_obj
-            if result is not None and result.extras.get('ramsey_candidates'):
+            if result is not None and result.extras.get("ramsey_candidates"):
                 summary_header = f"Selected by: {result.extras.get('ramsey_selected_by', 'prepared request')}"
-                summary_extra = "\n".join(f"- {c['model']}: R²={c['r2']:.4f}, BIC={c['bic']:.2f}, bound_hits={c['bound_hits']}" for c in result.extras['ramsey_candidates'])
-            if result is not None and result.extras.get('robust_subset'):
-                summary_header = 'Robust fit (best subset selected)'
-                robust_summary = "\n".join(f"- {c['subset']}: weighted MSE={c['weighted_mse']:.6g}" for c in result.extras.get('robust_candidates',[]))
+                summary_extra = "\n".join(
+                    f"- {c['model']}: R²={c['r2']:.4f}, BIC={c['bic']:.2f}, bound_hits={c['bound_hits']}"
+                    for c in result.extras["ramsey_candidates"]
+                )
+            if result is not None and result.extras.get("robust_subset"):
+                summary_header = "Robust fit (best subset selected)"
+                robust_summary = "\n".join(
+                    f"- {c['subset']}: weighted MSE={c['weighted_mse']:.6g}"
+                    for c in result.extras.get("robust_candidates", [])
+                )
             # Check for robust fit comparison in result.message
             if result is not None and result.message and "Robust fit candidate" in result.message:
                 msg_lines = result.message.split("\n")
@@ -11621,18 +11782,18 @@ class SmartFitterMainWindow(QMainWindow):
                 if robust_idx is not None:
                     robust_summary = "\n".join(msg_lines[robust_idx:])
                     summary_header = "Robust fit (best subset selected)"
-        
+
         # Check if fallback happened in worker or if we need to do it here?
-        # The worker should handle exceptions or return the result. 
+        # The worker should handle exceptions or return the result.
         # If worker threw exception, on_fit_error is called.
-        
+
         if result is None:
-             self._set_status("FAIL", "No result")
-             if self.ctx.trace is not None:
-                 self._store_active_detector_state()
-                 self._dual_fit_summaries[self.ctx.trace.detector_id] = "No fit result was produced."
-             self._continue_dual_fit()
-             return
+            self._set_status("FAIL", "No result")
+            if self.ctx.trace is not None:
+                self._store_active_detector_state()
+                self._dual_fit_summaries[self.ctx.trace.detector_id] = "No fit result was produced."
+            self._continue_dual_fit()
+            return
 
         self.ctx.fit_result = result
         if isinstance(result.extras, dict) and result.extras.get("detected_peaks"):
@@ -11692,7 +11853,9 @@ class SmartFitterMainWindow(QMainWindow):
         for peak, width in result.extras.get("peak_fwhm", {}).items():
             lines.append(f"{peak} FWHM: {width:.6g} axis units")
         if self.ctx.trace is not None:
-            snapshot_lines = self._snapshot_summary_lines(self.ctx.trace.metadata if self.ctx.trace.metadata is not None else {})
+            snapshot_lines = self._snapshot_summary_lines(
+                self.ctx.trace.metadata if self.ctx.trace.metadata is not None else {}
+            )
             if snapshot_lines:
                 lines += [""] + snapshot_lines
         for n, v, e in zip(result.param_names, result.params, result.errors):
@@ -12439,4 +12602,3 @@ if __name__ == "__main__":
         sys.stderr.write("SmartFitter v2 is now the default app; the legacy Qt app is deprecated (use --legacy to start it).\n")
         from smartfitter.__main__ import main as _smartfitter_v2_main
         _smartfitter_v2_main()
-

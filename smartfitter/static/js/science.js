@@ -7,29 +7,59 @@ import { h, input, check, field, select, seg, fmt, fmtPm, num } from './util.js'
 
 const sci = (f) => (f._sci = f._sci || {});
 export function historicalToolNote(f) {
-  const records=[...Object.values(f.boot || {}).map(b=>b.res),...Object.values(f.peakPick || {}),f.deerRatio?.res,f._sci?.nv?.res,f._sci?.tt?.steps,f._sci?.tt?.ratio,f._sci?.tt?.drift].filter(Boolean);
-  const stale=records.filter(r=>!resultFreshness(f,r,r.analysis?.descriptor.detector || f.detector).fresh);
-  return stale.length ? warn(`${stale.length} scientific result(s) are historical or unverified. Rerun their tools for this analysis.`) : null;
+  const records = [
+    ...Object.values(f.boot || {}).map((b) => b.res),
+    ...Object.values(f.peakPick || {}),
+    f.deerRatio?.res,
+    f._sci?.nv?.res,
+    f._sci?.tt?.steps,
+    f._sci?.tt?.ratio,
+    f._sci?.tt?.drift,
+  ].filter(Boolean);
+  const stale = records.filter((r) => !resultFreshness(f, r, r.analysis?.descriptor.detector || f.detector).fresh);
+  return stale.length
+    ? warn(`${stale.length} scientific result(s) are historical or unverified. Rerun their tools for this analysis.`)
+    : null;
 }
 const spin = () => h('span', { class: 'spinner' });
 const card = (...kids) => h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' }, ...kids);
-const title = (t, right) => h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, t), h('span', { class: 'sp' }), right || null);
+const title = (t, right) =>
+  h('div', { class: 'row' }, h('span', { style: 'font-weight:600' }, t), h('span', { class: 'sp' }), right || null);
 const note = (t, style = '') => h('div', { class: 'note', style }, t);
 const warn = (t) => note(t, 'color:var(--warn)');
-const th = (...c) => h('tr', {}, c.map((x) => h('th', {}, x)));
-const td = (...c) => h('tr', {}, c.map((x, i) => h('td', i === 0 ? { class: 'txt' } : {}, x)));
+const th = (...c) =>
+  h(
+    'tr',
+    {},
+    c.map((x) => h('th', {}, x))
+  );
+const td = (...c) =>
+  h(
+    'tr',
+    {},
+    c.map((x, i) => h('td', i === 0 ? { class: 'txt' } : {}, x))
+  );
 
 // Small Plotly plot inside an inspector card (drawn after the card is attached).
 function miniPlot(height, data, layout) {
   const div = h('div', { style: `height:${height}px;background:#fff;border-radius:4px` });
   setTimeout(() => {
     if (!div.isConnected || typeof Plotly === 'undefined') return;
-    Plotly.newPlot(div, data, {
-      margin: { l: 56, r: 10, t: 8, b: 44 }, font: { family: 'Arial', size: 11, color: '#1D2330' }, paper_bgcolor: '#fff', plot_bgcolor: '#fff',
-      showlegend: false, ...layout,
-      xaxis: { showline: true, mirror: true, ticks: 'outside', automargin: true, ...(layout.xaxis || {}) },
-      yaxis: { showline: true, mirror: true, ticks: 'outside', automargin: true, exponentformat: 'SI', ...(layout.yaxis || {}) },
-    }, { displayModeBar: false, responsive: true });
+    Plotly.newPlot(
+      div,
+      data,
+      {
+        margin: { l: 56, r: 10, t: 8, b: 44 },
+        font: { family: 'Arial', size: 11, color: '#1D2330' },
+        paper_bgcolor: '#fff',
+        plot_bgcolor: '#fff',
+        showlegend: false,
+        ...layout,
+        xaxis: { showline: true, mirror: true, ticks: 'outside', automargin: true, ...(layout.xaxis || {}) },
+        yaxis: { showline: true, mirror: true, ticks: 'outside', automargin: true, exponentformat: 'SI', ...(layout.yaxis || {}) },
+      },
+      { displayModeBar: false, responsive: true }
+    );
   }, 40);
   return div;
 }
@@ -38,18 +68,36 @@ function miniPlot(height, data, layout) {
 async function run(f, key, fn) {
   const s = sci(f);
   if (s[key + 'Busy']) return;
-  s[key + 'Busy'] = true; emit('insp');
-  const inputs=key==='nv' ? {fit_D:s.nv?.fitD,fit_E:s.nv?.fitE,text:s.nv?.text} : key==='deerRes' ? {B:s.deer?.B,fGHz:s.deer?.fGHz} : key==='boot' ? {n_boot:s.nBoot ?? 200,parentSignature:f.fit[f.detector]?.analysis?.signature} : {};
-  const analysis=envelopeFor(f,f.detector,{tool:key,inputs},key);
+  s[key + 'Busy'] = true;
+  emit('insp');
+  const inputs =
+    key === 'nv'
+      ? { fit_D: s.nv?.fitD, fit_E: s.nv?.fitE, text: s.nv?.text }
+      : key === 'deerRes'
+        ? { B: s.deer?.B, fGHz: s.deer?.fGHz }
+        : key === 'boot'
+          ? { n_boot: s.nBoot ?? 200, parentSignature: f.fit[f.detector]?.analysis?.signature }
+          : {};
+  const analysis = envelopeFor(f, f.detector, { tool: key, inputs }, key);
   try {
     await fn();
-    const bind=(r)=>{if(r&&typeof r==='object'){r.analysis ||= analysis;recordResult(f,r,{kind:key});}};
-    if(key==='boot')bind(f.boot?.[analysis.descriptor.detector]?.res);
-    else if(key==='deer')bind(f.deerRatio?.res);
-    else if(key==='nv')bind(s.nv?.res);
-    else if(key==='deerRes')bind(s.deer?.res);
-    else if(s.tt)bind(s.tt[key]);
-  } catch (e) { s[key + 'Err'] = e.message; } finally { s[key + 'Busy'] = false; emit('insp'); }
+    const bind = (r) => {
+      if (r && typeof r === 'object') {
+        r.analysis ||= analysis;
+        recordResult(f, r, { kind: key });
+      }
+    };
+    if (key === 'boot') bind(f.boot?.[analysis.descriptor.detector]?.res);
+    else if (key === 'deer') bind(f.deerRatio?.res);
+    else if (key === 'nv') bind(s.nv?.res);
+    else if (key === 'deerRes') bind(s.deer?.res);
+    else if (s.tt) bind(s.tt[key]);
+  } catch (e) {
+    s[key + 'Err'] = e.message;
+  } finally {
+    s[key + 'Busy'] = false;
+    emit('insp');
+  }
 }
 
 // ------------------------------------------------------------------ 1. SEM weighting + reduced chi-squared
@@ -87,7 +135,7 @@ export function bootstrapCard(f, fit, getSpec) {
     f.boot[det] = { res, parentSignature:fit.analysis?.signature, n_boot: res.n_boot };
   });
   const out = card(title('Bootstrap errors', null),
-    h('div', { class: 'row' }, field('Resamples', input(n, (v) => { s.nBoot = Math.max(10, Math.round(num(v) || 200)); emit('insp'); }, { style: 'width:70px' })),
+    h('div', { class: 'row' }, field('Resamples', input(n, (v) => { s.nBoot = Math.max(10, Math.round(num(v) || 200)); emit('insp'); }, { numeric: true, style: 'width:70px' })),
       h('button', { class: 'btn', style: 'flex:1;justify-content:center;margin-top:16px', disabled: busy || f.fitting, onclick: go }, busy ? spin() : null, busy ? 'Running…' : 'Bootstrap errors')),
     note('Refits resampled data (multistart ≤ 4 for speed). Can take a minute or more at 200 resamples; try 30 first.'));
   if (s.bootErr) out.append(note(s.bootErr, 'color:var(--bad)'));
@@ -256,9 +304,9 @@ export function ttSciCard(f) {
   });
   const nMarked = (f.style.shapes || []).filter((d) => d.stepT !== undefined).length;
   const steps = h('div', { class: 'f' }, h('span', { class: 'lbl' }, `Step detection · ${detLabel(f, f.detector)}`),
-    h('div', { class: 'g2' }, field('Min size (σ of noise)', input(t.sigma, (v) => { t.sigma = Math.max(1, num(v) || 4); emit('insp'); })),
-      field('Min segment (points)', input(t.minSeg, (v) => { t.minSeg = Math.max(2, num(v) || 5); emit('insp'); }))),
-    field('Min step size (% of level)', input(t.minPct, (v) => { t.minPct = Math.max(0, num(v) ?? 2); if (t.steps) markSteps(f, filteredSteps(t)); emit('insp'); }, { title: 'Client-side filter: hides steps smaller than this fraction of the level before the step.' })),
+    h('div', { class: 'g2' }, field('Min size (σ of noise)', input(t.sigma, (v) => { t.sigma = Math.max(1, num(v) || 4); emit('insp'); }, { numeric: true })),
+      field('Min segment (points)', input(t.minSeg, (v) => { t.minSeg = Math.max(2, num(v) || 5); emit('insp'); }, { numeric: true }))),
+    field('Min step size (% of level)', input(t.minPct, (v) => { t.minPct = Math.max(0, num(v) ?? 2); if (t.steps) markSteps(f, filteredSteps(t)); emit('insp'); }, { numeric: true, title: 'Client-side filter: hides steps smaller than this fraction of the level before the step.' })),
     h('div', { class: 'row' }, h('button', { class: 'btn', style: 'flex:1;justify-content:center', disabled: stepsBusy, onclick: detect }, stepsBusy ? spin() : null, 'Detect steps'),
       h('button', { class: 'btn', disabled: !nMarked, onclick: () => { f.style.shapes = (f.style.shapes || []).filter((d) => d.stepT === undefined); emit(); } }, 'Clear step marks')),
     s.stepsErr ? note(s.stepsErr, 'color:var(--bad)') : null);

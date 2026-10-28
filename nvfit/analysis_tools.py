@@ -34,6 +34,9 @@ class ProcessedSeries:
     excluded_raw_indices: set[int]
     exclusion_ranges: list[tuple[float, float]]
     provenance: list[dict[str, Any]] = field(default_factory=list)
+    # True where a displayed sample was interpolated (not a measured bin); its source group is then the
+    # measured bins it was computed from.
+    derived: list[bool] = field(default_factory=list)
 
 
 _ALLOWED_EXPR_FUNCTIONS = {
@@ -180,7 +183,36 @@ def process_series(
         fit_x, fit_y = fit_x[keep], fit_y[keep]
         groups = [g for g, ok in zip(groups, keep) if ok]
     analysis_x, analysis_y, provenance = apply_steps(fit_x, fit_y, list(steps or []))
-    if len(analysis_x) != len(groups):
-        # Resampling maps each displayed sample to its nearest fit-safe bin.
-        groups = [groups[int(np.argmin(np.abs(fit_x - value)))] for value in analysis_x] if len(fit_x) else []
-    return ProcessedSeries(fit_x, fit_y, analysis_x, analysis_y, groups, excluded, ranges, provenance)
+    groups, derived = _derived_groups(fit_x, groups, analysis_x)
+    return ProcessedSeries(fit_x, fit_y, analysis_x, analysis_y, groups, excluded, ranges, provenance, derived)
+
+
+def _derived_groups(fit_x: np.ndarray, groups: list[np.ndarray], analysis_x: np.ndarray) -> tuple[list[np.ndarray], list[bool]]:
+    """Source groups for displayed samples, including ones a resampling step moved off the measured bins.
+
+    A sample on a measured bin keeps that bin's raw indices.  An interpolated sample owns the raw indices of
+    the two bins bracketing it (its interpolation support), so excluding it removes exactly the measurements
+    it was computed from.  This is checked by x value, not only by length: resampling to the same count moves
+    the interior samples too.
+    """
+    analysis_x = np.asarray(analysis_x, dtype=float)
+    if len(analysis_x) == len(fit_x) and np.array_equal(analysis_x, fit_x):
+        return groups, [False] * len(groups)
+    if not len(fit_x):
+        return [], []
+    order = np.argsort(fit_x)
+    sx = fit_x[order]
+    spacing = np.diff(sx)
+    tol = 1e-9 * (float(np.median(spacing)) if len(spacing) and np.median(spacing) > 0 else 1.0)
+    out, derived = [], []
+    for value in analysis_x:
+        k = int(np.searchsorted(sx, value))  # first measured bin at or above value
+        exact = [i for i in (k, k - 1) if 0 <= i < len(sx) and abs(sx[i] - value) <= tol]
+        if exact:
+            out.append(groups[order[exact[0]]])
+            derived.append(False)
+            continue
+        lo, hi = max(k - 1, 0), min(k, len(sx) - 1)
+        out.append(np.unique(np.concatenate([groups[order[lo]], groups[order[hi]]])))
+        derived.append(True)
+    return out, derived

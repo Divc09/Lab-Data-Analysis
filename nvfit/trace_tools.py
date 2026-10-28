@@ -197,12 +197,19 @@ def ratio(t1, y1, t2, y2, sem1=None, sem2=None, tol: float | None = None) -> dic
         tol = 0.5 * float(np.median(np.diff(t1)))
     i1, i2, n_exact = _match_times(t1, t2, tol)
     src = []
+
+    def estimated(y, name):
+        # rolling_sigma needs 4 points; below that the per-point error is reported as unknown, not guessed.
+        if y.size >= 4:
+            src.append(f"{name}: rolling-MAD estimate")
+            return rolling_sigma(y)
+        src.append(f"{name}: not estimated (fewer than 4 points)")
+        return np.full(y.shape, np.nan)
+
     if s1 is None:
-        s1 = rolling_sigma(y1)
-        src.append("detector 1: rolling-MAD estimate")
+        s1 = estimated(y1, "detector 1")
     if s2 is None:
-        s2 = rolling_sigma(y2)
-        src.append("detector 2: rolling-MAD estimate")
+        s2 = estimated(y2, "detector 2")
     a, b, sa, sb, tt = y1[i1], y2[i2], s1[i1], s2[i2], t1[i1]
     good = a != 0
     a, b, sa, sb, tt = a[good], b[good], sa[good], sb[good], tt[good]

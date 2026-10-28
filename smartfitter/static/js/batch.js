@@ -26,10 +26,23 @@ async function poll() {
   if (!B.job) return;
   try {
     B.status = await call('batch_status', { job: B.job }, { quiet: true });
-    B.rows=B.status.rows || [];B.manifestPath=B.status.manifest_path || B.manifestPath;
-    if (B.status.state !== 'running') { clearInterval(timer); timer = null; B.rows = B.status.rows; B.manifestPath=B.status.manifest_path; toast(`Batch ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.`, B.status.state === 'finished' ? 'ok' : ''); }
+    B.rows = B.status.rows || [];
+    B.manifestPath = B.status.manifest_path || B.manifestPath;
+    if (B.status.state !== 'running') {
+      clearInterval(timer);
+      timer = null;
+      B.rows = B.status.rows;
+      B.manifestPath = B.status.manifest_path;
+      toast(
+        `Batch ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.`,
+        B.status.state === 'finished' ? 'ok' : ''
+      );
+    }
     emit();
-  } catch (e) { clearInterval(timer); timer = null; }
+  } catch (e) {
+    clearInterval(timer);
+    timer = null;
+  }
 }
 
 export function renderBatch(root) {
@@ -44,10 +57,10 @@ export function renderBatch(root) {
     check('Include subfolders', o.recursive, (v) => set({ recursive: v })), check('Skip __checkpoint files', o.skip_checkpoints, (v) => set({ skip_checkpoints: v })),
     field('Output folder', h('div', { class: 'row' }, input(o.output_dir, (v) => set({ output_dir: v })), h('button', { class: 'btn sm', onclick: () => browse('output_dir') }, 'Browse'))),
     field('Detectors', seg([['all', 'Both'], ['detector1', 'Detector 1'], ['detector2', 'Detector 2']], o.detector, (v) => set({ detector: v }))),
-    field('Model', select([['', 'Auto per experiment type'], 'Rabi', 'Ramsey', 'SpinEcho', 'DynamicDecoupling', 'T1', 'ODMR', 'DEERFrequency', 'DEERDuration', 'DEERDecay', 'DEERPosition', 'TimeTraceDecay'], o.model, (v) => set({ model: v }))),
+    field('Model', select([['', 'Auto per experiment type'], 'Rabi', 'Ramsey', 'SpinEcho', 'DynamicDecoupling', 'T1', 'ODMR', 'DEERFrequency', 'DEERDuration', 'DEERDecay', 'DEERPosition', 'TimeTraceDecay', ['GaussianPeaks', 'Gaussian peak']], o.model, (v) => set({ model: v }))),
     field('Observable', select([['contrast', 'Contrast'], ['signal', 'Signal'], ['reference', 'Reference'], ['difference', 'Difference']], o.mode, (v) => set({ mode: v }))),
-    h('div', { class: 'g2' }, field('Bin size', input(o.bin, (v) => set({ bin: Math.max(1, num(v) || 1) }))), field('Smoothing', input(o.smooth, (v) => set({ smooth: Math.max(1, num(v) || 1) }))),
-      field('Multistart', input(o.multistart, (v) => set({ multistart: Math.max(1, num(v) || 12) }))), field('Figure DPI', input(o.dpi, (v) => set({ dpi: num(v) || 180 }))),
+    h('div', { class: 'g2' }, field('Bin size', input(o.bin, (v) => set({ bin: Math.max(1, num(v) || 1) }), { numeric: true })), field('Smoothing', input(o.smooth, (v) => set({ smooth: Math.max(1, num(v) || 1) }), { numeric: true })),
+      field('Multistart', input(o.multistart, (v) => set({ multistart: Math.max(1, num(v) || 12) }), { numeric: true })), field('Figure DPI', input(o.dpi, (v) => set({ dpi: num(v) || 180 }), { numeric: true })),
       field('D1 label', input(o.detector_labels.detector1, (v) => set({ detector_labels: { ...o.detector_labels, detector1: v } }))), field('D2 label', input(o.detector_labels.detector2, (v) => set({ detector_labels: { ...o.detector_labels, detector2: v } })))),
     check('Robust fitting (subset comparison)', o.robust, (v) => set({ robust: v })), check('ODMR multi-peak', o.odmr_multi, (v) => set({ odmr_multi: v })), check('Write Origin bundles', o.origin, (v) => set({ origin: v })),
     h('div', { class: 'row' }, running ? h('button', { class: 'btn danger', style: 'flex:1;justify-content:center', onclick: () => call('batch_cancel', { job: B.job }) }, 'Cancel after row')
@@ -137,21 +150,42 @@ async function openFigure(r) {
 
 // Replays saved row IDs and frozen options; completed rows keep their archived outputs.
 async function rerunFailed() {
-  const B=S.batch, failed=(B.rows || []).filter(r=>needsBatchRetry(r) && r.row_id && r.manifest_path);
-  if(!failed.length)return;
-  B.rerunning=true;emit();
+  const B = S.batch,
+    failed = (B.rows || []).filter((r) => needsBatchRetry(r) && r.row_id && r.manifest_path);
+  if (!failed.length) return;
+  B.rerunning = true;
+  emit();
   try {
-    const manifest=B.manifestPath || failed[0].manifest_path;
-    B.job=await call('batch_rerun',{manifest_path:manifest,rows:failed.map(r=>r.row_id)},{label:'Rerunning saved batch rows'});
-    B.status={state:'running',done:0,total:failed.length,log:[]};emit();
-    do{await wait(700);B.status=await call('batch_status',{job:B.job},{quiet:true});emit();}while(B.status.state==='running');
-    B.rows=B.status.rows;B.manifestPath=B.status.manifest_path;
-    toast(`Re-run ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.${B.status.error ? ' '+B.status.error : ''}`,B.status.state==='finished'?'ok':'');
-  } finally {B.rerunning=false;emit();}
+    const manifest = B.manifestPath || failed[0].manifest_path;
+    B.job = await call(
+      'batch_rerun',
+      { manifest_path: manifest, rows: failed.map((r) => r.row_id) },
+      { label: 'Rerunning saved batch rows' }
+    );
+    B.status = { state: 'running', done: 0, total: failed.length, log: [] };
+    emit();
+    do {
+      await wait(700);
+      B.status = await call('batch_status', { job: B.job }, { quiet: true });
+      emit();
+    } while (B.status.state === 'running');
+    B.rows = B.status.rows;
+    B.manifestPath = B.status.manifest_path;
+    toast(
+      `Re-run ${B.status.state}: ${B.status.done}/${B.status.total} requested rows completed.${B.status.error ? ' ' + B.status.error : ''}`,
+      B.status.state === 'finished' ? 'ok' : ''
+    );
+  } finally {
+    B.rerunning = false;
+    emit();
+  }
 }
 
-async function resumeUnfinished(){
-  const B=S.batch;B.job=await call('batch_resume',{manifest_path:B.manifestPath},{label:'Resuming recorded batch'});
-  B.status={state:'running',done:0,total:0,log:[]};
-  if(timer)clearInterval(timer);timer=setInterval(poll,700);emit();
+async function resumeUnfinished() {
+  const B = S.batch;
+  B.job = await call('batch_resume', { manifest_path: B.manifestPath }, { label: 'Resuming recorded batch' });
+  B.status = { state: 'running', done: 0, total: 0, log: [] };
+  if (timer) clearInterval(timer);
+  timer = setInterval(poll, 700);
+  emit();
 }

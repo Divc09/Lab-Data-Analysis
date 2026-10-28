@@ -41,7 +41,7 @@ Other:
 
 - Folder scans are cached in `%APPDATA%\SmartFitter\peek_cache.json`, so reopening large folders is faster.
 - Fit uncertainties: the covariance estimate in `nvfit/fit_engine.py` now scales the Jacobian by column and uses an SVD cutoff. Badly scaled parameters (e.g. Rabi T, β, delay) previously got unrealistically small errors. Unidentifiable parameters report NaN, shown as "n/a" in the app.
-- Batch: under Auto, 1D line scans are plotted, not fitted. Choose GaussianPeaks or `--model-override` to fit them.
+- Auto fits 1D line scans with one Gaussian peak on a constant background, in Analyze, Compare and Batch. Choose GaussianPeaks with more peaks, a custom model, or `--model-override` for anything else.
 
 Iteration sensitivity (Analyze → Fit, or Process):
 

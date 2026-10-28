@@ -1,4 +1,5 @@
 """Refit iteration means after omissions without changing the source or selection."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -14,6 +15,7 @@ def _summary(fit):
     return {k: fit.get(k) for k in ("model", "params", "status", "reason", "success", "r2", "extras", "provenance")}
 
 
+@core.analysis_result
 def iteration_sensitivity(ws, path, detector, mode, proc=None, spec=None, omit_groups=None):
     proc, requested_spec = deepcopy(proc or {}), deepcopy(spec or {})
     if requested_spec.get("robust"):
@@ -50,7 +52,9 @@ def iteration_sensitivity(ws, path, detector, mode, proc=None, spec=None, omit_g
         row = {"omitted": group, "retained": retained, "sources": [sources[i] for i in group]}
         try:
             fit = core.run_fit(ws, path, detector, mode, {**baseline_proc, "iterations": retained}, spec)
-            comparable = fit.get("model") == baseline.get("model") and {p["name"] for p in fit.get("params", [])} == names
+            comparable = (
+                fit.get("model") == baseline.get("model") and {p["name"] for p in fit.get("params", [])} == names
+            )
             comparable = comparable and fit.get("success") is not False
             reason = fit.get("reason", "")
             if not comparable:
@@ -59,13 +63,22 @@ def iteration_sensitivity(ws, path, detector, mode, proc=None, spec=None, omit_g
         except Exception as exc:
             row.update(fit=None, comparable=False, status="ERROR", reason=str(exc))
         rows.append(row)
-    return {"baseline": _summary(baseline), "rows": rows, "selected": indices,
-            "sources": [sources[i] for i in indices], "detector": tr.detector_id, "mode": mode,
-            "processing": proc, "requested_spec": requested_spec, "fit_spec": spec, "locked": locked,
-            "note": "Each row refits the retained iteration mean with the same processing, range, seeds/bounds and weighting settings. "
-                    "Available Auto choices are resolved on the full selection. SEM weights, when enabled, are recomputed per subset. "
-                    "Sensitivity is not an outlier test or a confidence interval. Large changes can reflect drift, noise or an unstable fit. "
-                    "Errors are ordinary fit errors; fits share observations. With two baseline iterations each omission fits one trace without across-iteration SEM."}
+    return {
+        "baseline": _summary(baseline),
+        "rows": rows,
+        "selected": indices,
+        "sources": [sources[i] for i in indices],
+        "detector": tr.detector_id,
+        "mode": mode,
+        "processing": proc,
+        "requested_spec": requested_spec,
+        "fit_spec": spec,
+        "locked": locked,
+        "note": "Each row refits the retained iteration mean with the same processing, range, seeds/bounds and weighting settings. "
+        "Available Auto choices are resolved on the full selection. SEM weights, when enabled, are recomputed per subset. "
+        "Sensitivity is not an outlier test or a confidence interval. Large changes can reflect drift, noise or an unstable fit. "
+        "Errors are ordinary fit errors; fits share observations. With two baseline iterations each omission fits one trace without across-iteration SEM.",
+    }
 
 
 ENDPOINTS = {"iteration_sensitivity": iteration_sensitivity}

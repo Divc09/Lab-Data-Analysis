@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .fit_engine import FitResult, fit_model_multistart, reduced_chi2, sem_to_weights
+from .fit_engine import FitResult, UnderdeterminedFitError, fit_model_multistart, reduced_chi2, sem_to_weights
 from .models import ramsey_extended, ramsey_hyperfine_n14, ramsey_simple
 
 
@@ -94,58 +94,121 @@ def _seed_ramsey_extended(x_ns: np.ndarray, y: np.ndarray, n_starts: int = 24) -
 
 def ramsey_weights(x, y, sem=None):
     weights = np.ones_like(y, dtype=float)
-    weights[x > 2200] = .7
-    weights[x > 3200] = .5
+    weights[x > 2200] = 0.7
+    weights[x > 3200] = 0.5
     w_sem = sem_to_weights(sem) if sem is not None and len(sem) == len(y) else None
     return weights if w_sem is None else weights * w_sem
 
 
-def fit_ramsey_physics_first(x_ns, y, sem=None, *, multistart=None, locks=None, model="Auto") -> RamseySelectionResult:
+def ramsey_control_model(model):
+    aliases = {"Simple damped cosine": "RamseySimple", "N14 hyperfine": "RamseyHyperfine", "Extended": "RamseyExtended"}
+    wanted = aliases.get(model, model)
+    return "RamseySimple" if wanted in ("Auto", "", None) else wanted
+
+
+def fit_ramsey_physics_first(
+    x_ns, y, sem=None, *, multistart=None, locks=None, model="Auto", parameter_model=None
+) -> RamseySelectionResult:
     """Fit the requested Ramsey candidate(s), retaining general parameter controls."""
     from .fit_engine import parameter_controls
+
     x_ns, y = np.asarray(x_ns, float), np.asarray(y, float)
     weights = ramsey_weights(x_ns, y, sem)
     lo, hi = float(np.min(y)), float(np.max(y))
     span = max(hi - lo, 1e-9)
-    tspan = max(float(np.ptp(x_ns)), 1.)
-    dx = float(np.min(np.diff(np.unique(x_ns)))) if len(np.unique(x_ns)) > 1 else 1.
-    maxfreq = max(.5 / dx, 2.1e-4)
+    tspan = max(float(np.ptp(x_ns)), 1.0)
+    dx = float(np.min(np.diff(np.unique(x_ns)))) if len(np.unique(x_ns)) > 1 else 1.0
+    maxfreq = max(0.5 / dx, 2.1e-4)
     short = ["y0", "A", "f", "phi", "tau", "n"]
-    bounds = ([lo - 2 * span, 0., min(2e-4, maxfreq/100), -2*np.pi, max(dx/10, 1e-6), .5],
-              [hi + 2 * span, 4 * span, maxfreq, 2*np.pi, max(12000., 20*tspan), 5.])
+    bounds = (
+        [lo - 2 * span, 0.0, min(2e-4, maxfreq / 100), -2 * np.pi, max(dx / 10, 1e-6), 0.5],
+        [hi + 2 * span, 4 * span, maxfreq, 2 * np.pi, max(12000.0, 20 * tspan), 5.0],
+    )
     definitions = [
         ("RamseySimple", ramsey_simple, short, *bounds, _seed_ramsey_simple, 18),
         ("RamseyHyperfine", ramsey_hyperfine_n14, short, *bounds, _seed_ramsey_hyperfine, 18),
-        ("RamseyExtended", ramsey_extended,
-         ["A1", "A2", "T2_star", "n", "f1", "f2", "phi1", "phi2", "B", "D", "Td"],
-         [0., 0., max(dx/10,1e-6), .5, bounds[0][2], bounds[0][2], -2*np.pi, -2*np.pi, lo-2*span, -4*span, max(dx/10,1e-6)],
-         [4*span, 4*span, max(12000.,20*tspan), 5., maxfreq, maxfreq, 2*np.pi, 2*np.pi, hi+2*span, 4*span, max(9000.,20*tspan)],
-         _seed_ramsey_extended, 24),
+        (
+            "RamseyExtended",
+            ramsey_extended,
+            ["A1", "A2", "T2_star", "n", "f1", "f2", "phi1", "phi2", "B", "D", "Td"],
+            [
+                0.0,
+                0.0,
+                max(dx / 10, 1e-6),
+                0.5,
+                bounds[0][2],
+                bounds[0][2],
+                -2 * np.pi,
+                -2 * np.pi,
+                lo - 2 * span,
+                -4 * span,
+                max(dx / 10, 1e-6),
+            ],
+            [
+                4 * span,
+                4 * span,
+                max(12000.0, 20 * tspan),
+                5.0,
+                maxfreq,
+                maxfreq,
+                2 * np.pi,
+                2 * np.pi,
+                hi + 2 * span,
+                4 * span,
+                max(9000.0, 20 * tspan),
+            ],
+            _seed_ramsey_extended,
+            24,
+        ),
     ]
-    aliases = {"Simple damped cosine":"RamseySimple", "N14 hyperfine":"RamseyHyperfine", "Extended":"RamseyExtended"}
+    aliases = {"Simple damped cosine": "RamseySimple", "N14 hyperfine": "RamseyHyperfine", "Extended": "RamseyExtended"}
     wanted = aliases.get(model, model)
-    if wanted not in ('Auto', '', None) and wanted not in {d[0] for d in definitions}:
+    if wanted not in ("Auto", "", None) and wanted not in {d[0] for d in definitions}:
         raise ValueError(f"Unknown Ramsey model: {model}")
-    candidates = []
+    control_model = parameter_model or ramsey_control_model(wanted)
+    candidates, skipped = [], []
     for name, func, names, lower, upper, seed_fn, default_starts in definitions:
-        if wanted not in ('Auto', '', None) and wanted != name:
+        if wanted not in ("Auto", "", None) and wanted != name:
             continue
         count = default_starts if multistart is None else int(multistart)
-        if count < 1: raise ValueError('Multistart must be positive.')
-        with parameter_controls(locks):
-            candidate = fit_model_multistart(model_name=name, model_func=func, x=x_ns, y=y,
-                param_names=names, lower=lower, upper=upper, seeds=seed_fn(x_ns,y,n_starts=count),
-                weights=weights, x_scale='jac')
+        if count < 1:
+            raise ValueError("Multistart must be positive.")
+        try:
+            with parameter_controls(locks, model_name=control_model):
+                candidate = fit_model_multistart(
+                    model_name=name,
+                    model_func=func,
+                    x=x_ns,
+                    y=y,
+                    param_names=names,
+                    lower=lower,
+                    upper=upper,
+                    seeds=seed_fn(x_ns, y, n_starts=count),
+                    weights=weights,
+                    x_scale="jac",
+                )
+        except UnderdeterminedFitError as exc:
+            # Auto skips a candidate the data cannot identify (e.g. the 11-parameter extended model on few points).
+            if wanted not in ("Auto", "", None):
+                raise
+            skipped.append(exc)
+            continue
         if sem is not None:
             nfree = sum(candidate.free_mask) if candidate.free_mask is not None else len(candidate.params)
             chi2 = reduced_chi2(y, candidate.y_fit, sem, nfree)
-            if np.isfinite(chi2): candidate.extras.update(reduced_chi2=chi2, sem_weights_applied=True)
+            if np.isfinite(chi2):
+                candidate.extras.update(reduced_chi2=chi2, sem_weights_applied=True)
         candidates.append(candidate)
-    high_quality = [c for c in candidates if c.success and np.isfinite(c.r2) and c.r2 >= .85]
+    if not candidates:
+        raise skipped[0]
+    high_quality = [c for c in candidates if c.success and np.isfinite(c.r2) and c.r2 >= 0.85]
     if high_quality:
-        best = min(high_quality, key=lambda r:(sum(r.bound_hits), r.bic, -r.r2))
-        selected_by = 'quality_gate_r2>=0.85_then_bound_hits_then_bic'
+        best = min(high_quality, key=lambda r: (sum(r.bound_hits), r.bic, -r.r2))
+        selected_by = "quality_gate_r2>=0.85_then_bound_hits_then_bic"
     else:
-        best = max(candidates, key=lambda r:(r.success, r.r2 if np.isfinite(r.r2) else -np.inf, -sum(r.bound_hits)))
-        selected_by = 'fallback_max_r2_then_bound_hits_then_bic'
+        best = max(candidates, key=lambda r: (r.success, r.r2 if np.isfinite(r.r2) else -np.inf, -sum(r.bound_hits)))
+        selected_by = "fallback_max_r2_then_bound_hits_then_bic"
+    from .fit_workflows import describe_parameter_controls
+
+    describe_parameter_controls(best, locks, control_model)
     return RamseySelectionResult(best=best, candidates=candidates, selected_by=selected_by)

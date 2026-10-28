@@ -4,6 +4,7 @@ Opens a native desktop window (pywebview / WebView2). If that is unavailable it
 falls back to a chromeless Microsoft Edge app window. A second launch hands its
 files to the running window instead of starting another copy.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,27 +26,40 @@ LOCK = core.SETTINGS_DIR / "instance.json"
 
 def _existing_instance() -> int | None:
     try:
-        record=json.loads(LOCK.read_text())
-        port = int(record['port'])
-        request=urllib.request.Request(f'http://127.0.0.1:{port}/api/ping',data=b'{}',headers={'Content-Type':'application/json','X-SmartFitter-Token':record['token']},method='POST')
-        if not json.loads(urllib.request.urlopen(request,timeout=.7).read()).get('ok'): return None
+        record = json.loads(LOCK.read_text())
+        port = int(record["port"])
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/ping",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "X-SmartFitter-Token": record["token"]},
+            method="POST",
+        )
+        if not json.loads(urllib.request.urlopen(request, timeout=0.7).read()).get("ok"):
+            return None
         return port
     except Exception:
         return None
 
 
 def _post(port: int, name: str, payload: dict) -> None:
-    record=json.loads(LOCK.read_text())
-    if int(record['port']) != port: raise ValueError('SmartFitter instance changed; retry the launch.')
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/{name}", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json",'X-SmartFitter-Token':record['token']}, method="POST")
+    record = json.loads(LOCK.read_text())
+    if int(record["port"]) != port:
+        raise ValueError("SmartFitter instance changed; retry the launch.")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/{name}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "X-SmartFitter-Token": record["token"]},
+        method="POST",
+    )
     urllib.request.urlopen(req, timeout=3).read()
 
 
 def _edge() -> str | None:
-    for candidate in (shutil.which("msedge"),
-                      r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                      r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"):
+    for candidate in (
+        shutil.which("msedge"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ):
         if candidate and Path(candidate).exists():
             return candidate
     return None
@@ -83,13 +97,21 @@ def main() -> None:
             pass
         return
 
-    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid(),'token':api.token}))
+    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid(), "token": api.token}))
     try:
         import webview
 
         icon = Path(__file__).with_name("static") / "icon.ico"
-        api.window = webview.create_window("SmartFitter", url, width=1500, height=940, min_size=(1000, 640),
-                                           background_color="#0E1014", text_select=True)
+        api.window = webview.create_window(
+            "SmartFitter",
+            url,
+            width=1500,
+            height=940,
+            min_size=(1000, 640),
+            background_color="#0E1014",
+            text_select=True,
+        )
+
         def bind_drop(window):
             # A Python-side listener is what makes pywebview attach real paths to dropped files; the page then asks
             # Api.drop_paths, so dropped files open from where they live instead of as temporary copies.
@@ -102,7 +124,9 @@ def main() -> None:
 
                 def attach():  # DOM listeners live in the page, so re-attach after every (re)load
                     try:
-                        window.dom.document.events.drop += DOMEventHandler(on_drop, prevent_default=False, stop_propagation=False)
+                        window.dom.document.events.drop += DOMEventHandler(
+                            on_drop, prevent_default=False, stop_propagation=False
+                        )
                     except Exception:
                         pass
 

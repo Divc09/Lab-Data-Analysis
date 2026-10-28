@@ -1,6 +1,6 @@
 import { finiteExtent } from './numeric.js';
 // 2D map figures: per-detector maps with colorbars, RGB overlay panel, spot shapes, cursor.
-import { detLabel } from './state.js';
+import { S, detLabel } from './state.js';
 import { baseStyle, baseLayout, friendlyAxis } from './plotstyle.js';
 
 export const CMAPS = {
@@ -70,14 +70,41 @@ export function visibleSpots(f, det) {
   return res.spots.filter((s) => !removed.has(s.spot_id));
 }
 
-// panels: [{kind:'map', det}, {kind:'overlay'}]
+// A map source is {path, det}: the open file that owns it and one of its detectors. A Compare-tab pairing with
+// another open file adds that file's map, so cross-file comparisons show (and cut) both measured maps.
+export const sourceFile = (f, src) => (src.path === f.path ? f : S.files[src.path]);
+const axisName = (l) => friendlyAxis(l || '').split(' [')[0].trim().toLowerCase();
+
+// Another file may store the same plane with the opposite axis order; show it in the primary's orientation.
+export function sourceSwap(f, src) {
+  const own = f.data[f.detector]?.map, m = sourceFile(f, src)?.data[src.det]?.map;
+  const flipped = !!(own && m && src.path !== f.path && axisName(m.x_label) === axisName(own.y_label)
+    && axisName(m.y_label) === axisName(own.x_label) && axisName(m.x_label) !== axisName(m.y_label));
+  return !!f.map.swap !== flipped;
+}
+
+export function crossFileSource(f) {
+  const c = f.map.compareWith;
+  if (!c || c.path === f.path) return null;
+  return S.files[c.path]?.data[c.detector]?.map ? { path: c.path, det: c.detector } : null;
+}
+
+export function sourceLabel(f, src) {
+  const o = sourceFile(f, src);
+  return src.path === f.path ? detLabel(f, src.det) : `${o?.info.name || src.path} · ${detLabel(o || f, src.det)}`;
+}
+
+// panels: [{kind:'map', path, det}, {kind:'overlay'}]
 export function mapPanels(f) {
   const lay = f.map.layout;
-  const dets = f.info.detectors;
+  const own = f.info.detectors.map((d) => ({ kind: 'map', path: f.path, det: d }));
+  const other = crossFileSource(f);
+  const cross = other ? [{ kind: 'map', ...other }] : [];
   if (lay === 'overlay') return [{ kind: 'overlay' }];
-  if (lay === 'maps+overlay') return [...dets.map((d) => ({ kind: 'map', det: d })), { kind: 'overlay' }];
-  if (lay === 'side' && dets.length > 1) return dets.map((d) => ({ kind: 'map', det: d }));
-  return [{ kind: 'map', det: f.detector }];
+  // Maps + overlay shows the two maps being blended, then the blend.
+  if (lay === 'maps+overlay') return [...(other ? [{ kind: 'map', path: f.path, det: f.detector }, ...cross] : own), { kind: 'overlay' }];
+  if (lay === 'side' && own.length + cross.length > 1) return [...own, ...cross];
+  return [{ kind: 'map', path: f.path, det: f.detector }];
 }
 
 export function figureMaps(f, overlay) {
@@ -90,8 +117,11 @@ export function figureMaps(f, overlay) {
   const traces = [], shapes = [], annotations = [], images = [];
   const layout = baseLayout(st, { showlegend: false, margin: { l: 64, r: 16, t: 34, b: 52 }, uirevision: f.path + M.layout + M.swap, separators: '.' });
   let shared = null;
+  // Shared limits only pool maps that show the same quantity in the same unit; others keep their own limits.
+  const sameQuantity = (p) => mapValueLabel(sourceFile(f, p)) === mapValueLabel(f);
   if (M.scale === 'shared') {
-    const all = f.info.detectors.flatMap((d) => (f.data[d]?.map ? displayMap(f.data[d].map, M.swap, M.source).z.flat() : []));
+    const all = panels.filter((p) => p.kind === 'map' && sameQuantity(p))
+      .flatMap((p) => { const m = sourceFile(f, p)?.data[p.det]?.map; return m ? displayMap(m, M.swap, M.source).z.flat() : []; });
     shared = M.limits === 'manual' && M.manual.shared ? M.manual.shared : [percentile(all, M.plo), percentile(all, M.phi)];
   }
   panels.forEach((p, i) => {
@@ -100,11 +130,12 @@ export function figureMaps(f, overlay) {
     const dom = p.kind === 'map' ? [x0, x0 + w * 0.84] : [x0 + (i ? w * 0.08 : 0), x0 + w];
     let disp, title;
     if (p.kind === 'map') {
-      const m = f.data[p.det]?.map;
+      const o = sourceFile(f, p), m = o?.data[p.det]?.map;
       if (!m) return;
-      disp = displayMap(m, M.swap, M.source || 'value');
-      let z = disp.z;
-      const [lo, hi] = shared || mapLimits(f, p.det, z);
+      disp = displayMap(m, sourceSwap(f, p), M.source || 'value');
+      const raw = disp.z;
+      let z = raw;
+      const [lo, hi] = (sameQuantity(p) && shared) || mapLimits(f, p.det, z);
       let zmin = lo, zmax = hi, tickvals, ticktext;
       if (M.log) {
         z = z.map((r) => r.map((v) => (v > 0 ? Math.log10(v) : NaN)));
@@ -113,18 +144,22 @@ export function figureMaps(f, overlay) {
         for (let e = Math.ceil(zmin); e <= Math.floor(zmax); e++) { tickvals.push(e); ticktext.push(`1e${e}`); }
       }
       const cs = CMAPS[M.cmap] || 'Viridis';
-      title = detLabel(f, p.det);
+      title = sourceLabel(f, p);
+      const vlabel = mapValueLabel(o);
+      // In log mode the colour coordinate is log10(value); the hover still reports the recorded value.
+      const zText = M.log ? `%{customdata:.6g} · ${vlabel} (log₁₀ %{z:.4g})` : `%{z:.6g} · ${vlabel}`;
       traces.push({
         type: 'heatmap', x: disp.x, y: disp.y, z, zmin, zmax, colorscale: cs, reversescale: !!(M.reverse ^ !!NEEDS_FLIP[M.cmap]),
         xaxis: `x${ax}`, yaxis: `y${ax}`, zsmooth: false, hoverongaps: false,
         colorbar: { x: dom[1] + 0.012, len: 0.9, thickness: 12, outlinewidth: 1, outlinecolor: '#2A2F3A', tickfont: { size: Math.round(st.base * 0.75) },
-          title: { text: mapValueLabel(f), side: 'top', font: { size: Math.round(st.base * 0.72) } }, tickvals, ticktext, exponentformat: 'SI' },
-        hovertemplate: `${disp.xl} %{x:.6g}<br>${disp.yl} %{y:.6g}<br>%{z:.6g} · ${mapValueLabel(f)}<extra>${title}</extra>`, meta: { det: p.det },
+          title: { text: vlabel, side: 'top', font: { size: Math.round(st.base * 0.72) } }, tickvals, ticktext, exponentformat: 'SI' },
+        ...(M.log ? { customdata: raw } : {}),
+        hovertemplate: `${disp.xl} %{x:.6g}<br>${disp.yl} %{y:.6g}<br>${zText}<extra>${title}</extra>`, meta: { det: p.det, path: p.path },
       });
       if (M.showShapes || M.showCenters || M.showNumbers) {
-        for (const s of visibleSpots(f, p.det)) {
-          const sel = f.spotSel.includes(`${p.det}:${s.spot_id}`);
-          const hov = f.spotHover === `${p.det}:${s.spot_id}`;
+        for (const s of visibleSpots(o, p.det)) {
+          const sel = o === f && f.spotSel.includes(`${p.det}:${s.spot_id}`);
+          const hov = o === f && f.spotHover === `${p.det}:${s.spot_id}`;
           const color = sel ? '#E0A400' : '#FFFFFF';
           if (M.showShapes) shapes.push({ type: 'path', path: ellipsePath(s, M.swap), xref: `x${ax}`, yref: `y${ax}`, line: { color: hov ? '#FFD400' : color, width: hov ? 4 : sel ? 2.2 : 1.4 } });
           const [cx, cy] = M.swap ? [s.center_y, s.center_x] : [s.center_x, s.center_y];
@@ -140,7 +175,7 @@ export function figureMaps(f, overlay) {
       images.push({ source: overlay.png, xref: `x${ax}`, yref: `y${ax}`, x: xe[0], y: ye[ye.length - 1], sizex: xe[xe.length - 1] - xe[0], sizey: ye[ye.length - 1] - ye[0], sizing: 'stretch', layer: 'below' });
       traces.push({ type: 'scatter', x: [xe[0], xe[xe.length - 1]], y: [ye[0], ye[ye.length - 1]], mode: 'markers', marker: { opacity: 0 }, xaxis: `x${ax}`, yaxis: `y${ax}`, hoverinfo: 'skip', showlegend: false });
       const [c1, c2] = { 'Pink / teal': ['#FF0099', '#00CC99'], 'Green / magenta': ['#00C000', '#E000E0'], 'Red / cyan': ['#E00000', '#00C8C8'] }[M.palette] || ['#FF0099', '#00CC99'];
-      const others = M.compareWith && M.compareWith.path !== f.path ? 'other file' : detLabel(f, f.info.detectors.find((d) => d !== f.detector) || f.detector);
+      const others = M.compareWith && M.compareWith.path !== f.path ? sourceLabel(f, { path: M.compareWith.path, det: M.compareWith.detector }) : detLabel(f, f.info.detectors.find((d) => d !== f.detector) || f.detector);
       title = `<span style="color:${c1}">■</span> ${detLabel(f, f.detector)}  <span style="color:${c2}">■</span> ${others}`;
       annotations.push({ xref: `x${ax} domain`, yref: `y${ax} domain`, x: 0.5, y: -0.22, yanchor: "top", showarrow: false, font: { size: Math.round(st.base * 0.72), color: "#4A5262" }, text: `${M.overlayScale} scale · ${M.background}% background removed` });
     }
@@ -177,20 +212,36 @@ export function figureMaps(f, overlay) {
   return { data: traces, layout, panels };
 }
 
-// Linecut data through the cursor for every displayed detector.
+// Every map source a linecut covers: this file's detectors plus a paired map from another file.
+export function cutSources(f) {
+  const other = crossFileSource(f);
+  return [...f.info.detectors.map((det) => ({ path: f.path, det })), ...(other ? [other] : [])];
+}
+
+// Measured extent of an axis: cell centres +/- half the neighbouring spacing at each edge.
+export function axisExtent(a) {
+  const [lo, hi] = finiteExtent(a), hw = a.length > 1 ? (hi - lo) / (a.length - 1) / 2 : 0;
+  return [lo - hw, hi + hw];
+}
+const inside = (a, v) => { const [lo, hi] = axisExtent(a); return v >= lo && v <= hi; };
+
+// Linecut data through the cursor for every map source. A source only contributes a cut whose position lies
+// inside its own measured extent (no extrapolation onto the nearest edge row or column).
 export function linecuts(f) {
   const M = f.map;
   if (M.linecut === 'line') return lineProfiles(f);
   if (!M.cursor || M.linecut === 'none') return null;
   const out = [];
-  for (const det of f.info.detectors) {
-    const m = f.data[det]?.map;
+  for (const src of cutSources(f)) {
+    const m = sourceFile(f, src)?.data[src.det]?.map;
     if (!m) continue;
-    const d = displayMap(m, M.swap, M.cutSource || M.source || 'value');
+    const d = displayMap(m, sourceSwap(f, src), M.cutSource || M.source || 'value');
+    const inX = inside(d.x, M.cursor[0]), inY = inside(d.y, M.cursor[1]);
     const ix = nearest(d.x, M.cursor[0]), iy = nearest(d.y, M.cursor[1]);
-    const h = M.linecut !== 'v' ? { x: d.x, y: d.z[iy], label: `${friendlyAxis(d.xl)} at ${friendlyAxis(d.yl).split(' [')[0]} = ${fmtc(d.y[iy])}` } : null;
-    const v = M.linecut === 'v' || M.linecut === 'cross' ? { x: d.y, y: d.z.map((r) => r[ix]), label: `${friendlyAxis(d.yl)} at ${friendlyAxis(d.xl).split(' [')[0]} = ${fmtc(d.x[ix])}` } : null;
-    out.push({ det, label: detLabel(f, det), h, v, value: d.z[iy]?.[ix], at: [d.x[ix], d.y[iy]] });
+    const h = M.linecut !== 'v' && inY ? { x: d.x, y: d.z[iy], label: `${friendlyAxis(d.xl)} at ${friendlyAxis(d.yl).split(' [')[0]} = ${fmtc(d.y[iy])}` } : null;
+    const v = (M.linecut === 'v' || M.linecut === 'cross') && inX ? { x: d.y, y: d.z.map((r) => r[ix]), label: `${friendlyAxis(d.yl)} at ${friendlyAxis(d.xl).split(' [')[0]} = ${fmtc(d.x[ix])}` } : null;
+    if (!h && !v) continue;
+    out.push({ det: src.det, path: src.path, label: sourceLabel(f, src), h, v, value: inX && inY ? d.z[iy]?.[ix] : NaN, at: [d.x[ix], d.y[iy]] });
   }
   return out;
 }
@@ -205,14 +256,12 @@ function lineProfiles(f) {
   const [[x0, y0], [x1, y1]] = M.line;
   const len = lineLength(M.line);
   const out = [];
-  for (const det of f.info.detectors) {
-    const m = f.data[det]?.map;
+  for (const src of cutSources(f)) {
+    const m = sourceFile(f, src)?.data[src.det]?.map;
     if (!m) continue;
-    const d = displayMap(m, M.swap, M.cutSource || M.source || 'value');
+    const d = displayMap(m, sourceSwap(f, src), M.cutSource || M.source || 'value');
     const N = 2 * Math.max(d.x.length, d.y.length);
-    // Map extent = cell centres +/- half a cell at each edge.
-    const ext = (a) => { const [lo, hi] = finiteExtent(a), hw = a.length > 1 ? (hi - lo) / (a.length - 1) / 2 : Infinity; return [lo - hw, hi + hw]; };
-    const [exl, exh] = ext(d.x), [eyl, eyh] = ext(d.y);
+    const [exl, exh] = axisExtent(d.x), [eyl, eyh] = axisExtent(d.y);
     const xs = [], ys = [];
     for (let k = 0; k < N; k++) {
       const t = N > 1 ? k / (N - 1) : 0;
@@ -224,7 +273,8 @@ function lineProfiles(f) {
     const unit = (l) => (/\[(.*)\]/.exec(friendlyAxis(l)) || [])[1] || '';
     const ux = unit(d.xl), uy = unit(d.yl);
     const axisLabel = ux && ux === uy ? `Distance along line [${ux}]` : 'Distance along line (axis units; x and y units differ)';
-    out.push({ det, label: detLabel(f, det), h: { x: xs, y: ys, label: `Line profile: (${fmtc(x0)}, ${fmtc(y0)}) to (${fmtc(x1)}, ${fmtc(y1)})` }, v: null, line: true, xTitle: axisLabel });
+    if (!xs.length) continue;
+    out.push({ det: src.det, path: src.path, label: sourceLabel(f, src), h: { x: xs, y: ys, label: `Line profile: (${fmtc(x0)}, ${fmtc(y0)}) to (${fmtc(x1)}, ${fmtc(y1)})` }, v: null, line: true, xTitle: axisLabel });
   }
   return out;
 }

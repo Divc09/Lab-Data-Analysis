@@ -104,30 +104,65 @@ function sliceRows() {
   if (!out.length) for (const s of ST.stack?.slices || []) out.push({ det: s.detector, z: s.third_value, z_source: s.third_source, file_name: s.file_name, linked: null });
   return out;
 }
-const stackRequest=(kind)=>({paths:ST.sel,...(kind==='stack_trajectory'?{detectors:ST.both && ST.sel.every(p=>detectorCount(peekOf(p))>1)?[ST.det,ST.det==='detector1'?'detector2':'detector1']:[ST.det]}:{detector:ST.det}),mode:'contrast',opts:kind==='stack_build'?{source:ST.source,include_maps:true}:kind==='stack_trajectory'?{...baseOpts(),max_jump_fwhm:ST.maxJump}:{...baseOpts(),gate_fwhm:ST.gate}});
-const sourceChecks=new Map();
-function historicalWarnings(){
-  const out=[];
-  for(const [label,r]of [['Stack',ST.stack],['Trajectory',ST.traj],['Drift',ST.drift]]){
-    if(!r)continue;
-    const env=r.analysis,check=env && sourceChecks.get(env.signature);
-    if(!env || env.unverified)out.push(`${label}: unverified saved result; rebuild to verify.`);
-    else if(canonical(env.settings)!==canonical(stackRequest(env.kind)))out.push(`${label}: historical result; selected sources or options changed.`);
-    else if(check && !check.fresh)out.push(`${label}: historical result; ${check.reason}.`);
-    else if(!check)out.push(`${label}: checking source revisions…`);
+const stackRequest = (kind) => ({
+  paths: ST.sel,
+  ...(kind === 'stack_trajectory'
+    ? {
+        detectors:
+          ST.both && ST.sel.every((p) => detectorCount(peekOf(p)) > 1)
+            ? [ST.det, ST.det === 'detector1' ? 'detector2' : 'detector1']
+            : [ST.det],
+      }
+    : { detector: ST.det }),
+  mode: 'contrast',
+  opts:
+    kind === 'stack_build'
+      ? { source: ST.source, include_maps: true }
+      : kind === 'stack_trajectory'
+        ? { ...baseOpts(), max_jump_fwhm: ST.maxJump }
+        : { ...baseOpts(), gate_fwhm: ST.gate },
+});
+const sourceChecks = new Map();
+function historicalWarnings() {
+  const out = [];
+  for (const [label, r] of [
+    ['Stack', ST.stack],
+    ['Trajectory', ST.traj],
+    ['Drift', ST.drift],
+  ]) {
+    if (!r) continue;
+    const env = r.analysis,
+      check = env && sourceChecks.get(env.signature);
+    if (!env || env.unverified) out.push(`${label}: unverified saved result; rebuild to verify.`);
+    else if (canonical(env.settings) !== canonical(stackRequest(env.kind)))
+      out.push(`${label}: historical result; selected sources or options changed.`);
+    else if (check && !check.fresh) out.push(`${label}: historical result; ${check.reason}.`);
+    else if (!check) out.push(`${label}: checking source revisions…`);
   }
   return out;
 }
-function checkSources(){
-  for(const r of [ST.stack,ST.traj,ST.drift]){
-    const env=r?.analysis;if(!env || env.unverified)continue;
-    const old=sourceChecks.get(env.signature);if(old?.pending || old && Date.now()-old.checked<2000)continue;
-    sourceChecks.set(env.signature,{...old,pending:true});
-    call('validate_analysis',{analysis:env},{quiet:true}).then(check=>{sourceChecks.set(env.signature,{...check,checked:Date.now()});emit();}).catch(()=>{sourceChecks.set(env.signature,{fresh:false,reason:'Source verification unavailable',checked:Date.now()});emit();});
+function checkSources() {
+  for (const r of [ST.stack, ST.traj, ST.drift]) {
+    const env = r?.analysis;
+    if (!env || env.unverified) continue;
+    const old = sourceChecks.get(env.signature);
+    if (old?.pending || (old && Date.now() - old.checked < 2000)) continue;
+    sourceChecks.set(env.signature, { ...old, pending: true });
+    call('validate_analysis', { analysis: env }, { quiet: true })
+      .then((check) => {
+        sourceChecks.set(env.signature, { ...check, checked: Date.now() });
+        emit();
+      })
+      .catch(() => {
+        sourceChecks.set(env.signature, { fresh: false, reason: 'Source verification unavailable', checked: Date.now() });
+        emit();
+      });
   }
 }
 function warnings() {
-  return [...new Set([...historicalWarnings(),...(ST.stack?.warnings || []), ...(ST.traj?.warnings || []), ...(ST.drift?.warnings || [])])];
+  return [
+    ...new Set([...historicalWarnings(), ...(ST.stack?.warnings || []), ...(ST.traj?.warnings || []), ...(ST.drift?.warnings || [])]),
+  ];
 }
 
 function csvText(sep = '\t') {

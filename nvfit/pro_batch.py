@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import find_peaks
@@ -25,15 +26,24 @@ from .models import (
 from .preprocess import smooth_trace
 from .profiles import PROFILES, classify_status
 from .prepared_fit import PreparedFit
-from .batch_manifest import RunRecord, fingerprint, row_id, load_manifest, output_lock, atomic_json, atomic_csv, json_value
+from .batch_manifest import (
+    RunRecord,
+    fingerprint,
+    row_id,
+    load_manifest,
+    output_lock,
+    atomic_json,
+    atomic_csv,
+    json_value,
+)
 from .analysis_identity import analysis_descriptor, result_envelope
 from .rabi_utils import build_rabi_nv_metrics, rabi_envelope_bounds, rabi_envelope_metrics
 from .ramsey import estimate_ramsey_frequency, fit_ramsey_physics_first
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _json_default(value):
     """Serialize numpy values left in fit extras (e.g. the T1 ``plot_y`` series)."""
@@ -68,6 +78,7 @@ def _spin_echo_seed_and_bounds(exp_type: str, tspan: float) -> tuple[list[float]
 # Fitting
 # ---------------------------------------------------------------------------
 
+
 def _fit_non_ramsey(
     exp_type: str,
     x: np.ndarray,
@@ -78,10 +89,16 @@ def _fit_non_ramsey(
     *,
     trace=None,
 ) -> FitResult:
-    cfg=FitWorkflowConfig(multistart=n_starts,
-        rabi_mode="Single reliable Rabi" if exp_type=='Rabi' else 'Classic single (recommended)',
-        odmr_multipeak=odmr_multipeak,odmr_peak_count=4,odmr_auto_peak=True,odmr_polarity='Auto',custom_spec=custom_spec)
-    return PreparedFit.create(x,y,exp_type,cfg,trace=trace).run()[0]
+    cfg = FitWorkflowConfig(
+        multistart=n_starts,
+        rabi_mode="Single reliable Rabi" if exp_type == "Rabi" else "Classic single (recommended)",
+        odmr_multipeak=odmr_multipeak,
+        odmr_peak_count=4,
+        odmr_auto_peak=True,
+        odmr_polarity="Auto",
+        custom_spec=custom_spec,
+    )
+    return PreparedFit.create(x, y, exp_type, cfg, trace=trace).run()[0]
 
 
 def _fit_odmr_multipeak(x: np.ndarray, y: np.ndarray, n_starts: int, rng) -> FitResult:
@@ -118,8 +135,14 @@ def _fit_odmr_multipeak(x: np.ndarray, y: np.ndarray, n_starts: int, rng) -> Fit
     scale = _scaled_perturbation(lower, upper)
     seeds = [np.asarray(seed) + rng.normal(0, scale) for _ in range(n_starts)]
     return fit_model_multistart(
-        model_name="ODMRMulti", model_func=odmr_multi_lorentzian, x=x, y=y,
-        param_names=names, lower=lower, upper=upper, seeds=seeds,
+        model_name="ODMRMulti",
+        model_func=odmr_multi_lorentzian,
+        x=x,
+        y=y,
+        param_names=names,
+        lower=lower,
+        upper=upper,
+        seeds=seeds,
     )
 
 
@@ -131,13 +154,18 @@ def _run_robust_fit(
     custom_spec: dict | None = None,
     odmr_multipeak: bool = False,
     progress_callback=None,
-    *, trace=None,
+    *,
+    trace=None,
 ) -> FitResult:
     """Subset strategy over the same prepared request used by ordinary fitting."""
-    cfg = FitWorkflowConfig(multistart=n_starts,
-        rabi_mode="Single reliable Rabi" if exp_type == 'Rabi' else 'Classic single (recommended)',
-        odmr_multipeak=odmr_multipeak, odmr_peak_count=4, custom_spec=custom_spec)
-    return PreparedFit.create(x,y,exp_type,cfg,trace=trace).run(robust=True,progress=progress_callback)[0]
+    cfg = FitWorkflowConfig(
+        multistart=n_starts,
+        rabi_mode="Single reliable Rabi" if exp_type == "Rabi" else "Classic single (recommended)",
+        odmr_multipeak=odmr_multipeak,
+        odmr_peak_count=4,
+        custom_spec=custom_spec,
+    )
+    return PreparedFit.create(x, y, exp_type, cfg, trace=trace).run(robust=True, progress=progress_callback)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +173,22 @@ def _run_robust_fit(
 # ---------------------------------------------------------------------------
 
 _PARAM_UNITS = {
-    "y0": "arb.",  "A": "arb.",  "m": "1/ns",  "C": "arb.",
-    "f": "GHz",  "f1": "GHz",  "f2": "GHz",
-    "phi": "rad",  "phi1": "rad",  "phi2": "rad",
-    "tau": "ns",  "T2": "ns",  "T2_star": "ns",
-    "n": "",  "w": "",  "x0": "",
+    "y0": "arb.",
+    "A": "arb.",
+    "m": "1/ns",
+    "C": "arb.",
+    "f": "GHz",
+    "f1": "GHz",
+    "f2": "GHz",
+    "phi": "rad",
+    "phi1": "rad",
+    "phi2": "rad",
+    "tau": "ns",
+    "T2": "ns",
+    "T2_star": "ns",
+    "n": "",
+    "w": "",
+    "x0": "",
 }
 
 
@@ -171,10 +210,13 @@ def _plot_fit(
     dpi: int = 180,
 ):
     """Create publication-quality fit plot with stats annotation."""
-    y=np.asarray(result.extras.get('plot_y',y),float)
-    y_label=str(result.extras.get('plot_y_label') or y_label)
+    y = np.asarray(result.extras.get("plot_y", y), float)
+    y_label = str(result.extras.get("plot_y_label") or y_label)
     fig, (ax, axr) = plt.subplots(
-        2, 1, figsize=(10, 7), sharex=True,
+        2,
+        1,
+        figsize=(10, 7),
+        sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
 
@@ -206,9 +248,15 @@ def _plot_fit(
     stats_text = "\n".join(stat_lines)
     props = dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85, edgecolor="#bdbdbd")
     ax.text(
-        0.98, 0.97, stats_text, transform=ax.transAxes,
-        fontsize=7.5, verticalalignment="top", horizontalalignment="right",
-        fontfamily="monospace", bbox=props,
+        0.98,
+        0.97,
+        stats_text,
+        transform=ax.transAxes,
+        fontsize=7.5,
+        verticalalignment="top",
+        horizontalalignment="right",
+        fontfamily="monospace",
+        bbox=props,
     )
 
     # Residual subplot
@@ -224,8 +272,7 @@ def _plot_fit(
     plt.close(fig)
 
 
-def _plot_scan1d(out_path: Path, x: np.ndarray, y: np.ndarray,
-                  title: str, x_label: str, y_label: str, dpi: int = 180):
+def _plot_scan1d(out_path: Path, x: np.ndarray, y: np.ndarray, title: str, x_label: str, y_label: str, dpi: int = 180):
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(x, y, "o-", ms=3.5, lw=1.2, color="#1976d2")
     ax.set_title(title, fontsize=11, fontweight="bold")
@@ -237,15 +284,21 @@ def _plot_scan1d(out_path: Path, x: np.ndarray, y: np.ndarray,
     plt.close(fig)
 
 
-def _plot_scan2d(out_path: Path, x2d: np.ndarray, y2d: np.ndarray,
-                  z2d: np.ndarray, title: str, x_label: str, y_label: str,
-                  dpi: int = 180):
+def _plot_scan2d(
+    out_path: Path,
+    x2d: np.ndarray,
+    y2d: np.ndarray,
+    z2d: np.ndarray,
+    title: str,
+    x_label: str,
+    y_label: str,
+    dpi: int = 180,
+):
     fig, ax = plt.subplots(figsize=(9, 7))
     # Percentile normalization for better contrast
     vmin = np.nanpercentile(z2d, 2)
     vmax = np.nanpercentile(z2d, 98)
-    mesh = ax.pcolormesh(x2d, y2d, z2d, shading="auto", cmap="inferno",
-                         vmin=vmin, vmax=vmax)
+    mesh = ax.pcolormesh(x2d, y2d, z2d, shading="auto", cmap="inferno", vmin=vmin, vmax=vmax)
     ax.set_title(title, fontsize=11, fontweight="bold")
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
@@ -259,6 +312,7 @@ def _plot_scan2d(out_path: Path, x2d: np.ndarray, y2d: np.ndarray,
 # ---------------------------------------------------------------------------
 # NV metrics extraction
 # ---------------------------------------------------------------------------
+
 
 def _extract_nv_metrics(exp_type: str, result: FitResult, trace_metadata: dict | None = None) -> dict[str, object]:
     semantic_exp_type = exp_type
@@ -283,7 +337,9 @@ def _extract_nv_metrics(exp_type: str, result: FitResult, trace_metadata: dict |
     elif exp_type == "Rabi":
         physical_params = p
         if isinstance(result.extras, dict) and result.extras.get("rabi_physical_reference_params"):
-            physical_params = {k: float(v) for k, v in dict(result.extras.get("rabi_physical_reference_params", {})).items()}
+            physical_params = {
+                k: float(v) for k, v in dict(result.extras.get("rabi_physical_reference_params", {})).items()
+            }
         metrics.update(build_rabi_nv_metrics(physical_params, metadata=trace_metadata, errors=e))
         if isinstance(result.extras, dict):
             metrics.update(rabi_envelope_metrics(result.extras.get("rabi_envelope")))
@@ -333,15 +389,20 @@ def _extract_nv_metrics(exp_type: str, result: FitResult, trace_metadata: dict |
         for key in ("rf_frequency_ghz", "rf2_frequency_ghz", "rf2_duration_ns", "pi_pulse_ns", "tau_ns"):
             if trace_metadata.get(key) is not None:
                 metrics[key] = trace_metadata[key]
-    if exp_type in ('Ramsey','Rabi','SpinEcho','T1','DynamicDecoupling'):
+    if exp_type in ("Ramsey", "Rabi", "SpinEcho", "T1", "DynamicDecoupling"):
         from .units import unit_scale
-        factor=unit_scale((trace_metadata or {}).get('x_unit') or 'ns','ns')
+
+        factor = unit_scale((trace_metadata or {}).get("x_unit") or "ns", "ns")
         for key in list(metrics):
             # Metadata pulse timings already carry explicit ns; only model-derived quantities scale.
-            if key.endswith('_ns') and key not in ('pi_pulse_ns','tau_ns','rf2_duration_ns') and isinstance(metrics[key],(int,float)):
-                metrics[key]*=factor
-            elif key in ('detuning_MHz','rabi_freq_MHz') and isinstance(metrics[key],(int,float)):
-                metrics[key]/=factor
+            if (
+                key.endswith("_ns")
+                and key not in ("pi_pulse_ns", "tau_ns", "rf2_duration_ns")
+                and isinstance(metrics[key], (int, float))
+            ):
+                metrics[key] *= factor
+            elif key in ("detuning_MHz", "rabi_freq_MHz") and isinstance(metrics[key], (int, float)):
+                metrics[key] /= factor
     return metrics
 
 
@@ -349,10 +410,13 @@ def _extract_nv_metrics(exp_type: str, result: FitResult, trace_metadata: dict |
 # Result-row builder (eliminates code duplication)
 # ---------------------------------------------------------------------------
 
+
 def _fit_status(result: FitResult, profile, model_note: str = "") -> tuple[str, str]:
     """Separate optimizer/model outcomes from the fit-quality gate."""
     quality, reason = classify_status(
-        r2=result.r2, bound_hits=int(sum(result.bound_hits)), profile=profile,
+        r2=result.r2,
+        bound_hits=int(sum(result.bound_hits)),
+        profile=profile,
     )
     if not np.isfinite(result.r2) or not np.isfinite(result.rmse):
         quality, reason = "FAIL", "Nonfinite fit metrics"
@@ -425,7 +489,9 @@ def _build_result_row(
                 "message": result.message,
             },
             "params": {n: float(v) for n, v in zip(result.param_names, result.params)},
-            "covariance":result.covariance,"free_mask":result.free_mask,"uncertainty":result.uncertainty,
+            "covariance": result.covariance,
+            "free_mask": result.free_mask,
+            "uncertainty": result.uncertainty,
             "errors": {n: float(e) for n, e in zip(result.param_names, result.errors)},
             "bound_hits": {n: bool(h) for n, h in zip(result.param_names, result.bound_hits)},
             "fit_extras": dict(result.extras) if isinstance(result.extras, dict) else {},
@@ -568,6 +634,7 @@ def _build_result_row(
 # File utilities
 # ---------------------------------------------------------------------------
 
+
 def _load_mapping_file(path: Path | None) -> dict[str, dict]:
     if path is None or not path.exists():
         return {}
@@ -589,8 +656,7 @@ def _load_mapping_file(path: Path | None) -> dict[str, dict]:
     return {}
 
 
-def _write_origin_bundle(out_dir: Path, stem: str, x: np.ndarray, y: np.ndarray,
-                          y_fit: np.ndarray | None, meta: dict):
+def _write_origin_bundle(out_dir: Path, stem: str, x: np.ndarray, y: np.ndarray, y_fit: np.ndarray | None, meta: dict):
     p = out_dir / f"{stem}_origin_bundle.csv"
     with p.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -655,6 +721,7 @@ def _canonical_batch_detector(value: str) -> str:
 # Main batch loop
 # ---------------------------------------------------------------------------
 
+
 def _run_batch_locked(
     input_dir: Path,
     output_dir: Path,
@@ -678,7 +745,10 @@ def _run_batch_locked(
     detector: str = "all",
     detector_labels: dict[str, str] | None = None,
     progress_callback=None,
-    cancel_requested=None, resume_manifest=None, selected_rows=None, ui_options=None,
+    cancel_requested=None,
+    resume_manifest=None,
+    selected_rows=None,
+    ui_options=None,
 ):
     """
     Run batch fitting on all .mat files in *input_dir*.
@@ -705,7 +775,7 @@ def _run_batch_locked(
     labels = {**DETECTOR_LABELS, **(detector_labels or {})}
     output_dir.mkdir(parents=True, exist_ok=True)
     if resume_manifest is not None:
-        mat_files=[Path(source['path']) for source in resume_manifest['sources']]
+        mat_files = [Path(source["path"]) for source in resume_manifest["sources"]]
     elif single_file is not None:
         mat_files = [single_file]
     else:
@@ -713,30 +783,67 @@ def _run_batch_locked(
     if not mat_files:
         raise FileNotFoundError(f"No .mat files in {input_dir}")
 
-    options={key:value for key,value in locals().copy().items() if key in {
-        'input_dir','output_dir','mode','bin_size','smooth_window','roi_min','roi_max','single_file','metadata_file','exclude_file','plugin_file',
-        'model_override','multistart','robust','odmr_multipeak','dpi','write_origin_bundles','recursive','skip_checkpoints','detector','detector_labels'}}
-    options=json_value(options)
-    sources=[{'path':str(path.resolve()),'relative_path':_relative_batch_path(input_dir,path),'revision':fingerprint(path)} for path in mat_files]
+    options = {
+        key: value
+        for key, value in locals().copy().items()
+        if key
+        in {
+            "input_dir",
+            "output_dir",
+            "mode",
+            "bin_size",
+            "smooth_window",
+            "roi_min",
+            "roi_max",
+            "single_file",
+            "metadata_file",
+            "exclude_file",
+            "plugin_file",
+            "model_override",
+            "multistart",
+            "robust",
+            "odmr_multipeak",
+            "dpi",
+            "write_origin_bundles",
+            "recursive",
+            "skip_checkpoints",
+            "detector",
+            "detector_labels",
+        }
+    }
+    options = json_value(options)
+    sources = [
+        {
+            "path": str(path.resolve()),
+            "relative_path": _relative_batch_path(input_dir, path),
+            "revision": fingerprint(path),
+        }
+        for path in mat_files
+    ]
     summary_rows: list[dict[str, object]] = []
     validation_rows: list[dict[str, object]] = []
-    auxiliary=(resume_manifest or {}).get('auxiliary')
-    metadata_map=auxiliary['metadata'] if auxiliary is not None else _load_mapping_file(metadata_file)
-    exclude_map=auxiliary['exclude'] if auxiliary is not None else _load_mapping_file(exclude_file)
+    auxiliary = (resume_manifest or {}).get("auxiliary")
+    metadata_map = auxiliary["metadata"] if auxiliary is not None else _load_mapping_file(metadata_file)
+    exclude_map = auxiliary["exclude"] if auxiliary is not None else _load_mapping_file(exclude_file)
     custom_spec: dict | None = None
-    if auxiliary is not None: custom_spec=auxiliary.get('custom_model')
+    if auxiliary is not None:
+        custom_spec = auxiliary.get("custom_model")
     elif plugin_file is not None and plugin_file.exists():
-        custom_spec = json.loads(plugin_file.read_text(encoding='utf-8'))
+        custom_spec = json.loads(plugin_file.read_text(encoding="utf-8"))
 
     work_items: list[tuple[Path, ExperimentTrace | None, dict | None, int]] = []
-    discovery_cancelled=False
+    discovery_cancelled = False
     for mat_file in mat_files:
-        if cancel_requested and cancel_requested():discovery_cancelled=True;break
+        if cancel_requested and cancel_requested():
+            discovery_cancelled = True
+            break
         try:
-            expected=next(item['revision'] for item in sources if item['path']==str(mat_file.resolve()))
-            if fingerprint(mat_file)['sha256']!=expected['sha256']:raise ValueError('Source changed before loading')
+            expected = next(item["revision"] for item in sources if item["path"] == str(mat_file.resolve()))
+            if fingerprint(mat_file)["sha256"] != expected["sha256"]:
+                raise ValueError("Source changed before loading")
             dataset = load_experiment_dataset(mat_file, mode=mode)  # type: ignore[arg-type]
-            if fingerprint(mat_file)['sha256']!=expected['sha256']:raise ValueError('Source changed while loading')
+            if fingerprint(mat_file)["sha256"] != expected["sha256"]:
+                raise ValueError("Source changed while loading")
         except Exception as exc:
             work_items.append(
                 (
@@ -772,7 +879,11 @@ def _run_batch_locked(
                         "detector_id": detector_id,
                         "detector_label": labels.get(detector_id, DETECTOR_LABELS.get(detector_id, detector_id)),
                         "message": failure.message if failure is not None else f"{detector_id} is unavailable",
-                        "run_status": failure.run_status if failure is not None else str(dataset.metadata.get("run_status", "unavailable")),
+                        "run_status": (
+                            failure.run_status
+                            if failure is not None
+                            else str(dataset.metadata.get("run_status", "unavailable"))
+                        ),
                         "error_identifier": failure.error_identifier if failure is not None else "detector_unavailable",
                         "error_message": failure.error_message if failure is not None else "",
                         "available_channels": list(dataset.available_detectors),
@@ -781,61 +892,125 @@ def _run_batch_locked(
                 )
             )
 
-    used_stems=set(); stem_by_row={}; row_specs=[]
-    previous={r['row_id']:r for r in (resume_manifest or {}).get('rows',[])}
-    for mat_file,tr,failure,count in work_items:
-        relative=_relative_batch_path(input_dir,mat_file)
-        det=tr.detector_id if tr is not None else (failure or {}).get('detector_id','detector1')
-        key=row_id(relative,det)
-        base=_output_stem(input_dir,mat_file,recursive=recursive)
-        stem=previous.get(key,{}).get('output_stem') or _unique_stem(f'{base}__{det}' if count>1 else base,used_stems)
-        stem_by_row[(relative,det)]=stem
-        row_specs.append({'row_id':key,'source_path':str(mat_file.resolve()),'relative_path':relative,'detector_id':det,'output_stem':stem})
-    requested={row['row_id'] for row in row_specs} if selected_rows is None else set(selected_rows)
-    if (resume_manifest or {}).get('_resume_unfinished'):
-        requested-={r['row_id'] for r in resume_manifest['rows'] if r['state'] in ('completed','preserved')}
-    unknown=requested-{r['row_id'] for r in row_specs}
-    if unknown:raise ValueError(f'Unknown batch row(s): {sorted(unknown)}')
-    record=RunRecord(output_dir,options,sources,row_specs,requested,parent=resume_manifest,
-        auxiliary={'metadata':metadata_map,'exclude':exclude_map,'custom_model':custom_spec},ui_options=ui_options)
-    record.data['discovery_complete']=not discovery_cancelled;record.commit()
-    preserved_summary=[r['summary'] for r in record.data['rows'] if r['state']=='preserved' and r.get('summary')]
-    preserved_validation=[r['validation'] for r in record.data['rows'] if r['state']=='preserved' and r.get('validation')]
-    n_total=len(requested)
+    used_stems = set()
+    stem_by_row = {}
+    row_specs = []
+    previous = {r["row_id"]: r for r in (resume_manifest or {}).get("rows", [])}
+    for mat_file, tr, failure, count in work_items:
+        relative = _relative_batch_path(input_dir, mat_file)
+        det = tr.detector_id if tr is not None else (failure or {}).get("detector_id", "detector1")
+        key = row_id(relative, det)
+        base = _output_stem(input_dir, mat_file, recursive=recursive)
+        stem = previous.get(key, {}).get("output_stem") or _unique_stem(
+            f"{base}__{det}" if count > 1 else base, used_stems
+        )
+        stem_by_row[(relative, det)] = stem
+        row_specs.append(
+            {
+                "row_id": key,
+                "source_path": str(mat_file.resolve()),
+                "relative_path": relative,
+                "detector_id": det,
+                "output_stem": stem,
+            }
+        )
+    requested = {row["row_id"] for row in row_specs} if selected_rows is None else set(selected_rows)
+    if (resume_manifest or {}).get("_resume_unfinished"):
+        requested -= {r["row_id"] for r in resume_manifest["rows"] if r["state"] in ("completed", "preserved")}
+    unknown = requested - {r["row_id"] for r in row_specs}
+    if unknown:
+        raise ValueError(f"Unknown batch row(s): {sorted(unknown)}")
+    record = RunRecord(
+        output_dir,
+        options,
+        sources,
+        row_specs,
+        requested,
+        parent=resume_manifest,
+        auxiliary={"metadata": metadata_map, "exclude": exclude_map, "custom_model": custom_spec},
+        ui_options=ui_options,
+    )
+    record.data["discovery_complete"] = not discovery_cancelled
+    record.commit()
+    preserved_summary = [r["summary"] for r in record.data["rows"] if r["state"] == "preserved" and r.get("summary")]
+    preserved_validation = [
+        r["validation"] for r in record.data["rows"] if r["state"] == "preserved" and r.get("validation")
+    ]
+    n_total = len(requested)
+
     def reports():
-        committed=[r for r in record.data['rows'] if r['state'] in ('completed','preserved')]
-        _write_reports(output_dir,[r['summary'] for r in committed],[r['validation'] for r in committed])
-        _write_reports(record.folder,[r['summary'] for r in committed],[r['validation'] for r in committed])
+        committed = [r for r in record.data["rows"] if r["state"] in ("completed", "preserved")]
+        _write_reports(output_dir, [r["summary"] for r in committed], [r["validation"] for r in committed])
+        _write_reports(record.folder, [r["summary"] for r in committed], [r["validation"] for r in committed])
+
     reports()
-    def finish(rj,sr,vr,stem,mat_file,x=None,y=None,result=None):
-        key=row_id(sr['relative_path'],sr['detector_id'])
-        source=next(v for v in sources if Path(v['path']).resolve()==mat_file.resolve())
-        fields={'output_stem':stem,'run_id':record.id,'manifest_path':str(record.path),'row_id':key,
-                'source_path':str(mat_file.resolve()),'source_sha256':source['revision']['sha256']}
-        sr.update(fields);vr.update(fields);rj.update(fields)
-        rj['analysis']=result_envelope(analysis_descriptor(str(mat_file.resolve()),sr['detector_id'],mode,
-            {'bin':bin_size,'smooth':smooth_window,'roi_min':roi_min,'roi_max':roi_max}),source['revision'],options,kind='batch_fit')
+
+    def finish(rj, sr, vr, stem, mat_file, x=None, y=None, result=None):
+        key = row_id(sr["relative_path"], sr["detector_id"])
+        source = next(v for v in sources if Path(v["path"]).resolve() == mat_file.resolve())
+        fields = {
+            "output_stem": stem,
+            "run_id": record.id,
+            "manifest_path": str(record.path),
+            "row_id": key,
+            "source_path": str(mat_file.resolve()),
+            "source_sha256": source["revision"]["sha256"],
+        }
+        sr.update(fields)
+        vr.update(fields)
+        rj.update(fields)
+        rj["analysis"] = result_envelope(
+            analysis_descriptor(
+                str(mat_file.resolve()),
+                sr["detector_id"],
+                mode,
+                {"bin": bin_size, "smooth": smooth_window, "roi_min": roi_min, "roi_max": roi_max},
+            ),
+            source["revision"],
+            options,
+            kind="batch_fit",
+        )
         if result is not None:
-            rj['series']={'x':x.tolist(),'input_y':y.tolist(),'target_y':np.asarray(result.extras.get('plot_y',y)).tolist(),'y_fit':np.asarray(result.y_fit).tolist()}
-        atomic_json(output_dir/f'{stem}_result.json',rj)
-        summary_rows.append(sr);validation_rows.append(vr)
-        record.complete(key,rj,sr,vr,origin=write_origin_bundles)
+            rj["series"] = {
+                "x": x.tolist(),
+                "input_y": y.tolist(),
+                "target_y": np.asarray(result.extras.get("plot_y", y)).tolist(),
+                "y_fit": np.asarray(result.y_fit).tolist(),
+            }
+        atomic_json(output_dir / f"{stem}_result.json", rj)
+        summary_rows.append(sr)
+        validation_rows.append(vr)
+        record.complete(key, rj, sr, vr, origin=write_origin_bundles)
         reports()
-        if progress_callback:progress_callback(len(summary_rows),n_total,mat_file.name,f'{sr["status"]} | {sr["status_reason"]}')
-    state='cancelled' if discovery_cancelled else 'finished';error=None
+        if progress_callback:
+            progress_callback(len(summary_rows), n_total, mat_file.name, f'{sr["status"]} | {sr["status_reason"]}')
+
+    state = "cancelled" if discovery_cancelled else "finished"
+    error = None
     try:
-        if progress_callback:progress_callback(0,n_total,'','Run record created')
+        if progress_callback:
+            progress_callback(0, n_total, "", "Run record created")
         for file_idx, (mat_file, trace, load_failure, detector_count) in enumerate(work_items):
             relative_path = _relative_batch_path(input_dir, mat_file)
             file_meta = metadata_map.get(mat_file.name, {})
-            detector_id = trace.detector_id if trace is not None else str((load_failure or {}).get("detector_id", "detector1"))
-            detector_label = trace.detector_label if trace is not None else str((load_failure or {}).get("detector_label", labels.get(detector_id, detector_id)))
-            key=row_id(relative_path,detector_id)
-            if key not in requested:continue
-            if cancel_requested and cancel_requested():state='cancelled';break
-            expected=next(item['revision'] for item in sources if item['path']==str(mat_file.resolve()))
-            if fingerprint(mat_file)['sha256']!=expected['sha256']:raise ValueError(f'Source changed during batch: {mat_file}')
-            stem=stem_by_row[(relative_path,detector_id)]
+            detector_id = (
+                trace.detector_id if trace is not None else str((load_failure or {}).get("detector_id", "detector1"))
+            )
+            detector_label = (
+                trace.detector_label
+                if trace is not None
+                else str((load_failure or {}).get("detector_label", labels.get(detector_id, detector_id)))
+            )
+            key = row_id(relative_path, detector_id)
+            if key not in requested:
+                continue
+            if cancel_requested and cancel_requested():
+                state = "cancelled"
+                break
+            expected = next(item["revision"] for item in sources if item["path"] == str(mat_file.resolve()))
+            if fingerprint(mat_file)["sha256"] != expected["sha256"]:
+                raise ValueError(f"Source changed during batch: {mat_file}")
+            stem = stem_by_row[(relative_path, detector_id)]
 
             if load_failure is not None or trace is None:
                 trace_metadata = {
@@ -876,7 +1051,7 @@ def _run_batch_locked(
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                     json.dump(rj, f, indent=2, default=_json_default)
-                finish(rj,sr,vr,stem,mat_file)
+                finish(rj, sr, vr, stem, mat_file)
                 continue
 
             exp_type = trace.experiment_type
@@ -884,17 +1059,30 @@ def _run_batch_locked(
             excluded = str(ex.get("exclude", "false")).lower() in ("1", "true", "yes", "y")
 
             # Apply model override
+            auto_line_gaussian = False
             if model_override:
                 exp_type = model_override
-            elif (exp_type == "LineScan" and "t1" in mat_file.name.lower()
-                  and trace.scan_dim == "scan1d" and not is_stage_scan(tuple(trace.scan_axes))):
+            elif (
+                exp_type == "LineScan"
+                and "t1" in mat_file.name.lower()
+                and trace.scan_dim == "scan1d"
+                and not is_stage_scan(tuple(trace.scan_axes))
+            ):
                 # Legacy fallback for unnamed sequence scans only; a stage scan named e.g. "...AfterT1..." stays a scan.
                 exp_type = "T1"
+            elif exp_type == "LineScan" and trace.scan_dim == "scan1d" and custom_spec is None:
+                # Auto for a 1D line scan fits one Gaussian peak on a background, as in Analyze and Compare.
+                exp_type = "GaussianPeaks"
+                auto_line_gaussian = True
 
             if custom_spec is not None:
                 exp_type = "CustomModel"
 
-            profile = PROFILES["TimeTrace"] if trace.experiment_type == "TimeTrace" else PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
+            profile = (
+                PROFILES["TimeTrace"]
+                if trace.experiment_type == "TimeTrace"
+                else PROFILES.get(exp_type if exp_type in PROFILES else "LineScan")
+            )
 
             fit_png = output_dir / f"{stem}_fit.png"
             trace_metadata = dict(trace.metadata or {})
@@ -932,91 +1120,191 @@ def _run_batch_locked(
             except Exception as exc:
                 reason = f"Preprocessing failed: {type(exc).__name__}: {exc}"
                 rj, sr, vr = _build_result_row(
-                    mat_file, exp_type, profile, None, "FAIL", reason,
-                    file_meta, trace_metadata, provenance, "preprocess_error",
-                    relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                    mat_file,
+                    exp_type,
+                    profile,
+                    None,
+                    "FAIL",
+                    reason,
+                    file_meta,
+                    trace_metadata,
+                    provenance,
+                    "preprocess_error",
+                    relative_path=relative_path,
+                    scan_dim=trace.scan_dim,
+                    fit_allowed=trace.fit_allowed,
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                     json.dump(rj, f, indent=2, default=_json_default)
-                finish(rj,sr,vr,stem,mat_file)
+                finish(rj, sr, vr, stem, mat_file)
                 continue
 
-
             # --- Spatial scans: plot only, no fit ---
-            if not excluded and trace.scan_dim == "scan2d" and trace.z2d is not None and trace.x2d is not None and trace.y2d is not None:
+            if (
+                not excluded
+                and trace.scan_dim == "scan2d"
+                and trace.z2d is not None
+                and trace.x2d is not None
+                and trace.y2d is not None
+            ):
                 _plot_scan2d(
-                    fit_png, trace.x2d, trace.y2d, trace.z2d,
+                    fit_png,
+                    trace.x2d,
+                    trace.y2d,
+                    trace.z2d,
                     title=f"{mat_file.name} | {detector_label} | 2D scan",
                     x_label=(trace.scan_axes[0] if len(trace.scan_axes) > 0 else "X"),
                     y_label=(trace.scan_axes[1] if len(trace.scan_axes) > 1 else "Y"),
                     dpi=dpi,
                 )
                 rj, sr, vr = _build_result_row(
-                    mat_file, exp_type, profile, None,
-                    "PLOT_ONLY", "2D scan plotted (no fit expected)", file_meta, trace_metadata, provenance, "scan2d_plot_only",
-                    relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                    mat_file,
+                    exp_type,
+                    profile,
+                    None,
+                    "PLOT_ONLY",
+                    "2D scan plotted (no fit expected)",
+                    file_meta,
+                    trace_metadata,
+                    provenance,
+                    "scan2d_plot_only",
+                    relative_path=relative_path,
+                    scan_dim=trace.scan_dim,
+                    fit_allowed=trace.fit_allowed,
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                     json.dump(rj, f, indent=2, default=_json_default)
                 if write_origin_bundles:
-                    _write_origin_bundle(output_dir, stem, x, y, None,
-                                         {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
-                finish(rj,sr,vr,stem,mat_file)
+                    _write_origin_bundle(
+                        output_dir,
+                        stem,
+                        x,
+                        y,
+                        None,
+                        {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance},
+                    )
+                finish(rj, sr, vr, stem, mat_file)
                 continue
 
-            time_plot_only = trace.experiment_type == "TimeTrace" and (not trace.fit_allowed or (not model_override and custom_spec is None))
-            # Auto mode: 1D spatial line scans are plot-only (choose a model explicitly to fit)
-            line_scan_auto_plot = (
-                trace.scan_dim == "scan1d" and trace.experiment_type == "LineScan"
-                and exp_type == "LineScan" and not model_override and custom_spec is None
+            time_plot_only = trace.experiment_type == "TimeTrace" and (
+                not trace.fit_allowed or (not model_override and custom_spec is None)
             )
-            if not excluded and ((trace.scan_dim == "scan1d" and not trace.fit_allowed) or line_scan_auto_plot or time_plot_only):
+            # Auto maps 1D line scans to GaussianPeaks above. A scan too short for that fit (background plus
+            # amplitude, centre and width needs at least 5 points) is plotted instead of failing.
+            line_scan_auto_plot = (
+                trace.scan_dim == "scan1d"
+                and trace.experiment_type == "LineScan"
+                and exp_type == "LineScan"
+                and not model_override
+                and custom_spec is None
+            ) or (auto_line_gaussian and len(x) < 5)
+            if not excluded and (
+                (trace.scan_dim == "scan1d" and not trace.fit_allowed) or line_scan_auto_plot or time_plot_only
+            ):
                 _plot_scan1d(
-                    fit_png, x, y,
+                    fit_png,
+                    x,
+                    y,
                     title=f"{mat_file.name} | {detector_label} | {'Time trace' if time_plot_only else '1D scan'}",
                     x_label=(trace.scan_axes[0] if trace.scan_axes else trace.x_label),
-                    y_label=trace.y_label, dpi=dpi,
+                    y_label=trace.y_label,
+                    dpi=dpi,
                 )
                 rj, sr, vr = _build_result_row(
-                    mat_file, exp_type, profile, None,
-                    "PLOT_ONLY", "Time trace plotted; exponential fitting is optional" if time_plot_only else ("1D line scan plotted (no fit expected; choose GaussianPeaks to fit)" if line_scan_auto_plot else "1D scan plotted (no fit expected)"), file_meta, trace_metadata, provenance, "time_trace_plot_only" if time_plot_only else "scan1d_plot_only",
-                    relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                    mat_file,
+                    exp_type,
+                    profile,
+                    None,
+                    "PLOT_ONLY",
+                    (
+                        "Time trace plotted; exponential fitting is optional"
+                        if time_plot_only
+                        else (
+                            f"1D line scan plotted: {len(x)} points are too few for the Auto Gaussian fit (needs 5)"
+                            if auto_line_gaussian
+                            else "1D line scan plotted (LineScan override has no model; choose GaussianPeaks to fit)"
+                            if line_scan_auto_plot
+                            else "1D scan plotted (no fit expected)"
+                        )
+                    ),
+                    file_meta,
+                    trace_metadata,
+                    provenance,
+                    "time_trace_plot_only" if time_plot_only else "scan1d_plot_only",
+                    relative_path=relative_path,
+                    scan_dim=trace.scan_dim,
+                    fit_allowed=trace.fit_allowed,
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                     json.dump(rj, f, indent=2, default=_json_default)
                 if write_origin_bundles:
-                    _write_origin_bundle(output_dir, stem, x, y, None,
-                                         {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
-                finish(rj,sr,vr,stem,mat_file)
+                    _write_origin_bundle(
+                        output_dir,
+                        stem,
+                        x,
+                        y,
+                        None,
+                        {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance},
+                    )
+                finish(rj, sr, vr, stem, mat_file)
                 continue
 
             if excluded:
                 _plot_scan1d(
-                    fit_png, x, y,
+                    fit_png,
+                    x,
+                    y,
                     title=f"{mat_file.name} | {detector_label} | EXCLUDED",
-                    x_label=trace.x_label, y_label=trace.y_label, dpi=dpi,
+                    x_label=trace.x_label,
+                    y_label=trace.y_label,
+                    dpi=dpi,
                 )
                 rj, sr, vr = _build_result_row(
-                    mat_file, exp_type, profile, None,
-                    "EXCLUDED", "Excluded by exclude-file flag", file_meta, trace_metadata, provenance, "excluded_flag",
-                    relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                    mat_file,
+                    exp_type,
+                    profile,
+                    None,
+                    "EXCLUDED",
+                    "Excluded by exclude-file flag",
+                    file_meta,
+                    trace_metadata,
+                    provenance,
+                    "excluded_flag",
+                    relative_path=relative_path,
+                    scan_dim=trace.scan_dim,
+                    fit_allowed=trace.fit_allowed,
                 )
                 with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                     json.dump(rj, f, indent=2, default=_json_default)
                 if write_origin_bundles:
-                    _write_origin_bundle(output_dir, stem, x, y, None,
-                                         {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance})
-                finish(rj,sr,vr,stem,mat_file)
+                    _write_origin_bundle(
+                        output_dir,
+                        stem,
+                        x,
+                        y,
+                        None,
+                        {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance},
+                    )
+                finish(rj, sr, vr, stem, mat_file)
                 continue
 
             # --- Fitting ---
             try:
-                if trace.experiment_type == "TimeTrace" and exp_type not in {"TimeTrace", "TimeTraceDecay", "CustomModel"}:
+                if trace.experiment_type == "TimeTrace" and exp_type not in {
+                    "TimeTrace",
+                    "TimeTraceDecay",
+                    "CustomModel",
+                }:
                     raise ValueError("Elapsed-time data require TimeTraceDecay or a custom model with x in seconds.")
                 if robust:
                     result = _run_robust_fit(
-                        exp_type, x, y, n_starts=multistart,
-                        custom_spec=custom_spec, odmr_multipeak=odmr_multipeak, trace=trace,
+                        exp_type,
+                        x,
+                        y,
+                        n_starts=multistart,
+                        custom_spec=custom_spec,
+                        odmr_multipeak=odmr_multipeak,
+                        trace=trace,
                     )
                     model_note = "robust_fit"
                 elif exp_type == "Ramsey":
@@ -1025,15 +1313,22 @@ def _run_batch_locked(
                     model_note = sel.selected_by
                 else:
                     result = _fit_non_ramsey(
-                        exp_type, x, y, n_starts=multistart,
-                        custom_spec=custom_spec, odmr_multipeak=odmr_multipeak,
+                        exp_type,
+                        x,
+                        y,
+                        n_starts=multistart,
+                        custom_spec=custom_spec,
+                        odmr_multipeak=odmr_multipeak,
                         trace=trace,
                     )
                     model_note = "single_model"
             except Exception as exc:
                 try:
-                    if trace.experiment_type == "TimeTrace":
-                        raise ValueError("The selected time-trace fit failed; no spin-decay fallback is applied.") from exc
+                    if trace.experiment_type == "TimeTrace" or exp_type == "GaussianPeaks":
+                        # A spin-echo decay is no substitute for a time trace or a spatial profile.
+                        raise ValueError(
+                            "The selected fit failed; no spin-decay fallback is applied to this data type."
+                        ) from exc
                     result = _fit_non_ramsey("SpinEcho", x, y, n_starts=multistart)
                     model_note = f"fallback_after_error:{type(exc).__name__}: {exc}"
                 except Exception as fallback_exc:
@@ -1042,86 +1337,179 @@ def _run_batch_locked(
                         f"fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
                     )
                     rj, sr, vr = _build_result_row(
-                        mat_file, exp_type, profile, None, "FAIL", reason,
-                        file_meta, trace_metadata, provenance, "fit_error",
-                        relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                        mat_file,
+                        exp_type,
+                        profile,
+                        None,
+                        "FAIL",
+                        reason,
+                        file_meta,
+                        trace_metadata,
+                        provenance,
+                        "fit_error",
+                        relative_path=relative_path,
+                        scan_dim=trace.scan_dim,
+                        fit_allowed=trace.fit_allowed,
                     )
                     with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                         json.dump(rj, f, indent=2, default=_json_default)
-                    finish(rj,sr,vr,stem,mat_file)
+                    finish(rj, sr, vr, stem, mat_file)
                     continue
 
             status, reason = _fit_status(result, profile, model_note)
 
             _plot_fit(
-                fit_png, x, y, result,
+                fit_png,
+                x,
+                y,
+                result,
                 title=f"{mat_file.name} | {detector_label} | {result.model_name} | R²={result.r2:.4f}",
-                y_label=trace.y_label, status=status, reason=reason, dpi=dpi,
+                y_label=trace.y_label,
+                status=status,
+                reason=reason,
+                dpi=dpi,
             )
 
             rj, sr, vr = _build_result_row(
-                mat_file, exp_type, profile, result,
-                status, reason, file_meta, trace_metadata, provenance, model_note,
-                relative_path=relative_path, scan_dim=trace.scan_dim, fit_allowed=trace.fit_allowed,
+                mat_file,
+                exp_type,
+                profile,
+                result,
+                status,
+                reason,
+                file_meta,
+                trace_metadata,
+                provenance,
+                model_note,
+                relative_path=relative_path,
+                scan_dim=trace.scan_dim,
+                fit_allowed=trace.fit_allowed,
             )
             with (output_dir / f"{stem}_result.json").open("w", encoding="utf-8") as f:
                 json.dump(rj, f, indent=2, default=_json_default)
             if write_origin_bundles:
                 nv = _extract_nv_metrics(exp_type, result, trace_metadata)
                 _write_origin_bundle(
-                    output_dir, stem, x, np.asarray(result.extras.get('plot_y',y)), result.y_fit,
-                    {"sample_metadata": file_meta, "trace_metadata": trace_metadata, "provenance": provenance, "nv_metrics": nv, "fit_space": {k:v for k,v in result.extras.items() if k.startswith("t1_norm") or k in ("t1_prep_mode","plot_y_label")}},
+                    output_dir,
+                    stem,
+                    x,
+                    np.asarray(result.extras.get("plot_y", y)),
+                    result.y_fit,
+                    {
+                        "sample_metadata": file_meta,
+                        "trace_metadata": trace_metadata,
+                        "provenance": provenance,
+                        "nv_metrics": nv,
+                        "fit_space": {
+                            k: v
+                            for k, v in result.extras.items()
+                            if k.startswith("t1_norm") or k in ("t1_prep_mode", "plot_y_label")
+                        },
+                    },
                 )
-            finish(rj,sr,vr,stem,mat_file,x,y,result)
-
+            finish(rj, sr, vr, stem, mat_file, x, y, result)
 
     except KeyboardInterrupt:
-        state='cancelled'
+        state = "cancelled"
     except BaseException as exc:
-        state='failed';error=f'{type(exc).__name__}: {exc}'
+        state = "failed"
+        error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        record.finish(state,error)
+        record.finish(state, error)
         reports()
-    return {'state':state,'done':len(summary_rows),'total':n_total,'rows':[r['summary'] for r in record.data['rows'] if r['state'] in ('completed','preserved')],'manifest_path':str(record.path),'run_id':record.id,'unfinished_count':sum(r['state']=='pending' for r in record.data['rows']),'discovery_complete':record.data['discovery_complete']}
+    return {
+        "state": state,
+        "done": len(summary_rows),
+        "total": n_total,
+        "rows": [r["summary"] for r in record.data["rows"] if r["state"] in ("completed", "preserved")],
+        "manifest_path": str(record.path),
+        "run_id": record.id,
+        "unfinished_count": sum(r["state"] == "pending" for r in record.data["rows"]),
+        "discovery_complete": record.data["discovery_complete"],
+    }
 
 
-def run_batch(input_dir: Path,output_dir: Path,*args,**kwargs):
+def run_batch(input_dir: Path, output_dir: Path, *args, **kwargs):
     with output_lock(output_dir):
-        return _run_batch_locked(Path(input_dir),Path(output_dir),*args,**kwargs)
+        return _run_batch_locked(Path(input_dir), Path(output_dir), *args, **kwargs)
 
 
-def replay_batch(manifest_path,selected_rows=None,resume_unfinished=False,**runtime):
-    manifest=load_manifest(manifest_path)
+def replay_batch(manifest_path, selected_rows=None, resume_unfinished=False, **runtime):
+    manifest = load_manifest(manifest_path)
     if resume_unfinished:
-        completed={r['row_id'] for r in manifest['rows'] if r['state'] in ('completed','preserved')}
-        selected_rows=None if not manifest.get('discovery_complete',True) else [r['row_id'] for r in manifest['rows'] if r['row_id'] not in completed]
-    if resume_unfinished:manifest['_resume_unfinished']=True
-    options=dict(manifest['options'])
-    for key in ('input_dir','output_dir','single_file','metadata_file','exclude_file','plugin_file'):
-        if options.get(key) is not None:options[key]=Path(options[key])
-    return run_batch(**options,resume_manifest=manifest,selected_rows=selected_rows,**runtime)
+        completed = {r["row_id"] for r in manifest["rows"] if r["state"] in ("completed", "preserved")}
+        selected_rows = (
+            None
+            if not manifest.get("discovery_complete", True)
+            else [r["row_id"] for r in manifest["rows"] if r["row_id"] not in completed]
+        )
+    if resume_unfinished:
+        manifest["_resume_unfinished"] = True
+    options = dict(manifest["options"])
+    for key in ("input_dir", "output_dir", "single_file", "metadata_file", "exclude_file", "plugin_file"):
+        if options.get(key) is not None:
+            options[key] = Path(options[key])
+    return run_batch(**options, resume_manifest=manifest, selected_rows=selected_rows, **runtime)
 
 
-def _write_reports(output_dir,summary_rows,validation_rows):
+def _write_reports(output_dir, summary_rows, validation_rows):
     # --- Summary CSVs ---
     _SUMMARY_FIELDS = [
-        "file", "relative_path", "detector_id", "detector_label", "detector_count",
-        "experiment_type", "scan_family", "scan_dim", "fit_allowed",
-        "profile", "model", "r2", "rmse", "aic", "bic",
-        "durbin_watson", "bound_hits_count", "success", "status", "status_reason", "model_note",
-        "save_type", "run_status", "iteration_completion", "completed_iterations",
-        "target_iterations", "checkpoint_count", "warnings",
-        "sample_id", "condition", "power", "output_stem",
+        "file",
+        "relative_path",
+        "detector_id",
+        "detector_label",
+        "detector_count",
+        "experiment_type",
+        "scan_family",
+        "scan_dim",
+        "fit_allowed",
+        "profile",
+        "model",
+        "r2",
+        "rmse",
+        "aic",
+        "bic",
+        "durbin_watson",
+        "bound_hits_count",
+        "success",
+        "status",
+        "status_reason",
+        "model_note",
+        "save_type",
+        "run_status",
+        "iteration_completion",
+        "completed_iterations",
+        "target_iterations",
+        "checkpoint_count",
+        "warnings",
+        "sample_id",
+        "condition",
+        "power",
+        "output_stem",
     ]
-    atomic_csv(output_dir/'batch_summary.csv',_SUMMARY_FIELDS,summary_rows)
+    atomic_csv(output_dir / "batch_summary.csv", _SUMMARY_FIELDS, summary_rows)
 
     _VALIDATION_FIELDS = [
-        "file", "relative_path", "detector_id", "detector_label", "detector_count",
-        "experiment_type", "scan_family", "scan_dim", "status", "reason", "r2", "r2_min",
-        "bound_hits", "bound_hits_max", "model", "model_note",
+        "file",
+        "relative_path",
+        "detector_id",
+        "detector_label",
+        "detector_count",
+        "experiment_type",
+        "scan_family",
+        "scan_dim",
+        "status",
+        "reason",
+        "r2",
+        "r2_min",
+        "bound_hits",
+        "bound_hits_max",
+        "model",
+        "model_note",
     ]
-    atomic_csv(output_dir/'validation_report.csv',_VALIDATION_FIELDS,validation_rows)
+    atomic_csv(output_dir / "validation_report.csv", _VALIDATION_FIELDS, validation_rows)
 
     # Aggregate statistics
     agg: dict[tuple[str, str], list[float]] = {}
@@ -1134,20 +1522,34 @@ def _write_reports(output_dir,summary_rows,validation_rows):
             continue
         key = (str(row.get("experiment_type", "")), str(row.get("condition", "")))
         agg.setdefault(key, []).append(r2_val)
-    aggregate=[{'experiment_type':exp,'condition':condition,'n':len(values),'mean_r2':float(np.mean(values)),'std_r2':float(np.std(values))} for (exp,condition),values in sorted(agg.items())]
-    atomic_csv(output_dir/'aggregate_report.csv',['experiment_type','condition','n','mean_r2','std_r2'],aggregate)
+    aggregate = [
+        {
+            "experiment_type": exp,
+            "condition": condition,
+            "n": len(values),
+            "mean_r2": float(np.mean(values)),
+            "std_r2": float(np.std(values)),
+        }
+        for (exp, condition), values in sorted(agg.items())
+    ]
+    atomic_csv(
+        output_dir / "aggregate_report.csv", ["experiment_type", "condition", "n", "mean_r2", "std_r2"], aggregate
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="SmartFitter Pro batch pipeline")
     parser.add_argument("--input-dir", type=Path, default=Path("."))
     parser.add_argument("--single-file", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("./batch_out"))
-    parser.add_argument("--mode", choices=["contrast", "signal", "raw_signal", "reference", "difference"], default="contrast")
+    parser.add_argument(
+        "--mode", choices=["contrast", "signal", "raw_signal", "reference", "difference"], default="contrast"
+    )
     parser.add_argument(
         "--detector",
         choices=["all", "detector1", "detector2"],
@@ -1160,40 +1562,57 @@ def main():
     parser.add_argument("--smooth-window", type=int, default=1)
     parser.add_argument("--roi-min", type=float, default=None)
     parser.add_argument("--roi-max", type=float, default=None)
-    parser.add_argument("--metadata-file", type=Path, default=None,
-                        help="CSV/JSON mapping filename to metadata fields.")
-    parser.add_argument("--exclude-file", type=Path, default=None,
-                        help="CSV/JSON with exclude flags per filename.")
-    parser.add_argument("--plugin-file", type=Path, default=None,
-                        help="Custom model JSON spec.")
-    parser.add_argument("--model-override", type=str, default=None,
-                        choices=["Rabi", "SpinEcho", "DynamicDecoupling", "ODMR", "Ramsey", "T1", "DEERFrequency", "DEERDuration", "DEERDecay", "DEERPosition", "TimeTraceDecay"],
-                        help="Force a specific model for ALL files.")
-    parser.add_argument("--multistart", type=int, default=12,
-                        help="Number of random-seed restarts per fit (default: 12).")
-    parser.add_argument("--robust", action="store_true",
-                        help="Use subset-based robust fitting.")
-    parser.add_argument("--odmr-multipeak", action="store_true",
-                        help="Use automatic multi-Lorentzian for ODMR data.")
-    parser.add_argument("--dpi", type=int, default=180,
-                        help="Output plot resolution (default: 180).")
-    parser.add_argument("--no-origin-bundle", action="store_true",
-                        help="Skip writing per-file origin bundle CSVs.")
-    parser.add_argument("--recursive", action="store_true",
-                        help="Find .mat files recursively under --input-dir and use collision-safe output names.")
-    parser.add_argument("--skip-checkpoints", action="store_true",
-                        help="Skip files whose stem contains __checkpoint.")
-    parser.add_argument('--manifest',type=Path,help='Replay recorded sources and options; other fit flags are ignored.')
-    parser.add_argument('--row',action='append',default=None,help='Recorded row ID to rerun (repeatable).')
+    parser.add_argument(
+        "--metadata-file", type=Path, default=None, help="CSV/JSON mapping filename to metadata fields."
+    )
+    parser.add_argument("--exclude-file", type=Path, default=None, help="CSV/JSON with exclude flags per filename.")
+    parser.add_argument("--plugin-file", type=Path, default=None, help="Custom model JSON spec.")
+    parser.add_argument(
+        "--model-override",
+        type=str,
+        default=None,
+        choices=[
+            "Rabi",
+            "SpinEcho",
+            "DynamicDecoupling",
+            "ODMR",
+            "Ramsey",
+            "T1",
+            "DEERFrequency",
+            "DEERDuration",
+            "DEERDecay",
+            "DEERPosition",
+            "TimeTraceDecay",
+            "GaussianPeaks",
+        ],
+        help="Force a specific model for ALL files.",
+    )
+    parser.add_argument(
+        "--multistart", type=int, default=12, help="Number of random-seed restarts per fit (default: 12)."
+    )
+    parser.add_argument("--robust", action="store_true", help="Use subset-based robust fitting.")
+    parser.add_argument("--odmr-multipeak", action="store_true", help="Use automatic multi-Lorentzian for ODMR data.")
+    parser.add_argument("--dpi", type=int, default=180, help="Output plot resolution (default: 180).")
+    parser.add_argument("--no-origin-bundle", action="store_true", help="Skip writing per-file origin bundle CSVs.")
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Find .mat files recursively under --input-dir and use collision-safe output names.",
+    )
+    parser.add_argument("--skip-checkpoints", action="store_true", help="Skip files whose stem contains __checkpoint.")
+    parser.add_argument(
+        "--manifest", type=Path, help="Replay recorded sources and options; other fit flags are ignored."
+    )
+    parser.add_argument("--row", action="append", default=None, help="Recorded row ID to rerun (repeatable).")
     args = parser.parse_args()
 
     def _cli_progress(idx, total, name, msg):
         print(f"  [{idx}/{total}] {name}: {msg}")
 
     if args.manifest:
-        result=replay_batch(args.manifest,selected_rows=args.row,progress_callback=_cli_progress)
+        result = replay_batch(args.manifest, selected_rows=args.row, progress_callback=_cli_progress)
     else:
-        result=run_batch(
+        result = run_batch(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
             mode=args.mode,
@@ -1217,8 +1636,11 @@ def main():
             skip_checkpoints=args.skip_checkpoints,
             progress_callback=_cli_progress,
         )
-    print(f"Batch {result['state']}: {result['done']}/{result['total']} requested rows committed. Record: {result['manifest_path']}")
-    if result['state']=='cancelled':raise SystemExit(130)
+    print(
+        f"Batch {result['state']}: {result['done']}/{result['total']} requested rows committed. Record: {result['manifest_path']}"
+    )
+    if result["state"] == "cancelled":
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

@@ -103,12 +103,19 @@ def metadata_axis_value(metadata: dict | None, axis: str) -> tuple[float | None,
 
 
 def parse_file_time(path: str | Path) -> tuple[float, str]:
-    """Epoch seconds and source. Prefers ``MMDD_HHMM`` at the start of the file name, else mtime."""
+    """Epoch seconds and source. Prefers a ``YYYYMMDD_HHMMSS`` stamp in the file name, then ``MMDD_HHMM``
+    at its start, else mtime."""
     p = Path(path)
     try:
         mtime = p.stat().st_mtime
     except OSError:
         mtime = float("nan")
+    m = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})(?!\d)", p.name)
+    if m:
+        try:
+            return _dt.datetime(*(int(g) for g in m.groups())).timestamp(), "filename (YYYYMMDD_HHMMSS, local time)"
+        except ValueError:
+            pass
     m = re.match(r"^(\d{2})(\d{2})_(\d{2})(\d{2})", p.name)
     if m:
         year = _dt.datetime.fromtimestamp(mtime).year if math.isfinite(mtime) else _dt.datetime.now().year

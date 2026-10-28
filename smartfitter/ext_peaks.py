@@ -1,4 +1,5 @@
 """ODMR multi-peak "peak-pick only" (v1 parity: gui_app.py run_fit peak-pick branch). No model is fitted."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -34,18 +35,28 @@ def pick_peaks(x, y, polarity="Auto", ranges=None, prominence_frac=0.08):
             if len(local):
                 chosen.append(int(local[np.argmax(yp[local])]))
         chosen = sorted(set(chosen))
-    return {"polarity": pol, "peaks": [{"x": float(x[i]), "y": float(y[i])} for i in chosen],
-            "prominence": prominence_frac * float(np.ptp(yp))}
+    return {
+        "polarity": pol,
+        "peaks": [{"x": float(x[i]), "y": float(y[i])} for i in chosen],
+        "prominence": prominence_frac * float(np.ptp(yp)),
+    }
 
 
+@core.analysis_result
 def odmr_pick_peaks(ws, path, detector, mode, proc=None, polarity="Auto", ranges=None, smoothed=False, prominence=0.08):
     payload = core.trace_payload(ws, path, detector, mode, proc or {})
     p = payload["proc"]
     y = p.get("smooth") if smoothed and p.get("smooth") is not None else p["y"]
     nan = lambda a: [np.nan if v is None else v for v in a]
     out = pick_peaks(nan(p["x"]), nan(y), polarity, ranges, float(prominence))
-    out.update({"detector": payload.get("detector", detector), "mode": mode, "source": "smoothed" if smoothed else "processed mean",
-                "note": "Peak-pick only: detected sample positions (resolution = point spacing); no model, no uncertainties."})
+    out.update(
+        {
+            "detector": payload.get("detector", detector),
+            "mode": mode,
+            "source": "smoothed" if smoothed else "processed mean",
+            "note": "Peak-pick only: detected sample positions (resolution = point spacing); no model, no uncertainties.",
+        }
+    )
     return out
 
 

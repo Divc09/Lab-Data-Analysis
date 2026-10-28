@@ -1,3 +1,4 @@
+import { parseNumber } from './numeric.js';
 // Small DOM + formatting helpers shared by every view.
 
 // Views pass optional children (cond ? node : null) and arrays to append(); make the
@@ -133,6 +134,45 @@ export function toast(msg, kind = '', ms = 3800) {
   t._timer = setTimeout(() => t.remove(), kind === 'err' ? Math.max(ms, 8000) : ms);
 }
 
+// Persistent error tray: failed operations stay listed until dismissed, with Details (server message and
+// trace), Copy diagnostics, and Retry when the caller can redo the whole user action (not just the request).
+const errorLog = [];
+export const errors = () => errorLog.slice();
+export function reportError({ title, message, trace = '', context = null, retry = null }) {
+  const entry = { id: `${Date.now()}-${errorLog.length}`, at: new Date(), title, message, trace, context, retry };
+  const same = errorLog.find((e) => e.title === title && e.message === message);
+  if (same) { same.count = (same.count || 1) + 1; same.at = entry.at; same.retry = retry || same.retry; }
+  else errorLog.push(entry);
+  renderErrorTray();
+  return same || entry;
+}
+export function dismissError(id) {
+  const i = errorLog.findIndex((e) => e.id === id);
+  if (i >= 0) errorLog.splice(i, 1);
+  renderErrorTray();
+}
+function diagnostics(e) {
+  return [`SmartFitter error · ${e.at.toLocaleString()}`, `${e.title}: ${e.message}`,
+    e.context ? `Context: ${JSON.stringify(e.context)}` : '', e.trace ? `Trace:\n${e.trace}` : ''].filter(Boolean).join('\n');
+}
+function renderErrorTray() {
+  let tray = document.querySelector('.error-tray');
+  if (!errorLog.length) { tray?.remove(); return; }
+  if (!tray) { tray = h('div', { class: 'error-tray', role: 'region', 'aria-label': 'Errors' }); document.body.appendChild(tray); }
+  tray.replaceChildren(...errorLog.slice(-4).map((e) => {
+    const details = h('pre', { class: 'error-details', hidden: true }, diagnostics(e));
+    return h('div', { class: 'error-item', role: 'alert' },
+      h('div', { class: 'error-head' }, h('b', {}, e.title), e.count > 1 ? h('span', { class: 'dim' }, ` ×${e.count}`) : null, h('span', { class: 'sp' }),
+        h('button', { class: 'btn sm', title: 'Dismiss', 'aria-label': 'Dismiss error', onclick: () => dismissError(e.id) }, '×')),
+      h('div', { class: 'error-msg' }, e.message),
+      h('div', { class: 'row', style: 'gap:6px' },
+        e.retry ? h('button', { class: 'btn sm primary', onclick: async () => { dismissError(e.id); try { await e.retry(); } catch { /* a new entry reports it */ } } }, 'Retry') : null,
+        h('button', { class: 'btn sm', onclick: () => { details.hidden = !details.hidden; } }, 'Details'),
+        h('button', { class: 'btn sm', onclick: () => navigator.clipboard.writeText(diagnostics(e)).then(() => toast('Diagnostics copied'), () => {}) }, 'Copy')),
+      details);
+  }), errorLog.length > 4 ? h('div', { class: 'dim', style: 'font-size:11px' }, `${errorLog.length - 4} earlier error(s) hidden`) : '');
+}
+
 export function modal(content, { onClose, className = '' } = {}) {
   const back = h('div', { class: 'modal-back' });
   const box = h('div', { class: `modal ${className}` });
@@ -171,9 +211,26 @@ export function select(options, value, onChange, props = {}) {
 }
 
 // text/number input committing on Enter or blur (keeps focus stable during re-renders)
+// props.numeric validates the text before committing (see parseNumber); props.unit is the field's native unit,
+// so a compatible typed unit is converted. Invalid text stays visible with an inline error and is not applied.
 export function input(value, onCommit, props = {}) {
-  const el = h('input', { class: 'field', value: value ?? '', ...props });
-  const commit = () => { if (el.value !== String(value ?? '')) onCommit(el.value); };
+  const { numeric, unit, ...rest } = props;
+  const el = h('input', { class: 'field', value: value ?? '', ...rest });
+  // Enter commits and then blurs; remembering the committed text stops the blur from committing it a second time.
+  let committed = String(value ?? '');
+  const commit = () => {
+    if (el.value === committed) return;
+    if (!numeric) { committed = el.value; onCommit(el.value); return; }
+    const r = parseNumber(el.value, unit);
+    el.classList.toggle('invalid', !!r.error);
+    el.setAttribute('aria-invalid', r.error ? 'true' : 'false');
+    el.setCustomValidity(r.error || '');
+    if (r.error) { el.title = r.error; el.reportValidity(); return; }
+    if (r.note) { toast(r.note); el.value = String(r.value); } // show the native value that was applied
+    committed = el.value;
+    onCommit(r.value === null ? '' : String(r.value));
+  };
+  el.addEventListener('input', () => { if (el.classList.contains('invalid')) { el.classList.remove('invalid'); el.setCustomValidity(''); } });
   el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); commit(); el.blur(); } e.stopPropagation(); });
   el.addEventListener('blur', commit);
   return el;
@@ -210,7 +267,8 @@ export function linreg(xs, ys) {
   const n = xs.length; if (n < 2) return null;
   const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
   let sxy = 0, sxx = 0; for (let i = 0; i < n; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; }
-  const slope = sxx ? sxy / sxx : 0; const icpt = my - slope * mx;
+  if (!sxx) return null; // identical x values define no slope (not a zero drift)
+  const slope = sxy / sxx; const icpt = my - slope * mx;
   let ss = 0; for (let i = 0; i < n; i++) ss += (ys[i] - (icpt + slope * xs[i])) ** 2;
   const se = n > 2 && sxx ? Math.sqrt(ss / (n - 2) / sxx) : null;
   return { slope, intercept: icpt, slope_err: se };

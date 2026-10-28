@@ -1,4 +1,5 @@
 """Shared, serializable application state for SmartFitter."""
+
 from __future__ import annotations
 
 import hashlib
@@ -41,24 +42,28 @@ def state_signature(payload: dict[str, Any]) -> str:
 def fit_result_to_dict(result: FitResult | None) -> dict[str, Any] | None:
     if result is None:
         return None
-    return json_safe({
-        "model_name": result.model_name,
-        "param_names": result.param_names,
-        "params": result.params,
-        "errors": result.errors,
-        "y_fit": result.y_fit,
-        "r2": result.r2,
-        "rmse": result.rmse,
-        "aic": result.aic,
-        "bic": result.bic,
-        "durbin_watson": result.durbin_watson,
-        "bound_hits": result.bound_hits,
-        "success": result.success,
-        "message": result.message,
-        "selection_note": result.selection_note,
-        "extras": result.extras,
-        "covariance": result.covariance, "free_mask": result.free_mask, "uncertainty": result.uncertainty,
-    })
+    return json_safe(
+        {
+            "model_name": result.model_name,
+            "param_names": result.param_names,
+            "params": result.params,
+            "errors": result.errors,
+            "y_fit": result.y_fit,
+            "r2": result.r2,
+            "rmse": result.rmse,
+            "aic": result.aic,
+            "bic": result.bic,
+            "durbin_watson": result.durbin_watson,
+            "bound_hits": result.bound_hits,
+            "success": result.success,
+            "message": result.message,
+            "selection_note": result.selection_note,
+            "extras": result.extras,
+            "covariance": result.covariance,
+            "free_mask": result.free_mask,
+            "uncertainty": result.uncertainty,
+        }
+    )
 
 
 def fit_result_from_dict(value: dict[str, Any] | None) -> FitResult | None:
@@ -80,8 +85,9 @@ def fit_result_from_dict(value: dict[str, Any] | None) -> FitResult | None:
         message=str(value.get("message", "")),
         selection_note=str(value.get("selection_note", "")),
         extras=dict(value.get("extras") or {}),
-        covariance=np.asarray(value['covariance'], float) if value.get('covariance') is not None else None,
-        free_mask=value.get('free_mask'), uncertainty=dict(value.get('uncertainty') or {}),
+        covariance=np.asarray(value["covariance"], float) if value.get("covariance") is not None else None,
+        free_mask=value.get("free_mask"),
+        uncertainty=dict(value.get("uncertainty") or {}),
     )
 
 

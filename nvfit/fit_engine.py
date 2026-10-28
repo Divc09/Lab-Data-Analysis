@@ -34,17 +34,42 @@ class FitResult:
     model_func: Callable | None = field(default=None, repr=False, compare=False)
 
 
-_controls = ContextVar('fit_parameter_controls', default=None)
+class UnderdeterminedFitError(ValueError):
+    """The data cannot identify the model's free parameters (raised before optimizing)."""
 
 
-def current_parameter_controls():
-    return _controls.get()
+def check_fit_readiness(model_name: str, x, n_free: int) -> None:
+    """Fail early, with a fixable explanation, when a fit cannot be identified by the data.
+
+    Fewer finite points (or distinct x values) than free parameters leaves the model unidentifiable.
+    Exactly as many is a saturated fit: it runs, but parameter errors are reported as unavailable.
+    """
+    x = np.asarray(x, dtype=float)
+    n_points = int(np.count_nonzero(np.isfinite(x)))
+    n_distinct = int(np.unique(x[np.isfinite(x)]).size)
+    hint = "widen the fit range, reduce binning, lock parameters, or choose a simpler model"
+    if n_points < n_free:
+        raise UnderdeterminedFitError(f"{n_points} points can't identify {n_free} free parameters of {model_name}; {hint}.")
+    if n_distinct < n_free:
+        raise UnderdeterminedFitError(
+            f"{n_distinct} distinct x values can't identify {n_free} free parameters of {model_name}; {hint}."
+        )
+
+
+_controls = ContextVar("fit_parameter_controls", default=None)
+
+
+def current_parameter_controls(model_name):
+    scope = _controls.get()
+    if scope is None or scope[0] != model_name:
+        return None
+    return scope[1]
 
 
 @contextmanager
-def parameter_controls(controls):
-    """One prepared request's controls, including nested model-selection fits."""
-    token = _controls.set(controls)
+def parameter_controls(controls, *, model_name):
+    """Apply controls only to the named model, never to nested/fallback models."""
+    token = _controls.set((model_name, controls))
     try:
         yield
     finally:
@@ -56,11 +81,14 @@ def apply_parameter_controls(names, lower, upper, seed, controls):
         if not controls or name not in controls:
             continue
         value, locked, lo, hi = controls[name]
-        if lo is not None: lower[i] = lo
-        if hi is not None: upper[i] = hi
+        if lo is not None:
+            lower[i] = lo
+        if hi is not None:
+            upper[i] = hi
         if value is not None and np.isfinite(value):
             seed[i] = value
-            if locked: lower[i] = upper[i] = value
+            if locked:
+                lower[i] = upper[i] = value
 
 
 def _estimate_covariance(jac: np.ndarray, cost: float, dof: int) -> np.ndarray:
@@ -147,16 +175,17 @@ def fit_model_multistart(
     upper_arr = np.asarray(list(upper), dtype=float)
     seeds = [np.asarray(seed, dtype=float).copy() for seed in seeds]
     if not seeds:
-        raise ValueError('At least one optimizer start is required.')
-    apply_parameter_controls(param_names, lower_arr, upper_arr, seeds[0], _controls.get())
+        raise ValueError("At least one optimizer start is required.")
+    apply_parameter_controls(param_names, lower_arr, upper_arr, seeds[0], current_parameter_controls(model_name))
     if np.any(upper_arr < lower_arr):
-        raise ValueError('Parameter bounds are reversed; lower must not exceed upper.')
+        raise ValueError("Parameter bounds are reversed; lower must not exceed upper.")
     # A locked parameter arrives as lower == upper.  least_squares needs a strictly positive
     # interval, so optimize only the free parameters and re-insert the fixed values.
     fixed = upper_arr == lower_arr
     free = ~fixed
     if not np.any(free):
         raise ValueError("All fit parameters are locked; unlock at least one parameter to fit.")
+    check_fit_readiness(model_name, x, int(np.count_nonzero(free)))
     fixed_vals = lower_arr.copy()
 
     def full(p_free: np.ndarray) -> np.ndarray:
@@ -243,9 +272,15 @@ def fit_model_multistart(
         message=message,
         selection_note=selection_note,
         extras={"fixed_params": [n for n, f in zip(param_names, fixed) if f]} if np.any(fixed) else {},
-        covariance=covariance, free_mask=free.tolist(), model_func=model_func,
-        uncertainty={"method": "optimizer Jacobian; relative residual scale", "loss": loss,
-                     "weighted": weighted, "dof": dof, "n_observations": len(y),
-                     "band": "1-sigma model-mean confidence; excludes prediction noise"},
+        covariance=covariance,
+        free_mask=free.tolist(),
+        model_func=model_func,
+        uncertainty={
+            "method": "optimizer Jacobian; relative residual scale",
+            "loss": loss,
+            "weighted": weighted,
+            "dof": dof,
+            "n_observations": len(y),
+            "band": "1-sigma model-mean confidence; excludes prediction noise",
+        },
     )
-

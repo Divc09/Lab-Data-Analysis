@@ -17,22 +17,51 @@ export const copyCompareOverlay = () => renderImage({ data: overlayEl.data, layo
 const C = () => S.compare;
 const itemPath = (id) => compareFile(id)?.path || id;
 const itemLabel = (id) => {
-  const f=compareFile(id);if(!f)return basename(id);
-  const duplicates=C().set.filter(key=>{const o=compareFile(key);return o?.path===f.path && o.detector===f.detector && o.mode===f.mode;}).length>1;
-  const p=f.proc || {},detail=duplicates?` [bin ${p.bin || 1}, smooth ${p.smooth || 1}${p.excluded?.length?`, ${p.excluded.length} excluded`:''}${p.baseline?.path?', baseline':''}${p.steps?.length?`, ${p.steps.length} steps`:''}]`:'';
-  return `${basename(f.path).replace(/\.mat$/i,'')} · ${detLabel(f,f.detector)} · ${MODE_LABEL[f.mode] || f.mode}${detail}`;
+  const f = compareFile(id);
+  if (!f) return basename(id);
+  const duplicates =
+    C().set.filter((key) => {
+      const o = compareFile(key);
+      return o?.path === f.path && o.detector === f.detector && o.mode === f.mode;
+    }).length > 1;
+  const p = f.proc || {},
+    detail = duplicates
+      ? ` [bin ${p.bin || 1}, smooth ${p.smooth || 1}${p.excluded?.length ? `, ${p.excluded.length} excluded` : ''}${p.baseline?.path ? ', baseline' : ''}${p.steps?.length ? `, ${p.steps.length} steps` : ''}]`
+      : '';
+  return `${basename(f.path).replace(/\.mat$/i, '')} · ${detLabel(f, f.detector)} · ${MODE_LABEL[f.mode] || f.mode}${detail}`;
 };
-const overlayLabel=(id)=>{
-  const f=compareFile(id);if(!f)return itemLabel(id);
-  const name=basename(f.path).replace(/\.mat$/i,'');
-  const variant=C().set.filter(key=>{const o=compareFile(key);return o?.path===f.path && o.detector===f.detector && o.mode===f.mode;}).length>1;
-  return `${name.length>22?name.slice(0,20)+'…':name} · ${detLabel(f,f.detector).replace(/^Detector /,'D')} · ${MODE_LABEL[f.mode] || f.mode}${variant?` · b${f.proc?.bin || 1}/s${f.proc?.smooth || 1}`:''}`;
+const overlayLabel = (id) => {
+  const f = compareFile(id);
+  if (!f) return itemLabel(id);
+  const name = basename(f.path).replace(/\.mat$/i, '');
+  const variant =
+    C().set.filter((key) => {
+      const o = compareFile(key);
+      return o?.path === f.path && o.detector === f.detector && o.mode === f.mode;
+    }).length > 1;
+  return `${name.length > 22 ? name.slice(0, 20) + '…' : name} · ${detLabel(f, f.detector).replace(/^Detector /, 'D')} · ${MODE_LABEL[f.mode] || f.mode}${variant ? ` · b${f.proc?.bin || 1}/s${f.proc?.smooth || 1}` : ''}`;
 };
 
-const compareSpec = (f) => C().spec?.model === 'useOwn' ? clone(f.fitSpec) : {...clone(f.fitSpec),model:C().spec?.model || 'Auto',peaks:C().spec?.peaks || 1,range_min:C().spec?.range_min ?? null,range_max:C().spec?.range_max ?? null};
-const freshResult = (id) => { const f=compareFile(id),r=C().results[id]; return f && resultFreshness(f,r,f.detector,{...compareSpec(f),robust:!!r?.analysis?.settings?.robust}).fresh ? r : null; };
-const compareSignature = (id) => { const f=compareFile(id); return f ? envelopeFor(f,f.detector,compareSpec(f)).signature : ''; };
-const gfSignature = () => JSON.stringify(visibleSet().map(id=>compareSignature(id)));
+const compareSpec = (f) =>
+  C().spec?.model === 'useOwn'
+    ? clone(f.fitSpec)
+    : {
+        ...clone(f.fitSpec),
+        model: C().spec?.model || 'Auto',
+        peaks: C().spec?.peaks || 1,
+        range_min: C().spec?.range_min ?? null,
+        range_max: C().spec?.range_max ?? null,
+      };
+const freshResult = (id) => {
+  const f = compareFile(id),
+    r = C().results[id];
+  return f && resultFreshness(f, r, f.detector, { ...compareSpec(f), robust: !!r?.analysis?.settings?.robust }).fresh ? r : null;
+};
+const compareSignature = (id) => {
+  const f = compareFile(id);
+  return f ? envelopeFor(f, f.detector, compareSpec(f)).signature : '';
+};
+const gfSignature = () => JSON.stringify(visibleSet().map((id) => compareSignature(id)));
 
 
 const GF_MODELS = {
@@ -96,7 +125,28 @@ function xValue(path, i) {
     return m ? Number(m[1].replace('_', '.')) : NaN;
   }
   if (c.against === 'meta') { const v = Number((compareFile(path)?.info.metadata || {})[c.metaKey]); return Number.isFinite(v) ? v : NaN; }
-  return (info.mtime || 0) * 1000; // acquisition (file save) time
+  return fileTime(path).ms;
+}
+
+// The .mat files store no acquisition timestamp. Prefer the YYYYMMDD_HHMMSS stamp in the file name (local
+// time the run was named), else the file modification (save) time, which copies and checkpoints change.
+// A missing time stays NaN (the point is left out) instead of becoming the 1970 epoch.
+export function fileTime(path) {
+  const m = basename(itemPath(path)).match(/(?:^|[^\d])(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})(?!\d)/);
+  if (m) {
+    const [y, mo, d, hh, mi, ss] = m.slice(1).map(Number);
+    const t = new Date(y, mo - 1, d, hh, mi, ss);
+    if (t.getMonth() === mo - 1 && t.getDate() === d && hh < 24 && mi < 60 && ss < 60) return { ms: t.getTime(), source: 'name' };
+  }
+  const info = S.library.peeks[itemPath(path)] || compareFile(path)?.info || {};
+  return Number.isFinite(info.mtime) && info.mtime > 0 ? { ms: info.mtime * 1000, source: 'mtime' } : { ms: NaN, source: 'missing' };
+}
+
+function timeAxisTitle(paths) {
+  const sources = new Set(paths.map((p) => fileTime(p).source).filter((s) => s !== 'missing'));
+  if (sources.size === 1 && sources.has('name')) return 'Time from file name (local)';
+  if (sources.size === 1) return 'File save time (modification time, local)';
+  return 'Time (file name where present, else save time; local)';
 }
 
 export function renderCompare(root) {
@@ -152,21 +202,26 @@ export function renderCompare(root) {
         h('div', { class: 'note' }, 'Or use Add files, right-click files in the Library ("Add to Compare set"), or send Batch results here.'));
     })());
 
+  // View: both figures (Split) or one of them using the whole area. Hidden figures stay mounted and redraw on show.
+  const view = c.view || 'split', showOverlay = view !== 'trend', showTrend = view !== 'overlay';
+  const shown = (on) => (on ? '' : 'display:none');
   const main = h('main', { class: 'main' },
-    h('div', { class: 'row wrap' }, h('h1', { style: 'margin:0;font-size:17px;font-weight:600;margin-right:auto' }, 'Overlay'),
+    h('div', { class: 'row wrap' }, h('span', { class: 'lbl' }, 'View'),
+      seg([['split', 'Split'], ['overlay', 'Overlay'], ['trend', 'Trend']], view, (v) => { c.view = v; emit(); })),
+    h('div', { class: 'row wrap', style: shown(showOverlay) }, h('h1', { style: 'margin:0;font-size:17px;font-weight:600;margin-right:auto' }, 'Overlay'),
       h('span', { class: 'lbl' }, 'Normalize'), seg([['none', 'None'], ['max', 'To max'], ['minmax', 'Min–max'], ['area', 'Area']], c.norm, (v) => { c.norm = v; emit(); }),
       h('span', { class: 'lbl' }, 'Align'), seg([['none', 'None'], ['peak', 'Peak'], ['fit', 'Fit center']], c.align, (v) => { c.align = v; emit(); }),
       h('span', { class: 'lbl' }, 'Layout'), seg([['overlaid', 'Overlaid'], ['waterfall', 'Waterfall'], ['grid', 'Grid']], c.layout, (v) => { c.layout = v; emit(); }),
       h('button', { class: 'btn', onclick: () => renderImage({ data: overlayEl.data, layout: overlayEl.layout }, { width_in: 8.5, height_in: 5, dpi: 300 }).then(copyImage) }, 'Copy')),
-    h('section', { class: 'plotcard', style: 'flex:1.2;min-height:300px' }, overlayEl),
-    alignNoteEl,
-    h('div', { class: 'row wrap' }, h('h2', { style: 'margin:0;font-size:15px;font-weight:600;margin-right:auto' }, 'Trend across files'),
+    h('section', { class: 'plotcard', style: `flex:1.2;min-height:300px;${shown(showOverlay)}` }, overlayEl),
+    alignNoteEl, // also carries trend-unit warnings, so it stays visible in every view
+    h('div', { class: 'row wrap', style: shown(showTrend) }, h('h2', { style: 'margin:0;font-size:15px;font-weight:600;margin-right:auto' }, 'Trend across files'),
       h('span', { class: 'lbl' }, 'Plot'), select(keys.length ? keys : [['', 'Fit files first']], c.param, (v) => { c.param = v; c.sel = null; emit(); }, { style: 'width:190px' }),
-      h('span', { class: 'lbl' }, 'Against'), select([['time', 'Acquisition time'], ['order', 'File order'], ['name', 'Number in file name'], ['meta', 'Saved parameter']], c.against, (v) => { c.against = v; emit(); }, { style: 'width:170px' }),
+      h('span', { class: 'lbl' }, 'Against'), select([['time', 'Time (file name / save time)'], ['order', 'File order'], ['name', 'Number in file name'], ['meta', 'Saved parameter']], c.against, (v) => { c.against = v; emit(); }, { style: 'width:170px' }),
       c.against === 'name' ? input(c.namePrefix || '', (v) => { c.namePrefix = v; emit(); }, { placeholder: 'prefix, e.g. Z', style: 'width:110px' }) : null,
       c.against === 'meta' ? select(Object.keys(compareFile(set[0])?.info.metadata || {}), c.metaKey, (v) => { c.metaKey = v; emit(); }, { style: 'width:160px' }) : null,
       h('button', { class: 'btn', onclick: () => renderImage({ data: trendEl.data, layout: trendEl.layout }, { width_in: 6, height_in: 3.6, dpi: 300 }).then(copyImage) }, 'Copy')),
-    h('section', { class: 'plotcard', style: 'flex:1;min-height:240px' }, trendEl));
+    h('section', { class: 'plotcard', style: `flex:1;min-height:240px;${shown(showTrend)}` }, trendEl));
 
   // Trend values in display units (e.g. T1 in µs/ms, not raw ns); plot, table, regression and CSV all use them.
   const trendUnit = trendNativeUnit(fitted,c.param);
@@ -184,7 +239,7 @@ export function renderCompare(root) {
     h('div', { class: 'card pad', style: 'display:flex;flex-direction:column;gap:8px' },
       field('Model', select([['Auto', 'Auto (each file\'s type)'], ['GaussianPeaks', 'Gaussian peaks'], ['useOwn', 'Each file\'s own Fit settings']], c.spec.model, (v) => { c.spec.model = v; emit(); })),
       c.spec.model === 'GaussianPeaks' ? field('Peaks', select([1, 2, 3, 4], c.spec.peaks, (v) => { c.spec.peaks = Number(v); emit(); })) : null,
-      h('div', { class: 'g2' }, field('Range from', input(c.spec.range_min ?? '', (v) => { c.spec.range_min = num(v); }, { placeholder: 'all' })), field('to', input(c.spec.range_max ?? '', (v) => { c.spec.range_max = num(v); }, { placeholder: 'all' }))),
+      h('div', { class: 'g2' }, field('Range from', input(c.spec.range_min ?? '', (v) => { c.spec.range_min = num(v); }, { numeric: true, placeholder: 'all' })), field('to', input(c.spec.range_max ?? '', (v) => { c.spec.range_max = num(v); }, { numeric: true, placeholder: 'all' }))),
       h('div', { class: 'note' }, c.spec.model==='useOwn' ? 'Each analysis keeps its captured or current Fit settings and processing.' : 'Model and range apply to the set; each analysis keeps its own detector and processing.'),
       h('button', { class: 'btn primary block', disabled: !set.length || c.fitting, onclick: fitAll }, c.fitting ? `Fitting ${c.fitting}` : `Fit / refit ${set.length} analyses`)),
     globalCard(),
@@ -365,7 +420,7 @@ function drawTrend(pts, reg) {
     data.push({ type: 'scatter', mode: 'lines', x: isTime ? [new Date(lo), new Date(hi)] : [lo, hi], y: [reg.intercept + reg.slope * lo, reg.intercept + reg.slope * hi], line: { color: '#7A4FD6', dash: 'dash', width: 1.4 }, name: 'linear trend', hoverinfo: 'skip' });
   }
   const layout = { separators: '.', margin: { l: 70, r: 16, t: 10, b: 50 }, font: { family: 'Arial', size: 12 }, showlegend: false,
-    xaxis: { title: { text: { time: 'Acquisition time', order: 'File order', name: `Value in file name${c.namePrefix ? ` (${c.namePrefix})` : ''}`, meta: c.metaKey || 'Saved parameter' }[c.against] }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', type: isTime ? 'date' : 'linear' },
+    xaxis: { title: { text: { time: timeAxisTitle(pts.map((q) => q.p)), order: 'File order', name: `Value in file name${c.namePrefix ? ` (${c.namePrefix})` : ''}`, meta: c.metaKey || 'Saved parameter' }[c.against] }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', type: isTime ? 'date' : 'linear' },
     yaxis: { title: { text: trendLabel() }, showline: true, mirror: true, ticks: 'outside', showgrid: true, gridcolor: '#ECEEF2', exponentformat: 'none' } };
   Plotly.react(trendEl, data, layout, { responsive: true, displayModeBar: false, edits: { axisTitleText: true } });
   trendEl._points = pts;
