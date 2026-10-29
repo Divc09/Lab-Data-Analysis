@@ -31,7 +31,7 @@ def _existing_instance() -> int | None:
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/ping",
             data=b"{}",
-            headers={"Content-Type": "application/json", "X-SmartFitter-Token": record["token"]},
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         if not json.loads(urllib.request.urlopen(request, timeout=0.7).read()).get("ok"):
@@ -48,7 +48,7 @@ def _post(port: int, name: str, payload: dict) -> None:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/{name}",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "X-SmartFitter-Token": record["token"]},
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
     urllib.request.urlopen(req, timeout=3).read()
@@ -84,7 +84,7 @@ def main() -> None:
     api.pending_open = files
     server = serve(api, args.port)
     port = server.server_address[1]
-    url = f"http://127.0.0.1:{port}/#token={api.token}"
+    url = f"http://127.0.0.1:{port}/"
     core.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.serve or args.browser:
@@ -97,7 +97,7 @@ def main() -> None:
             pass
         return
 
-    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid(), "token": api.token}))
+    LOCK.write_text(json.dumps({"port": port, "pid": os.getpid()}))
     try:
         import webview
 

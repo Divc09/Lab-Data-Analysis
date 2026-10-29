@@ -11,8 +11,6 @@ import sys
 import tempfile
 import threading
 import traceback
-import secrets
-import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -42,7 +40,6 @@ class Api:
         self.window = None  # pywebview window when running as a desktop app
         self.pending_open: list[str] = []
         self.session_lock = threading.Lock()
-        self.token = secrets.token_urlsafe(32)
 
     @core.plain_endpoint
     def ping(self) -> dict:
@@ -473,8 +470,6 @@ def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
             origin = self.headers.get("Origin")
             if origin and origin not in allowed:
                 return self._reject(403, "Forbidden Origin")
-            if not hmac.compare_digest(self.headers.get("X-SmartFitter-Token", ""), api.token):
-                return self._reject(403, "Session token missing or invalid. Open SmartFitter from its launcher.")
             if self.headers.get("Transfer-Encoding"):
                 return self._reject(400, "Transfer-Encoding is not supported; send a bounded JSON body.")
             lengths = self.headers.get_all("Content-Length", [])
