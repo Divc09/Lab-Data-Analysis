@@ -346,6 +346,11 @@ body.resizing { cursor: col-resize; user-select: none; }
 .chip-s.ok { background: var(--okBg); color: var(--ok); } .chip-s.warn { background: var(--warnBg); color: var(--warn); }
 .chip-s.bad { background: var(--badBg); color: var(--bad); }
 .frow.cp-child { margin-left: 18px; border-left: 1px solid var(--line2); opacity: .85; }
+.frow.rh-group { gap: 4px; }
+.frow.rh-group .rh-caret { width: 18px; height: 18px; font-size: 11px; color: var(--text3); }
+.modal.rh-modal { width: min(1180px, 94vw); max-height: 86vh; overflow: auto; margin-top: -5vh; }
+.rh-plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+.rh-plot { height: min(460px, 60vh); }
 
 /* Always-visible identity of the shown result, above the inspector tabs. */
 .result-head { padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; font-size: 12px; min-width: 0; }

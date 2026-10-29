@@ -484,7 +484,38 @@ def list_dir(path: str) -> dict:
         except OSError:
             continue
     parent = str(root.parent) if root.parent != root else None
-    return {"path": str(root), "name": root.name or str(root), "parent": parent, "folders": folders, "files": files}
+    groups = [g for g in (_rehone_group(d["path"], d["name"]) for d in folders if d["name"].lower().startswith("rehone")) if g]
+    return {"path": str(root), "name": root.name or str(root), "parent": parent, "folders": folders, "files": files, "groups": groups}
+
+
+def _rehone_group(path: str, name: str) -> dict | None:
+    """A Rehone_* run folder (autoFindRehone.m): its scans in order plus the RH_*_log.mat result, if readable."""
+    scans, log = [], None
+    try:
+        for entry in os.scandir(path):
+            if not entry.is_file() or not entry.name.lower().endswith(".mat"):
+                continue
+            if entry.name.lower().endswith("_log.mat"):
+                log = entry.path
+                continue
+            st = entry.stat()
+            scans.append({"name": entry.name, "path": entry.path, "mtime": st.st_mtime, "size": st.st_size})
+    except OSError:
+        return None
+    if not scans:
+        return None
+    scans.sort(key=lambda f: f["name"].lower())
+    result = None
+    if log:
+        try:
+            from nvfit.autofind import read_mat
+
+            d = read_mat(log, ["start", "final", "moved", "why"])
+            vec = lambda v: [float(x) for x in np.ravel(v)] if v is not None and np.size(v) == 3 else None
+            result = {"start": vec(d.get("start")), "final": vec(d.get("final")), "moved": vec(d.get("moved")), "why": str(d.get("why") or "")}
+        except Exception:
+            result = None
+    return {"kind": "rehone", "name": name, "path": path, "start": min(f["mtime"] for f in scans), "end": max(f["mtime"] for f in scans), "files": scans, "log": log, "result": result}
 
 
 # ---------------------------------------------------------------------------

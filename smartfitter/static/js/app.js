@@ -2,7 +2,7 @@
 import { call, onBusy } from './api.js';
 import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile, isDirty, markClean } from './state.js';
 import { h, mount, icon, toast, modal, contextMenu, fmt, fmtTime, fmtDate, basename, dirname, tag, debounce } from './util.js';
-import { renderAnalyze, renderInspector, runFit, runFitScoped, saveResults, copyFigure, resetView, ALT_TABS, kindOf } from './analyze.js';
+import { renderAnalyze, renderInspector, runFit, runFitScoped, saveResults, copyFigure, resetView, ALT_TABS, kindOf, currentFigure } from './analyze.js';
 import { renderCompare, hasCompareTrend, hasCompareOverlay, saveCompareTrend, copyCompareOverlay } from './compare.js';
 import { renderFigure, exportFigure } from './figure.js';
 import { renderBatch, saveBatchSummary, copyBatchSummary } from './batch.js';
@@ -171,9 +171,10 @@ export async function openFolder(path, { remember = true } = {}) {
   if (!S.library.seen[listing.path]) listing.files.forEach((f) => { seen[f.path] = f.mtime; });
   S.library.seen[listing.path] = seen;
   if (remember) { S.settings = await call('remember', { kind: 'recent_folders', path: listing.path }); call('settings_set', { patch: { last_dir: listing.path } }, { quiet: true }); }
-  requestPeeks(listing.files.map((f) => f.path));
+  requestPeeks([...listing.files, ...groupFiles(listing)].map((f) => f.path));
   emit();
 }
+const groupFiles = (listing) => (listing?.groups || []).flatMap((g) => g.files);
 
 const peekQueue = new Set();
 const flushPeeks = debounce(async () => {
@@ -223,7 +224,7 @@ function statusChips(p, info, f, checkpointOf) {
   return chips.map(([kind, text, title]) => h('span', { class: `chip-s ${kind}`, title }, text));
 }
 
-function fileRow(p, meta, { checkpointOf = null } = {}) {
+function fileRow(p, meta, { checkpointOf = null, child = false } = {}) {
   const info = S.files[p]?.info || S.library.peeks[p] || {};
   const f = S.files[p];
   const isPrimary = S.primary === p && S.view === 'analyze';
@@ -239,7 +240,7 @@ function fileRow(p, meta, { checkpointOf = null } = {}) {
   if (info.error) sub.push('unreadable');
   const chips = statusChips(p, info, f, checkpointOf);
   return h('div', {
-    class: `frow ${isPrimary ? 'sel primary' : ''} ${libSelected.has(p) ? 'multi-sel' : ''} ${newer ? 'newfile' : ''} ${checkpointOf ? 'cp-child' : ''}`, title: info.error ? `${p}\n${info.error}` : `${p}\nClick to open · Ctrl/Shift-click to select for comparison`, 'data-path': p, tabindex: 0,
+    class: `frow ${isPrimary ? 'sel primary' : ''} ${libSelected.has(p) ? 'multi-sel' : ''} ${newer ? 'newfile' : ''} ${checkpointOf || child ? 'cp-child' : ''}`, title: info.error ? `${p}\n${info.error}` : `${p}\nClick to open · Ctrl/Shift-click to select for comparison`, 'data-path': p, tabindex: 0,
     onfocus: () => { libFocus = p; },
     // Drag onto the plot (compare), the Compare set or the Figure composer; a multi-selection drags together.
     draggable: 'true',
@@ -341,8 +342,8 @@ let libScroll = 0;
 const libScrolls = {}, libSelected = new Set();
 let libAnchor = null, libFocus = null;
 const saveLibraryPrefs = debounce(() => {
-  const { filter, chip, sort, type, foldersHeight } = S.library;
-  S.settings.library_nav = { filter, chip, sort, type, foldersHeight };
+  const { filter, chip, sort, type, foldersHeight, mergeRehone } = S.library;
+  S.settings.library_nav = { filter, chip, sort, type, foldersHeight, mergeRehone };
   call('settings_set', { patch: { library_nav: S.settings.library_nav } }, { quiet: true }).catch(() => {});
 }, 200);
 
@@ -358,7 +359,7 @@ function selectLibraryFile(p, e) {
 function libraryKeys(e) {
   if (e.altKey || e.ctrlKey || e.metaKey || e.target.type === 'checkbox') return;
   const rows = [...els.libList.querySelectorAll('.frow')];
-  const i = rows.findIndex((r) => r.dataset.path === libFocus);
+  const i = rows.findIndex((r) => (r.dataset.path || r.dataset.group) === libFocus);
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     const r = rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
     if (r) { r.focus(); r.scrollIntoView({ block: 'nearest' }); }
@@ -427,6 +428,8 @@ Click to open · drag onto the Compare set, Figure panels or the plot`, style: S
       // Folder tools on one slim line (the breadcrumb above already names the folder).
       listing ? h('div', { class: 'row lib-foldertools' },
         h('span', { class: 'dim ellip', style: 'flex:1;font-size:11.5px', title: listing.path }, lib.watching ? h('span', { style: 'color:var(--ok)' }, '● watching · new files appear live') : `${listing.files.length} .mat file${listing.files.length === 1 ? '' : 's'}`),
+        listing.groups?.length ? h('label', { class: 'ck', style: 'font-size:11px', title: 'List the Rehone_* subfolder runs in this file list, in time order' },
+          h('input', { type: 'checkbox', checked: lib.mergeRehone !== false, onchange: (e) => { lib.mergeRehone = e.target.checked; saveLibraryPrefs(); renderLibList(); } }), `Rehone (${listing.groups.length})`) : null,
         h('button', { class: 'ibtn', title: isFavorite(listing.path) ? 'Remove from favorite folders' : 'Add to favorite folders', 'aria-label': 'Toggle favorite folder', style: isFavorite(listing.path) ? 'color:#F5C451' : '', onclick: (e) => { e.stopPropagation(); toggleFavorite(listing.path); } }, isFavorite(listing.path) ? '★' : '☆'),
         h('button', { class: `btn sm ${lib.watching ? 'primary' : ''}`, title: 'Watch this folder for new and updated files', onclick: (e) => { e.stopPropagation(); lib.watching = !lib.watching; toast(lib.watching ? 'Watching for new files and checkpoint updates.' : 'Stopped watching.'); emit(); } }, lib.watching ? 'Watching' : 'Watch'))
         : h('button', { class: 'btn block', onclick: chooseFolder }, 'Choose a data folder'),
@@ -536,7 +539,7 @@ function renderLibList() {
   const listing = lib.listing;
   const out = [];
   const openPaths = Object.keys(S.files).filter((p) => !listing || dirname(p).toLowerCase() !== listing.path.toLowerCase());
-  const listed = new Set((listing?.files || []).map((f) => f.path));
+  const listed = new Set([...(listing?.files || []), ...groupFiles(listing)].map((f) => f.path));
   const extra = [...new Set([...openPaths, ...lib.extra])].filter((p) => !listed.has(p) && fileMatches(p, lib.peeks[p] || S.files[p]?.info || {}));
   if (listing) {
     const nameSort = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true });
@@ -550,10 +553,18 @@ function renderLibList() {
     const finals = new Map(files.filter((f) => !isCheckpoint(f.name)).map((f) => [runFamily(f.name), f]));
     const childrenOf = new Map();
     files.forEach((f) => { if (isCheckpoint(f.name) && finals.has(runFamily(f.name))) (childrenOf.get(runFamily(f.name)) || childrenOf.set(runFamily(f.name), []).get(runFamily(f.name))).push(f); });
-    files.forEach((f) => {
-      if (isCheckpoint(f.name) && finals.has(runFamily(f.name))) return;
-      const group = lib.sort === 'type' ? lib.peeks[f.path]?.type || 'Scanning…' : lib.sort === 'name' ? '' : fmtDate(f.mtime);
+    // Rehone_* run folders: one collapsible row each, placed by the run's last save time like any file.
+    const runs = lib.mergeRehone === false ? [] : (listing.groups || []).map((g) => ({ g, kids: g.files.filter((f) => fileMatches(f.path, S.files[f.path]?.info || lib.peeks[f.path] || {})) })).filter((r) => r.kids.length);
+    const rows = [...files.filter((f) => !(isCheckpoint(f.name) && finals.has(runFamily(f.name)))).map((f) => ({ f, t: f.mtime })), ...runs.map((r) => ({ run: r, t: r.g.end }))];
+    if (lib.sort === 'date') rows.sort((a, b) => b.t - a.t);
+    rows.forEach(({ f, run }) => {
+      const group = run ? (lib.sort === 'date' ? fmtDate(run.g.end) : 'Rehone runs') : lib.sort === 'type' ? lib.peeks[f.path]?.type || 'Scanning…' : lib.sort === 'name' ? '' : fmtDate(f.mtime);
       if (group && group !== lastDay) { out.push(h('div', { class: 'lbl', style: 'padding:8px 8px 2px;font-size:10px' }, group)); lastDay = group; }
+      if (run) {
+        out.push(rehoneRow(run.g, run.kids));
+        if (lib.rehoneOpen?.[run.g.path]) run.kids.forEach((c) => out.push(fileRow(c.path, c, { child: true })));
+        return;
+      }
       out.push(fileRow(f.path, f));
       for (const c of (childrenOf.get(runFamily(f.name)) || []).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))) out.push(fileRow(c.path, c, { checkpointOf: f.name }));
     });
@@ -568,6 +579,69 @@ function renderLibList() {
   mount(list, out);
   list.scrollTop = top;
   if (focusPath) list.querySelector(`.frow[data-path="${CSS.escape(focusPath)}"]`)?.focus({ preventScroll: true });
+}
+
+// ------------------------------------------------------------------ rehone runs
+const rehoneLabel = (g) => g.name.replace(/^rehone_?/i, '').replace(/_?\d{4}_\d{4}$/, '');
+const isZ = (name) => /_Z\d*[a-z]*\.mat$/i.test(name), isXY = (name) => /_XY\d*[a-z]*\.mat$/i.test(name);
+const um = (v) => `(${v.map((x) => `${x >= 0 ? '+' : '−'}${Math.abs(x).toFixed(2)}`).join(', ')}) µm`;
+
+function rehoneRow(g, kids) {
+  const lib = S.library;
+  const open = !!lib.rehoneOpen?.[g.path];
+  const toggle = () => { lib.rehoneOpen = { ...(lib.rehoneOpen || {}), [g.path]: !open }; renderLibList(); };
+  const nXY = g.files.filter((f) => isXY(f.name)).length, nZ = g.files.filter((f) => isZ(f.name)).length;
+  const r = g.result;
+  const sub = [`${fmtTime(g.start)}–${fmtTime(g.end)}`, `${nXY} XY + ${nZ} Z`, r?.why, r?.moved ? `moved ${um(r.moved)}` : null].filter(Boolean).join(' · ');
+  const tip = `${g.path}\nClick to show the final XY map and Z scan · arrow to list every step${r?.final ? `\nFinal position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : ''}${kids.length < g.files.length ? `\n${kids.length} of ${g.files.length} scans match the filter` : ''}`;
+  return h('div', { class: `frow rh-group ${open ? 'open' : ''}`, 'data-group': g.path, tabindex: 0, title: tip,
+    onfocus: () => { libFocus = g.path; },
+    onkeydown: (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); openRehone(g); }
+      else if ((e.key === 'ArrowRight' && !open) || (e.key === 'ArrowLeft' && open)) { e.preventDefault(); e.stopPropagation(); toggle(); }
+      else libraryKeys(e);
+    },
+    onclick: (e) => { if (e.target.closest('.rh-caret')) return; openRehone(g); },
+    oncontextmenu: (e) => { e.preventDefault(); contextMenu(e.clientX, e.clientY, [
+      { label: 'Show final XY + Z', run: () => openRehone(g) },
+      { label: open ? 'Hide steps' : 'List every step', run: toggle },
+      { label: 'Open folder in Library', run: () => openFolder(g.path) },
+      { label: 'Show in folder', run: () => call('reveal', { path: g.path }) },
+    ]); } },
+  h('button', { class: 'ibtn rh-caret', title: open ? 'Hide steps' : 'List every step', 'aria-label': 'Toggle rehone steps', onclick: (e) => { e.stopPropagation(); toggle(); } }, open ? '▾' : '▸'),
+  tag('RH'),
+  h('div', { style: 'min-width:0;flex:1' }, h('div', { class: 'fname ellip' }, `Rehone${rehoneLabel(g) ? ` · ${rehoneLabel(g)}` : ''}`),
+    h('div', { class: 'sub ellip' }, sub),
+    r && r.why && r.why !== 'converged' ? h('div', { class: 'chips-s' }, h('span', { class: 'chip-s warn' }, r.why)) : null));
+}
+
+// Final XY map and final Z scan of a rehone run, side by side (both stay open as normal files).
+async function openRehone(g) {
+  const last = (pred) => [...g.files].reverse().find((f) => pred(f.name));
+  const picks = [last(isXY), last(isZ)].filter(Boolean);
+  if (!picks.length) { openPath(g.files[g.files.length - 1].path); return; }
+  const loaded = [];
+  for (const m of picks) { try { loaded.push(await openFile(m.path, { primary: false })); } catch (e) { /* toast shown by api */ } }
+  if (!loaded.length) return;
+  requestPeeks(loaded.map((f) => f.path));
+  const r = g.result;
+  const plots = loaded.map((f) => h('div', { class: 'rh-plot' }));
+  const m = modal(h('div', { style: 'padding:14px 16px;display:flex;flex-direction:column;gap:10px' },
+    h('div', { class: 'row', style: 'gap:8px' }, tag('RH'), h('b', {}, `Rehone${rehoneLabel(g) ? ` · ${rehoneLabel(g)}` : ''}`),
+      h('span', { class: 'dim', style: 'font-size:12px' }, `${fmtDate(g.end)} ${fmtTime(g.start)}–${fmtTime(g.end)}`), h('span', { class: 'sp' }),
+      h('button', { class: 'ibtn', title: 'Close (Esc)', onclick: () => m.close() }, '✕')),
+    r ? h('div', { class: 'note', style: 'font-size:12px' }, [r.why ? `Result: ${r.why}` : '', r.final ? `final position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : '', r.moved ? `moved ${um(r.moved)} from the start` : ''].filter(Boolean).join(' · '))
+      : h('div', { class: 'note', style: 'font-size:12px' }, 'No readable RH_*_log.mat in this run folder.'),
+    h('div', { class: 'rh-plots' }, loaded.map((f, i) => h('div', { style: 'min-width:0;display:flex;flex-direction:column;gap:4px' },
+      h('div', { class: 'row', style: 'gap:6px;font-size:12px' }, tag(f.info.tag), h('span', { class: 'ellip', style: 'flex:1', title: f.path }, basename(f.path).replace(/\.mat$/i, '')),
+        h('button', { class: 'btn sm', title: 'Open this scan in Analyze', onclick: () => { m.close(); openPath(f.path); } }, 'Open')),
+      plots[i]))),
+    h('div', { class: 'row', style: 'justify-content:flex-end;gap:8px' },
+      h('button', { class: 'btn sm', onclick: () => { m.close(); S.library.rehoneOpen = { ...(S.library.rehoneOpen || {}), [g.path]: true }; renderLibList(); } }, `List all ${g.files.length} steps`))), { className: 'rh-modal' });
+  loaded.forEach((f, i) => {
+    const fig = currentFigure(f);
+    if (fig) Plotly.newPlot(plots[i], fig.data, { ...fig.layout, width: undefined, height: undefined, autosize: true }, { displaylogo: false, responsive: true });
+  });
 }
 
 // ------------------------------------------------------------------ opening
@@ -867,7 +941,10 @@ async function watchTick() {
       const changed = listing.files.filter((f) => !fresh.includes(f) && seen[f.path] !== f.mtime);
       changed.forEach((f) => { seen[f.path] = f.mtime; delete lib.peeks[f.path]; });
       lib.seen[listing.path] = seen;
+      const runSig = (l) => (l?.groups || []).map((g) => `${g.path}:${g.files.length}:${g.end}`).join('|');
+      const runsChanged = runSig(lib.listing) !== runSig(listing);
       lib.listing = listing;
+      if (runsChanged) { requestPeeks(groupFiles(listing).map((f) => f.path)); renderLibList(); }
       if (changed.length) requestPeeks(changed.map((f) => f.path)); // refresh row details (iterations, status)
       if (fresh.length) { toast(`New file${fresh.length > 1 ? 's' : ''}: ${fresh.map((f) => f.name).join(', ')}`); requestPeeks(fresh.map((f) => f.path)); }
       if (fresh.length || changed.length) renderLibList();

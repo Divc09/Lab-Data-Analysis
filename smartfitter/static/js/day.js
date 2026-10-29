@@ -19,7 +19,9 @@ let stripEl;
 function dayFiles() {
   const lst = S.library.listing;
   if (!lst) return [];
-  return [...lst.files].sort((a, b) => a.mtime - b.mtime).map((m) => ({ ...m, info: S.library.peeks[m.path] || S.files[m.path]?.info || null }));
+  // Rehone_* run scans (listed under their parent folder in the Library) belong to the same day's timeline.
+  const runs = S.library.mergeRehone === false ? [] : (lst.groups || []).flatMap((g) => g.files);
+  return [...lst.files, ...runs].sort((a, b) => a.mtime - b.mtime).map((m) => ({ ...m, info: S.library.peeks[m.path] || S.files[m.path]?.info || null }));
 }
 
 // Main fitted quantity for a file (first non-R² result line of its current detector's fit).

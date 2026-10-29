@@ -249,7 +249,7 @@ export function field(label, control, props = {}) {
 export const TAG_COLORS = {
   RABI: ['#3A2A18', '#FFC78A'], ODMR: ['#182A3C', '#8EC5FF'], RAMSEY: ['#26213A', '#C4B5FF'], ECHO: ['#1F2E22', '#9FE0AC'],
   DD: ['#1F2E22', '#9FE0AC'], T1: ['#2F2A1A', '#E8D38A'], DEER: ['#2A1E2E', '#E3A6F0'], Z: ['#1E3330', '#8FE3CF'],
-  XY: ['#2A2240', '#C9B6FF'], TT: ['#33261E', '#F2B48C'], '?': ['#3A1B1B', '#FF8A80'],
+  XY: ['#2A2240', '#C9B6FF'], TT: ['#33261E', '#F2B48C'], RH: ['#1E2A3A', '#9CC8F0'], '?': ['#3A1B1B', '#FF8A80'],
 };
 export function tag(t) {
   const [bg, fg] = TAG_COLORS[t] || ['#2A2F3A', '#C9D1DD'];
