@@ -58,14 +58,14 @@ class FitWorkflowConfig:
     rabi_pi_ns: float = 200.0
     rabi_pi2_ns: float = 100.0
     rabi_dead_time_ns: float = 0.0
-    rabi_mode: str = "Adaptive pulse-area (recommended)"
+    rabi_mode: str = "Auto compare"
     odmr_multipeak: bool = False
     odmr_peak_count: int = 2
     odmr_auto_peak: bool = True
     odmr_polarity: str = "Auto"
     odmr_peak_ranges: tuple[tuple[float, float], ...] = ()
     t1_prep_mode: str = "Auto"
-    t1_model_family: str = "Stretched exponential"
+    t1_model_family: str = "Regular exponential"
     custom_spec: dict | None = None
     custom_expr: str = ""
     t1_normalization: tuple[float, float] | None = None

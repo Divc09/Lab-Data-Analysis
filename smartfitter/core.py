@@ -912,7 +912,7 @@ def fit_inputs(ws: Workspace, path: str, detector: str | None, mode: str, proc: 
     if model == "CustomModel":
         exp_type = "CustomModel"
     cfg = FitWorkflowConfig(
-        multistart=int(spec.get("multistart", 20)),
+        multistart=int(spec.get("multistart", 12)),
         gaussian_peak_count=int(spec.get("peaks", 1)),
         rabi_use_sem=bool(spec.get("sem_weights", True)) and not spec.get("fit_smoothed"),
         sem_weights=bool(spec.get("sem_weights_all", False))
