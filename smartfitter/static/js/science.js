@@ -101,9 +101,18 @@ async function run(f, key, fn) {
 }
 
 // ------------------------------------------------------------------ 1. SEM weighting + reduced chi-squared
-export function semAllCheck(f, set) {
-  return check('Weight all models by iteration SEM', !!f.fitSpec.sem_weights_all, (v) => set({ sem_weights_all: v }),
-    { title: 'Weighted least squares with the per-point SEM of the iteration mean (all models except Rabi, which has its own switch above). Needs per-iteration data in the file; also enables reduced χ².' });
+// Rabi keeps its own switch (sem_weights, default on); every other model uses sem_weights_all (default off).
+export function weightsField(f, set, fam) {
+  const key = fam === 'Rabi' ? 'sem_weights' : 'sem_weights_all';
+  return [field('Weights', seg([[false, 'None (equal)'], [true, 'Iteration SEM']], !!f.fitSpec[key], (v) => set({ [key]: v })),
+    { title: 'None: every point counts equally and errors come from the residual scatter. Iteration SEM: weighted least squares with the per-point SEM of the iteration mean; errors come from the SEM and reduced χ² is reported. Needs per-iteration data in the file. The two can give different values; say which one a number came from.' }),
+    f.fitSpec.fit_smoothed ? h('div', { class: 'note' }, 'Ignored while fitting smoothed data (SEM weighting is disabled for smoothed fits).') : null];
+}
+// kv rows for the result card: which weighting the fit actually used.
+export function weightsRows(fit) {
+  const applied = fit?.extras?.sem_weights_applied;
+  const v = applied === true ? 'Iteration SEM' : applied === false ? 'None (no per-iteration SEM in file)' : 'None (equal)';
+  return [h('span', { class: 'k', title: 'Weighting used by this fit result (not the current setting).' }, 'Weights'), h('span', { class: 'v' }, v)];
 }
 
 // kv rows for the result card (empty when the fit has no reduced chi-squared).

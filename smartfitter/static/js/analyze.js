@@ -1002,6 +1002,7 @@ function fitTab(f) {
       h('table', { class: 'tbl' }, h('tr', {}, h('th', {}, 'Param'), h('th', {}, 'Seed'), h('th', {}, 'Min'), h('th', {}, 'Max')),
         s.custom_params.map((p) => h('tr', {}, h('td', { class: 'txt' }, p.name), ['seed', 'min', 'max'].map((k) => h('td', {}, input(p[k] ?? '', (v) => { p[k] = num(v); set({}); }, { numeric: true, placeholder: k === 'seed' ? '1' : '–' })))))));
   }
+  if (fam !== 'Scan2D') out.append(...sci.weightsField(f, set, fam).filter(Boolean));
   // range
   const fr = f.data[f.detector]?.proc?.x || [];
   const splitAt = out.children.length; // everything appended from here on is secondary (moved below the results)
@@ -1014,14 +1015,12 @@ function fitTab(f) {
       h('button', { class: 'btn sm', disabled: !fr.length, title: 'Fit only the first 20 % of the x range', onclick: () => { const [lo, hi] = finiteExtent(fr); set({ range_min: null, range_max: lo + 0.2 * (hi - lo) }); } }, 'Head 20%'),
       h('button', { class: 'btn sm', title: 'Profile default: clear the range so the experiment profile chooses it', onclick: () => set({ range_min: null, range_max: null }) }, 'Profile'))));
   // options
-  const opts = h('details', { class: 'card pad', open: !!f.display.fitOptions, ontoggle: (e) => { f.display.fitOptions = e.target.open; } }, h('summary', {}, `Options · multistart ${s.multistart}${fam === 'Rabi' ? ` · SEM weights ${s.sem_weights ? 'on' : 'off'}` : s.sem_weights_all ? ' · SEM weights on' : ''}${s.apply_both ? ' · both detectors' : ''}`),
+  const opts = h('details', { class: 'card pad', open: !!f.display.fitOptions, ontoggle: (e) => { f.display.fitOptions = e.target.open; } }, h('summary', {}, `Options · multistart ${s.multistart}${s.apply_both ? ' · both detectors' : ''}`),
     h('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-top:8px' },
       h('div', { class: 'g2' }, field('Multistart', input(s.multistart, (v) => set({ multistart: Math.max(4, num(v) || 12) }), { numeric: true })),
         fam === 'Rabi' ? field('Delay / dead time (ns)', input(s.dead_time_ns || '', (v) => set({ dead_time_ns: num(v) || 0 }), { numeric: true, unit: 'ns', placeholder: 'fit' })) : h('span')),
-      fam === 'Rabi' ? [check('Weight by iteration SEM', s.sem_weights, (v) => set({ sem_weights: v })),
-        check('Lock to π / π/2 times', s.pi_lock, (v) => set({ pi_lock: v })),
+      fam === 'Rabi' ? [check('Lock to π / π/2 times', s.pi_lock, (v) => set({ pi_lock: v })),
         s.pi_lock ? h('div', { class: 'g2' }, field('π (ns)', input(s.pi_ns, (v) => set({ pi_ns: num(v) }), { numeric: true, unit: 'ns' })), field('π/2 (ns)', input(s.pi2_ns, (v) => set({ pi2_ns: num(v) }), { numeric: true, unit: 'ns' }))) : null] : null,
-      sci.semAllCheck(f, set),
       f.proc.steps.length ? check('Fit the transformed data', s.fit_transformed, (v) => set({ fit_transformed: v })) : null,
       f.info.detectors.length > 1 ? field('Apply to', seg([[false, 'Active detector'], [true, 'Both detectors']], s.apply_both, (v) => set({ apply_both: v }))) : null));
   out.append(h('div', { class: 'card pad' }, check('Fit smoothed data', s.fit_smoothed, (v) => { if (v) f.layers.smooth = true; set({ fit_smoothed: v }); emit(); }),
@@ -1068,7 +1067,7 @@ function resultCard(f, fit) {
       h('span', { class: 'k', title: 'Root-mean-square residual, in the y units of the fitted data. Compare it with the point-to-point noise: about equal is good; much larger means the model misses structure.' }, 'RMSE'), h('span', { class: 'v' }, fmt(fit.rmse, 4)),
       h('span', { class: 'k', title: 'Tests whether neighbouring residuals are correlated (range 0–4). ≈ 2: residuals look like random noise (good). Well below 2 (≲ 1.5): runs of same-sign residuals, so the model misses a feature, there is drift, or smoothing was applied. Well above 2 (≳ 2.5): residuals alternate sign point to point.' }, 'Durbin–Watson'), h('span', { class: 'v' }, fmt(fit.dw, 3)),
       h('span', { class: 'k', title: 'Information criteria: n·ln(RSS/n) plus a penalty per free parameter (AIC 2k, BIC k·ln n; BIC penalises extra parameters more). Only differences matter, and only between fits of the same data and range. Lower is better: Δ ≳ 2 is a mild preference, Δ ≳ 10 is strong. Use them to choose between models (e.g. 1 vs 2 peaks), not to judge one fit on its own.' }, 'AIC / BIC'), h('span', { class: 'v' }, `${fmt(fit.aic, 5)} / ${fmt(fit.bic, 5)}`),
-      h('span', { class: 'k', title: 'Number of fitted parameters sitting on a bound. Should be 0. A hit means the true best value may lie outside the allowed range and that parameter (and its error bar) is unreliable: widen the bound or fix the parameter.' }, 'Bound hits'), h('span', { class: 'v' }, String(fit.bound_hits)), sci.chi2Rows(fit)),
+      h('span', { class: 'k', title: 'Number of fitted parameters sitting on a bound. Should be 0. A hit means the true best value may lie outside the allowed range and that parameter (and its error bar) is unreliable: widen the bound or fix the parameter.' }, 'Bound hits'), h('span', { class: 'v' }, String(fit.bound_hits)), sci.weightsRows(fit), sci.chi2Rows(fit)),
     sci.chi2Note(fit),
     fit.status !== 'PASS' ? h('div', { class: 'note', style: 'color:var(--warn)' }, fit.reason) : null,
     identifiabilityCard(fit),
