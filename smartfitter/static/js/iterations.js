@@ -179,36 +179,56 @@ export function openIterationResults(f) {
 
 export async function openCombineDialog(f = active()) {
   if (!f) return;
+  // Start from what is open: this file, or the source runs (and their iteration choices) of a combined dataset,
+  // so adding one more run to a pooled dataset only needs one more click.
+  const seeds = f.combinedRecipe?.runs?.length ? clone(f.combinedRecipe.runs)
+    : f.path.startsWith('combined:') ? [] : [{ path: f.path, iterations: clone(f.proc.iterations ?? null) }];
+  const pinned = new Set(seeds.map((r) => r.path));
   const candidates = new Map(), chosen = new Map();
   let busy = false;
   const list = h('div', { class: 'combine-list' }), message = h('div', { class: 'note', role: 'status' });
-  const name = h('input', { class: 'field', value: `Combined ${f.info.type} iterations`, 'aria-label': 'Combined dataset name' });
-  const grid = select([['identical', 'Identical x grids (required by default)'], ['intersect', 'Exact intersection (drop unmatched x; no interpolation)']], 'identical', () => {}, { 'aria-label': 'X grid compatibility' });
+  const name = h('input', { class: 'field', value: f.combinedRecipe?.name || `Combined ${f.info.type} iterations`, 'aria-label': 'Combined dataset name' });
+  const grid = select([['identical', 'Identical x grids (required by default)'], ['intersect', 'Exact intersection (drop unmatched x; no interpolation)']], f.combinedRecipe?.grid || 'identical', () => {}, { 'aria-label': 'X grid compatibility' });
   const search = h('input', { class: 'field', placeholder: 'Search run files', 'aria-label': 'Search runs to combine' });
-  const choose = async (path, enabled) => {
+  const choose = async (path, enabled, iterations) => {
     if (!enabled) { chosen.delete(path); draw(); return; }
     try {
       const o = await openFile(path, { primary: false });
       await syncOverlay(o, f);
       if (!o.data[o.detector]?.iterations) throw new Error('No complete iteration matrix.');
-      chosen.set(path, { path, iterations: clone(o.proc.iterations ?? null) }); message.textContent = ''; draw();
+      chosen.set(path, { path, iterations: clone(iterations !== undefined ? iterations : o.proc.iterations ?? null) }); message.textContent = ''; draw();
     } catch (e) { message.textContent = `${basename(path)}: ${e.message}`; draw(); }
   };
+  const when = (t) => (Number.isFinite(t) ? new Date(t * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '');
   const draw = () => {
     const q = search.value.toLowerCase();
-    mount(list, [...candidates].filter(([path]) => path.toLowerCase().includes(q)).map(([path, info]) => {
-      const run = chosen.get(path), o = S.files[path], it = o?.data[o.detector]?.iterations;
-      return h('div', { class: 'card pad' }, check(info.name || basename(path), !!run, (v) => choose(path, v), { disabled: busy, 'aria-label': `Combine ${info.name || basename(path)}` }),
+    // Current runs first, then newest acquisition first (file time, then name) — the same order as the library.
+    const rows = [...candidates].filter(([path]) => path.toLowerCase().includes(q)).sort(([a, x], [b, y]) =>
+      (pinned.has(b) - pinned.has(a)) || ((y.mtime ?? 0) - (x.mtime ?? 0)) || (x.name || '').localeCompare(y.name || ''));
+    const names = new Map(); for (const [, i] of candidates) names.set(i.name, (names.get(i.name) || 0) + 1);
+    mount(list, rows.map(([path, info]) => {
+      const run = chosen.get(path), o = S.files[path], it = o?.data[o.detector]?.iterations, label = info.name || basename(path);
+      const meta = [pinned.has(path) ? (f.combinedRecipe ? 'in this combined dataset' : 'current file') : '', when(info.mtime),
+        info.iterations && !run ? `${info.iterations} iterations acquired` : '', names.get(info.name) > 1 ? basename(dirname(path)) : ''].filter(Boolean).join(' · ');
+      return h('div', { class: 'card pad', title: path }, check(label, !!run, (v) => choose(path, v), { disabled: busy, 'aria-label': `Combine ${label}` }),
+        h('div', { class: 'note', style: 'margin:2px 0 0 24px' }, meta),
         run && it ? h('details', {}, h('summary', {}, `${run.iterations?.length ?? it.count}/${it.count} iterations · choose for this run`),
           selectionControls(it.count, run.iterations, (iterations) => { run.iterations = iterations; draw(); }, `${info.name} iteration`)) : null);
     }));
+    const n = chosen.size;
+    create.disabled = busy || n < 2;
+    create.textContent = n >= 2 ? `Combine ${n} runs` : 'Create combined dataset';
+    hint.textContent = n >= 2 ? '' : n === 1 ? 'Tick at least one more run to pool with it.' : 'Tick two or more runs to pool.';
   };
   const add = async (paths) => {
-    const infos = await call('peek', { paths: paths.filter((p) => !p.startsWith('combined:')) }, { label: 'Reading run candidates' });
+    paths = paths.filter((p) => !p.startsWith('combined:') && !candidates.has(p));
+    if (!paths.length) return;
+    const infos = await call('peek', { paths }, { label: 'Reading run candidates' });
     infos.filter((i) => !i.error && i.type === f.info.type && i.dim !== 'scan2d').forEach((i) => candidates.set(i.path, i)); draw();
   };
+  const hint = h('span', { class: 'note', style: 'margin:0' });
   const create = h('button', { class: 'btn primary', onclick: async () => {
-    if (busy) return;
+    if (busy || chosen.size < 2) return;
     busy = true; create.disabled = true;
     try {
       const res = await call('combine_iterations', { runs: [...chosen.values()], grid: grid.value, name: name.value, mode: f.mode }, { label: 'Checking and pooling iterations' });
@@ -228,11 +248,13 @@ export async function openCombineDialog(f = active()) {
     h('div', { class: 'row' }, h('strong', {}, `Combine ${f.info.type} iterations`), h('span', { class: 'sp' }), h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel')),
     h('div', { class: 'note' }, 'Pooled mean ± SEM across selected iterations, not a mean of run means. Source processing is not copied; the combined dataset starts unbinned. Detector layout, observable and native units must match.'),
     field('Name', name), field('X grid', grid), search, list,
-    h('div', { class: 'note' }, 'Checkpoints may repeat the same observations. No automatic deduplication: use disjoint source iterations or independent runs. SEM assumes independent iterations. Acquisition files are never modified.'),
+    h('div', { class: 'note' }, 'A checkpoint repeats the first iterations of its final file: runs sharing identical iterations are refused rather than counted twice, so pick the final file (or deselect the shared iterations). SEM assumes independent iterations. Acquisition files are never modified.'),
     message, h('div', { class: 'row wrap' }, h('button', { class: 'btn', onclick: async () => {
       const paths = await call('dialog', { kind: 'open_files', title: 'Choose runs to combine', directory: S.library.folder || dirname(f.path) }); if (paths?.length) await add(paths);
-    } }, 'Browse runs…'), h('span', { class: 'sp' }), create)), { className: 'combine-modal' });
+    } }, 'Browse runs…'), h('span', { class: 'sp' }), hint, create)), { className: 'combine-modal' });
   search.addEventListener('input', draw);
+  // Preselect before reading the (possibly large) library folder, so the current runs are ticked at once.
+  await add(seeds.map((r) => r.path));
+  for (const r of seeds) await choose(r.path, true, r.iterations);
   await add([...new Set([...Object.keys(S.files), ...(S.library.listing?.files || []).map((r) => r.path)])]);
-  if (!f.path.startsWith('combined:')) await choose(f.path, true);
 }

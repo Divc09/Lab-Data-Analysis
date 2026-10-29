@@ -282,7 +282,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .sensitivity-modal details { flex: none; max-height: 110px; overflow: auto; }
 @media(max-width:700px) { .sensitivity-modal .tbl { min-width: 700px; } .sensitivity-modal .iteration-chart { height: 150px; } }
 .combine-modal { width: min(760px,94vw); max-width: 94vw; }
-.combine-list { display: flex; flex-direction: column; gap: 7px; max-height: 38vh; overflow: auto; }
+.combine-list { display: flex; flex-direction: column; gap: 7px; max-height: 38vh; overflow: hidden auto; }
 .combine-list summary { cursor: pointer; font-size: 12px; margin-top: 6px; }
 @media(max-height:800px) { .iteration-chart { height: 240px; } .iteration-table-wrap { max-height: 180px; } }
 
