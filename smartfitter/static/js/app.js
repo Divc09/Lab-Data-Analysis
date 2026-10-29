@@ -1,6 +1,6 @@
 // Application shell: top bar, library, routing, keyboard shortcuts, drag & drop, folder watching.
 import { call, onBusy } from './api.js';
-import { S, emit, subscribe, active, openFile, reloadFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile, isDirty, markClean } from './state.js';
+import { S, emit, subscribe, active, openFile, reloadFile, followFinalFile, undo, redo, canUndo, canRedo, sessionDoc, applySession, detLabel, addOverlay, removeOverlay, addCompareItem, compareFile, isDirty, markClean } from './state.js';
 import { h, mount, icon, toast, modal, contextMenu, fmt, fmtTime, fmtDate, basename, dirname, tag, debounce } from './util.js';
 import { renderAnalyze, renderInspector, runFit, runFitScoped, saveResults, copyFigure, resetView, ALT_TABS, kindOf, currentFigure } from './analyze.js';
 import { renderCompare, hasCompareTrend, hasCompareOverlay, saveCompareTrend, copyCompareOverlay } from './compare.js';
@@ -953,7 +953,14 @@ async function watchTick() {
       const st = await call('stat', { paths }, { quiet: true });
       for (const p of paths) {
         const f = S.files[p];
-        if (!f || !st[p]) continue;
+        if (f && !st[p]) {
+          // A finished run deletes its checkpoint: switch to the final file and refit it if a fit was shown.
+          const final = await followFinalFile(f).catch(() => null);
+          const g = final && S.files[final];
+          if (g === f && f.fitStale && S.settings.auto_refit !== false && !f.fitting) { try { await runFit(f, { recordUndo: false }); } catch (e) { /* reported in the error tray */ } }
+          continue;
+        }
+        if (!f) continue;
         if (!f.mtime) { f.mtime = st[p]; continue; }
         if (st[p] === f.mtime) { delete watchPending[p]; continue; }
         // MATLAB may still be writing: reload only once the timestamp has held for one whole tick.

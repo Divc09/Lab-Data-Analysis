@@ -113,6 +113,32 @@ export async function reloadFile(f) {
   emit();
 }
 
+// MATLAB deletes "X_checkpoint.mat" once the completed run is saved as "X.mat". When an open checkpoint has
+// vanished and its final file exists, rebind the open file to the final one (keeping its settings) and reload.
+// Returns the final path, or null when the file is not a vanished checkpoint with a final file beside it.
+export async function followFinalFile(f) {
+  const old = f.path;
+  if (!/__?checkpoint\d*\.mat$/i.test(old)) return null;
+  const final = old.replace(/__?checkpoint\d*\.mat$/i, '.mat');
+  const st = await call('stat', { paths: [old, final] }, { quiet: true });
+  if (st[old] || !st[final]) return null;
+  const finalOpen = S.files[final] && S.files[final] !== f; // the final file is already open on its own
+  delete S.files[old];
+  if (S.primary === old) S.primary = final;
+  const swap = (p) => (p === old ? final : p);
+  S.overlays = [...new Set(S.overlays.map(swap))];
+  if (old in S.overlaySlots) { if (!(final in S.overlaySlots)) S.overlaySlots[final] = S.overlaySlots[old]; delete S.overlaySlots[old]; }
+  S.library.extra = [...new Set(S.library.extra.map(swap))];
+  if (!finalOpen) {
+    f.path = final; f.mtime = st[final]; S.files[final] = f;
+    if (Object.keys(f.fit || {}).length) f.fitStale = true; // shown fit describes the checkpoint's iterations
+    await reloadFile(f);
+  }
+  toast(`${old.split(/[\\/]/).pop()} was replaced by the completed run; now showing ${final.split(/[\\/]/).pop()}.`);
+  emit();
+  return final;
+}
+
 export async function syncOverlay(o, f) {
   if (o.info.dim === 'scan2d' || o.info.type === 'TimeTrace') throw new Error('Compare overlays require 1D files. Use the Compare workspace for maps/time traces.');
   if (!o.info.observables.includes(f.mode)) throw new Error(`${o.info.name} has no ${f.mode} observable.`);

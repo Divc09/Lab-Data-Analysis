@@ -2,7 +2,7 @@ import { finiteExtent } from './numeric.js';
 // Analyze workspace: 1D experiments, time traces and 2D maps, with their inspectors.
 import { call } from './api.js';
 import { canonical, sourcePath } from './analysisidentity.js';
-import { S, emit, active, commit, markDirty, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor } from './state.js';
+import { S, emit, active, commit, markDirty, loadData, detLabel, defaultFitSpec, syncOverlays, syncOverlay, removeOverlay, subscribe, recordResult, resultFreshness, currentResult, envelopeFor, followFinalFile } from './state.js';
 import { openOverlayPicker, browseOverlays } from './overlaypicker.js';
 import { isNormalizedT1, isDirectT1, t1Normalization, displaySpace, displayProvenance } from './fitdisplay.js';
 import { h, mount, icon, seg, select, input, check, field, fmt, fmtPm, fmtCounts, num, toast, clone, tag, basename, dirname, stem, contextMenu, linreg } from './util.js';
@@ -93,6 +93,11 @@ export async function runFit(f, { robust = false, recordUndo = true } = {}) {
   if (recordUndo) commit('fit');
   if (f.data[f.detector]?.iterations?.selected?.length === 0) { toast('Select at least one iteration before fitting.', 'err'); return; }
   if (f.fitting || f.iterationFitting || f.sensitivityFitting) return;
+  // A finished run deletes its checkpoint file: fit the final file instead of failing on the missing one.
+  if (/__?checkpoint\d*\.mat$/i.test(f.path)) {
+    const final = await followFinalFile(f);
+    if (final && S.files[final] !== f) return runFit(S.files[final], { robust, recordUndo: false });
+  }
   const spec = prepareFitSpec(f), proc = clone(f.proc), mode = f.mode;
   const signature = JSON.stringify([mode, proc, spec]);
   spec.robust = robust;
