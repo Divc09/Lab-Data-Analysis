@@ -165,6 +165,40 @@ export function moveFile(f, o, direction) {
   commit('series order'); [order[i], order[j]] = [order[j], order[i]]; f.style.fileOrder = order; delete f.style.seriesOrder; emit();
 }
 
+function seriesTimes(o) {
+  const modified = Number.isFinite(o.info.mtime) ? o.info.mtime * 1000 : NaN;
+  const name = o.info.name || o.path.split(/[\\/]/).pop();
+  const full = name.match(/(?:^|[^\d])(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})(?!\d)/);
+  const short = name.match(/^(\d{2})(\d{2})_(\d{2})(\d{2})(?!\d)/);
+  let named = NaN;
+  if (full || short) {
+    // Short acquisition names omit the year; use the save year, or the current year when unavailable.
+    const [year, month, day, hour, minute, second] = full ? full.slice(1).map(Number)
+      : [new Date(Number.isFinite(modified) ? modified : Date.now()).getFullYear(), ...short.slice(1).map(Number), 0];
+    const date = new Date(year, month - 1, day, hour, minute, second);
+    if (date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day
+      && date.getHours() === hour && date.getMinutes() === minute && date.getSeconds() === second) named = date.getTime();
+  }
+  return { time: Number.isFinite(modified) ? modified : named, named };
+}
+
+export function sortSeriesByTime(f, newestFirst = false) {
+  const direction = newestFirst ? -1 : 1;
+  const files = comparisonFiles(f).map((o) => ({ path: o.path, ...seriesTimes(o) }));
+  files.sort((a, b) => {
+    // Unknown times stay last in both directions; ties use filename time, then the current order.
+    const knownA = Number.isFinite(a.time), knownB = Number.isFinite(b.time);
+    if (knownA !== knownB) return knownA ? -1 : 1;
+    if (knownA && a.time !== b.time) return direction * (a.time - b.time);
+    const namedA = Number.isFinite(a.named), namedB = Number.isFinite(b.named);
+    if (namedA !== namedB) return namedA ? -1 : 1;
+    return namedA ? direction * (a.named - b.named) : 0;
+  });
+  const order = files.map((o) => o.path);
+  if (order.join('\n') === comparisonFiles(f).map((o) => o.path).join('\n')) { toast('Series already in that order'); return; }
+  commit('sort series by time'); f.style.fileOrder = order; delete f.style.seriesOrder; emit();
+}
+
 export function seriesOptions(f, o) {
   const cfg = filePresentation(f, o), set = (patch) => updateFilePresentation(f, o, patch);
   const fit = currentResult(o,seriesDetector(f,o)), lines = resultLines(fit, o.info);
@@ -223,6 +257,9 @@ export function seriesPanel(f) {
     h('summary', {}, files.length > 1 ? `Series (${files.length}) · data / fit / style / legend` : 'Series · style & legend for this file · add comparisons'),
     h('div', { class: 'row wrap', style: 'padding:6px 0' },
       h('button', { class: 'btn sm', onclick: () => openOverlayPicker(f) }, 'Add comparison…'),
+      select([['', 'Sort by time…'], ['oldest', 'Oldest first'], ['newest', 'Newest first']], '', (v) => {
+        if (v) sortSeriesByTime(f, v === 'newest');
+      }, { 'aria-label': 'Sort series by time', style: 'width:auto', disabled: files.length < 2 }),
       h('button', { class: 'btn sm primary', disabled: f.compareFitting || files.some((o) => o.fitting), title: 'Fits every series below, each with the model shown on its row. Run fit / Ctrl+F does the same while the Fit tab says “All series”.', onclick: () => fitAllSeries(f) }, f.compareFitting ? 'Fitting…' : `Fit all ${files.length} series`),
       h('button', { class: 'btn sm', onclick: () => downloadComparison(f) }, 'Export table CSV'),
       h('button', { class: 'btn sm', onclick: () => copyText(comparisonCSV(f, '\t'), 'Comparison results copied') }, 'Copy table')),
