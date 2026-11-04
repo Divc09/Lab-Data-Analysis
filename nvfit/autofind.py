@@ -51,6 +51,16 @@ def is_v73(path: str | Path) -> bool:
 
 
 def read_mat(path: str | Path, names: list[str] | None = None) -> dict:
+    """read_mat, retried: Box Drive placeholders can fail an open/read (e.g. Errno 22) while they download or re-sync."""
+    for delay in (0.25, 0.5, 1.0, 2.0):
+        try:
+            return _read_mat(path, names)
+        except OSError:
+            time.sleep(delay)
+    return _read_mat(path, names)
+
+
+def _read_mat(path: str | Path, names: list[str] | None = None) -> dict:
     """Load v5 structs/cells; v7.3 structs/cells use HDF5 references when available."""
     path = Path(path)
     if not is_v73(path):
@@ -317,6 +327,11 @@ def _scan_files(folder):
     return sorted(out, key=lambda p: (p.stat().st_mtime, p.name))
 
 
+def _logs(folder):
+    # RH_*_log.mat are autoFindRehone logs (no L struct); the Library shows those runs, not AutoFind.
+    return sorted(p for p in folder.glob('*_log.mat') if not p.name.upper().startswith('RH_'))
+
+
 def _stamp(path):
     s = path.stat()
     return (s.st_mtime_ns, s.st_size)
@@ -393,7 +408,7 @@ class AutoFindStore:
         folders, queue = [], [root]
         while queue:
             folder = queue.pop()
-            logs = sorted(folder.glob('*_log.mat'))
+            logs = _logs(folder)
             scans = _scan_files(folder)
             if logs or scans:
                 folders.append((folder, logs, scans))
@@ -418,14 +433,14 @@ class AutoFindStore:
             raise ValueError('Choose an AutoFind *_log.mat or run folder.')
         folder = source if source.is_dir() else source.parent
         if source.is_dir():
-            logs = sorted(source.glob('*_log.mat'))
+            logs = _logs(source)
             if len(logs) == 1:
                 source = logs[0]
             elif logs:
                 raise ValueError('Several logs in this folder; choose a specific log/run.')
         files = _scan_files(folder)
-        logs = sorted(folder.glob('*_log.mat'))
-        stamp = (tuple((p.name, *_stamp(p)) for p in files + logs), source.name)
+        logs = _logs(folder)
+        stamp =(tuple((p.name, *_stamp(p)) for p in files + logs), source.name)
         return self._cached(self._runs, str(source), stamp, lambda: self._load_run(source, folder, files, logs), 24)
 
     def _load_run(self, source, folder, files, logs):
