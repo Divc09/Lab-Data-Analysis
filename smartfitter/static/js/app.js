@@ -585,6 +585,8 @@ function renderLibList() {
 const rehoneLabel = (g) => g.name.replace(/^rehone_?/i, '').replace(/_?\d{4}_\d{4}$/, '');
 const isZ = (name) => /_Z\d*[a-z]*\.mat$/i.test(name), isXY = (name) => /_XY\d*[a-z]*\.mat$/i.test(name);
 const um = (v) => `(${v.map((x) => `${x >= 0 ? '+' : '−'}${Math.abs(x).toFixed(2)}`).join(', ')}) µm`;
+// A rehone that found no particle has no final position (NaN in the log, null here).
+const xyz = (v) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
 
 function rehoneRow(g, kids) {
   const lib = S.library;
@@ -592,8 +594,8 @@ function rehoneRow(g, kids) {
   const toggle = () => { lib.rehoneOpen = { ...(lib.rehoneOpen || {}), [g.path]: !open }; renderLibList(); };
   const nXY = g.files.filter((f) => isXY(f.name)).length, nZ = g.files.filter((f) => isZ(f.name)).length;
   const r = g.result;
-  const sub = [`${fmtTime(g.start)}–${fmtTime(g.end)}`, `${nXY} XY + ${nZ} Z`, r?.why, r?.moved ? `moved ${um(r.moved)}` : null].filter(Boolean).join(' · ');
-  const tip = `${g.path}\nClick to show the final XY map and Z scan · arrow to list every step${r?.final ? `\nFinal position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : ''}${kids.length < g.files.length ? `\n${kids.length} of ${g.files.length} scans match the filter` : ''}`;
+  const sub = [`${fmtTime(g.start)}–${fmtTime(g.end)}`, `${nXY} XY + ${nZ} Z`, r?.why === 'converged' ? r.why : null, xyz(r?.moved) ? `moved ${um(r.moved)}` : null].filter(Boolean).join(' · ');
+  const tip = `${g.path}\nClick to show the final XY map and Z scan · arrow to list every step${xyz(r?.final) ? `\nFinal position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : ''}${kids.length < g.files.length ? `\n${kids.length} of ${g.files.length} scans match the filter` : ''}`;
   return h('div', { class: `frow rh-group ${open ? 'open' : ''}`, 'data-group': g.path, tabindex: 0, title: tip,
     onfocus: () => { libFocus = g.path; },
     onkeydown: (e) => {
@@ -630,7 +632,7 @@ async function openRehone(g) {
     h('div', { class: 'row', style: 'gap:8px' }, tag('RH'), h('b', {}, `Rehone${rehoneLabel(g) ? ` · ${rehoneLabel(g)}` : ''}`),
       h('span', { class: 'dim', style: 'font-size:12px' }, `${fmtDate(g.end)} ${fmtTime(g.start)}–${fmtTime(g.end)}`), h('span', { class: 'sp' }),
       h('button', { class: 'ibtn', title: 'Close (Esc)', onclick: () => m.close() }, '✕')),
-    r ? h('div', { class: 'note', style: 'font-size:12px' }, [r.why ? `Result: ${r.why}` : '', r.final ? `final position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : '', r.moved ? `moved ${um(r.moved)} from the start` : ''].filter(Boolean).join(' · '))
+    r ? h('div', { class: 'note', style: 'font-size:12px' }, [r.why ? `Result: ${r.why}` : '', xyz(r.final) ? `final position (${r.final.map((x) => x.toFixed(3)).join(', ')}) µm` : '', xyz(r.moved) ? `moved ${um(r.moved)} from the start` : ''].filter(Boolean).join(' · '))
       : h('div', { class: 'note', style: 'font-size:12px' }, 'No readable RH_*_log.mat in this run folder.'),
     h('div', { class: 'rh-plots' }, loaded.map((f, i) => h('div', { style: 'min-width:0;display:flex;flex-direction:column;gap:4px' },
       h('div', { class: 'row', style: 'gap:6px;font-size:12px' }, tag(f.info.tag), h('span', { class: 'ellip', style: 'flex:1', title: f.path }, basename(f.path).replace(/\.mat$/i, '')),

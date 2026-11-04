@@ -18,6 +18,7 @@ from copy import deepcopy
 from functools import partial, wraps
 from inspect import signature
 import os
+import re
 import subprocess
 import threading
 import time
@@ -469,6 +470,10 @@ class Workspace:
             self._disk_saved = time.monotonic()
 
 
+# Rehone/AutoFind run logs (RH_/AF_<date>_<time>_log.mat) hold run results, not scan data.
+RUN_LOG_RE = re.compile(r"^(RH|AF)_\d{4}_\d{6}_log\.mat$", re.IGNORECASE)
+
+
 def list_dir(path: str) -> dict:
     root = Path(path)
     if not root.is_dir():
@@ -478,7 +483,7 @@ def list_dir(path: str) -> dict:
         try:
             if entry.is_dir() and not entry.name.startswith((".", "__")):
                 folders.append({"name": entry.name, "path": entry.path})
-            elif entry.is_file() and entry.name.lower().endswith(".mat"):
+            elif entry.is_file() and entry.name.lower().endswith(".mat") and not RUN_LOG_RE.match(entry.name):
                 st = entry.stat()
                 files.append({"name": entry.name, "path": entry.path, "mtime": st.st_mtime, "size": st.st_size})
         except OSError:
@@ -511,8 +516,10 @@ def _rehone_group(path: str, name: str) -> dict | None:
             from nvfit.autofind import read_mat
 
             d = read_mat(log, ["start", "final", "moved", "why"])
-            vec = lambda v: [float(x) for x in np.ravel(v)] if v is not None and np.size(v) == 3 else None
-            result = {"start": vec(d.get("start")), "final": vec(d.get("final")), "moved": vec(d.get("moved")), "why": str(d.get("why") or "")}
+            # A run that found no particle saves final = NaN and moved = 0; report neither as a position.
+            vec = lambda v: [float(x) for x in np.ravel(v)] if v is not None and np.size(v) == 3 and np.all(np.isfinite(np.ravel(v).astype(float))) else None
+            final = vec(d.get("final"))
+            result = {"start": vec(d.get("start")), "final": final, "moved": vec(d.get("moved")) if final else None, "why": str(d.get("why") or "")}
         except Exception:
             result = None
     return {"kind": "rehone", "name": name, "path": path, "start": min(f["mtime"] for f in scans), "end": max(f["mtime"] for f in scans), "files": scans, "log": log, "result": result}
