@@ -2,6 +2,38 @@
 
 SmartFitter is a Python application for loading, visualizing, fitting, and exporting data from nitrogen-vacancy (NV) center experiments saved as MATLAB `.mat` files. It provides an interactive desktop GUI for individual measurements and a command-line batch pipeline for folders of experiments.
 
+## Install
+
+### Windows: download and run (no Python needed)
+
+1. Go to the [latest release](https://github.com/Divc09/Lab-Data-Analysis/releases/latest) and download `SmartFitter-portable-<version>.zip`.
+2. Right-click the zip, choose **Extract All…**, and pick a folder you keep (for example `Documents\SmartFitter`). Do not run it from inside the zip.
+3. Open the extracted folder and double-click **SmartFitter.exe**.
+
+Notes:
+
+- The first time, Windows SmartScreen may say "Windows protected your PC" because the app is not code-signed. Click **More info → Run anyway**.
+- Optional: pin `SmartFitter.exe` to the taskbar or Start menu, or right-click a `.mat` file → **Open with** → choose `SmartFitter.exe`.
+- To update, download the new zip and replace the old folder. Your settings are kept in `%APPDATA%\SmartFitter`. The app shows a notice when a newer release exists.
+- Needs Windows 10 or 11. It uses the Microsoft WebView2 runtime, which is already installed on Windows 11 and most up-to-date Windows 10 PCs.
+
+### macOS or Linux: run with Python
+
+There is no `.dmg` yet, so macOS and Linux run SmartFitter from Python (3.12 or newer):
+
+```bash
+git clone https://github.com/Divc09/Lab-Data-Analysis.git
+cd Lab-Data-Analysis
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m smartfitter
+```
+
+Next time, just `cd Lab-Data-Analysis`, `source .venv/bin/activate`, and `python -m smartfitter`. On macOS and Linux the app opens in your default web browser instead of its own window. The Windows build is the tested platform; macOS and Linux are not regularly tested.
+
+To update: `git pull`, then `python -m pip install -r requirements.txt`.
+
 ## SmartFitter v2 (new interface)
 
 `smartfitter/` is a new desktop interface built on the same `nvfit` loaders, fits, spot detection, map overlays and batch pipeline. SmartFitter v2 is now the default app: `python -m nvfit.gui_app` and `Launch SmartFitter.vbs` start it. The original Qt app is deprecated and kept for reference; start it with `python -m nvfit.gui_app --legacy`.
@@ -70,16 +102,9 @@ Plan the measurement (Analyze → Fit → Result → **Plan the measurement**; `
 - Exports publication-ready PNG, PDF, and SVG figures plus JSON, CSV, and report outputs.
 - Includes representative test data and an offscreen GUI regression suite.
 
-## Requirements
+## Install from source (Windows, for development)
 
-- Python 3.12 or newer
-- Windows, macOS, or Linux
-
-The GUI uses Qt through PySide6. The included one-click launcher is Windows-specific; the Python launch command works on every supported platform.
-
-## Quick start
-
-Clone the repository and enter its directory:
+Most Windows users should use the download above. To run from source instead you need Python 3.12 or newer. Clone the repository and enter its directory:
 
 ```bash
 git clone https://github.com/Divc09/Lab-Data-Analysis.git
@@ -99,15 +124,6 @@ python -m pip install -r requirements.txt
 ```
 
 The pins in `requirements.txt` are the tested environment (Windows 11, Python 3.14.5). For running the tests or building the portable app, install `requirements-dev.txt` instead; for the research scripts under `scripts/`, `requirements-scripts.txt`.
-
-macOS or Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
 
 Start SmartFitter:
 
@@ -171,7 +187,7 @@ Run `python -m nvfit.pro_batch --help` for all options. Batch results include fi
 
 Batch processes both available detector streams by default. Use `--detector detector1` or `--detector detector2` to restrict it. Dual-file outputs use `__detector1` and `__detector2` suffixes; single-detector output names remain unchanged.
 
-## Portable build (no Python needed)
+## Building the Windows download (maintainers)
 
 `powershell -File tools\build_portable.ps1` builds `dist\SmartFitter\SmartFitter.exe` (PyInstaller onedir, no PySide6) and `dist\SmartFitter-portable-<version>.zip`. Lab-mates unzip and run `SmartFitter.exe` (same options as `python -m smartfitter`; settings stay in `%APPDATA%\SmartFitter`). It uses the WebView2 runtime that ships with Windows 11 and falls back to an Edge app window. Update notices are informational only: git checkouts compare with `origin/main` (update with `git pull --ff-only origin main`), portable builds compare with the latest GitHub release.
 
