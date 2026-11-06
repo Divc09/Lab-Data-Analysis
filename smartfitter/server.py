@@ -328,7 +328,11 @@ class Api:
     @core.plain_endpoint
     def reveal(self, path: str) -> bool:
         p = Path(path)
-        if p.is_dir():
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)] if p.is_dir() else ["open", "-R", str(p)])
+        elif sys.platform != "win32":
+            subprocess.Popen(["xdg-open", str(p if p.is_dir() else p.parent)])
+        elif p.is_dir():
             os.startfile(str(p))  # noqa: S606 - local desktop convenience
         else:
             subprocess.Popen(["explorer", "/select,", str(p)])
@@ -336,7 +340,12 @@ class Api:
 
     @core.plain_endpoint
     def open_path(self, path: str) -> bool:
-        os.startfile(path)  # noqa: S606
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif sys.platform != "win32":
+            subprocess.Popen(["xdg-open", path])
+        else:
+            os.startfile(path)  # noqa: S606
         return True
 
     @core.plain_endpoint
@@ -344,6 +353,10 @@ class Api:
         """Put a PNG on the Windows clipboard (used when the browser clipboard is unavailable)."""
         tmp = Path(tempfile.gettempdir()) / "smartfitter_clip.png"
         tmp.write_bytes(base64.b64decode(data.split(",", 1)[-1]))
+        if sys.platform == "darwin":
+            subprocess.run(["osascript", "-e", f'set the clipboard to (read (POSIX file "{tmp}") as «class PNGf»)'],
+                           check=True, capture_output=True)
+            return True
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
             f"$img=[System.Drawing.Image]::FromFile('{tmp}'); [System.Windows.Forms.Clipboard]::SetImage($img); $img.Dispose()"
@@ -358,6 +371,9 @@ class Api:
 
     @core.plain_endpoint
     def clipboard_text(self, text: str) -> bool:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text, text=True, check=True, capture_output=True)
+            return True
         subprocess.run(
             ["powershell", "-NoProfile", "-STA", "-Command", "$input | Set-Clipboard"],
             input=text,

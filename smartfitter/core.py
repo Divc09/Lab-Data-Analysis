@@ -20,6 +20,7 @@ from inspect import signature
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -158,7 +159,8 @@ def _file_stamp(stat: os.stat_result) -> tuple[int, int, int]:
     then differs.  Content hashes (``source_revision``) are computed once per stamp, not on every access.
     """
     return (stat.st_mtime_ns, stat.st_size, getattr(stat, "st_ino", 0))
-SETTINGS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "SmartFitter"
+SETTINGS_DIR = (Path.home() / "Library" / "Application Support" / "SmartFitter" if sys.platform == "darwin"
+                else Path(os.environ.get("APPDATA", str(Path.home()))) / "SmartFitter")
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 PEEK_CACHE_NAME = "peek_cache.json"
 PEEK_CACHE_MAX = 5000

@@ -135,7 +135,9 @@ def main() -> None:
             except Exception:
                 pass  # older pywebview: uploads remain the fallback
 
-        webview.start(bind_drop, (api.window,), gui="edgechromium", icon=str(icon) if icon.exists() else None)
+        # Windows: WebView2 (edgechromium). macOS/Linux: pywebview's native backend (WebKit / GTK / Qt).
+        gui = "edgechromium" if sys.platform == "win32" else None
+        webview.start(bind_drop, (api.window,), gui=gui, icon=str(icon) if icon.exists() else None)
     except Exception as exc:  # pywebview missing or WebView2 unavailable: use Edge in app mode
         edge = _edge()
         if not edge:
