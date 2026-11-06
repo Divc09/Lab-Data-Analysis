@@ -33,7 +33,7 @@ jobs:
           path: dist/SmartFitter-portable-*.zip
 
   mac:
-    runs-on: macos-14   # Apple Silicon (M1 and newer)
+    runs-on: macos-15   # Apple Silicon (M1 and newer)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
