@@ -149,7 +149,7 @@ def bind_endpoint(function, workspace=None):
     return partial(function, workspace) if workspace is not None else function
 
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 
 def _file_stamp(stat: os.stat_result) -> tuple[int, int, int]:
