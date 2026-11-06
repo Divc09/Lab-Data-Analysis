@@ -17,9 +17,25 @@ Notes:
 - To update, download the new zip and replace the old folder. Your settings are kept in `%APPDATA%\SmartFitter`. The app shows a notice when a newer release exists.
 - Needs Windows 10 or 11. It uses the Microsoft WebView2 runtime, which is already installed on Windows 11 and most up-to-date Windows 10 PCs.
 
-### macOS or Linux: run with Python
+### macOS: app download (Apple Silicon, no Python needed)
 
-There is no `.dmg` yet, so macOS and Linux run SmartFitter from Python (3.12 or newer):
+1. From the [latest release](https://github.com/Divc09/Lab-Data-Analysis/releases/latest), download `SmartFitter-<version>-mac-apple-silicon.dmg` (for Macs with M1 or newer chips).
+2. Open the `.dmg` and drag **SmartFitter** into **Applications**.
+3. Double-click SmartFitter in Applications. The first time, macOS says it "cannot verify" the app because it is not signed by an Apple-registered developer. Click **Done**, open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to SmartFitter. You only do this once.
+
+### macOS: double-click launcher (any Mac, no Python needed)
+
+Use this if the app above does not open, or on an older Intel Mac. It installs everything it needs (a private copy of Python, inside `~/Library/Application Support/SmartFitter`) and updates itself to each new release.
+
+1. From the [latest release](https://github.com/Divc09/Lab-Data-Analysis/releases/latest), download `SmartFitter-mac-launcher.zip` and double-click it to unzip.
+2. Double-click **SmartFitter.command**. The first time, allow it the same way: **System Settings → Privacy & Security → Open Anyway**.
+3. A Terminal window shows progress. The first start takes a minute or two and needs internet; later starts are quick. Keep the Terminal window open while you use SmartFitter (you can minimize it).
+
+To uninstall, delete `~/Library/Application Support/SmartFitter` (and the app or the `.command` file).
+
+### Linux, or running from source on a Mac
+
+Run SmartFitter from Python (3.12 or newer):
 
 ```bash
 git clone https://github.com/Divc09/Lab-Data-Analysis.git
@@ -30,7 +46,7 @@ python -m pip install -r requirements.txt
 python -m smartfitter
 ```
 
-Next time, just `cd Lab-Data-Analysis`, `source .venv/bin/activate`, and `python -m smartfitter`. On macOS and Linux the app opens in your default web browser instead of its own window. The Windows build is the tested platform; macOS and Linux are not regularly tested.
+Next time, just `cd Lab-Data-Analysis`, `source .venv/bin/activate`, and `python -m smartfitter`. Windows is the main tested platform; the Mac builds are checked automatically when they are built, and Linux is not regularly tested. On Linux, if no desktop window can open, run `python -m smartfitter --browser` to use your web browser instead.
 
 To update: `git pull`, then `python -m pip install -r requirements.txt`.
 
@@ -187,7 +203,9 @@ Run `python -m nvfit.pro_batch --help` for all options. Batch results include fi
 
 Batch processes both available detector streams by default. Use `--detector detector1` or `--detector detector2` to restrict it. Dual-file outputs use `__detector1` and `__detector2` suffixes; single-detector output names remain unchanged.
 
-## Building the Windows download (maintainers)
+## Building the downloads (maintainers)
+
+**Releasing:** raise `APP_VERSION` in `smartfitter/core.py` (e.g. to `2.1`), commit and push, then push a matching tag (`git tag v2.1` then `git push origin v2.1`). The **Build apps** GitHub Actions workflow (`.github/workflows/build.yml`) then builds the Windows zip, the Mac `.dmg` and `SmartFitter-mac-launcher.zip`, smoke-tests them, and attaches them to the `v2.1` release (creating it if needed). You can also run the workflow by hand from the Actions tab to get the files without releasing. Mac builds come only from this workflow (they must be built on a Mac); the Windows zip can also be built locally:
 
 `powershell -File tools\build_portable.ps1` builds `dist\SmartFitter\SmartFitter.exe` (PyInstaller onedir, no PySide6) and `dist\SmartFitter-portable-<version>.zip`. Lab-mates unzip and run `SmartFitter.exe` (same options as `python -m smartfitter`; settings stay in `%APPDATA%\SmartFitter`). It uses the WebView2 runtime that ships with Windows 11 and falls back to an Edge app window. Update notices are informational only: git checkouts compare with `origin/main` (update with `git pull --ff-only origin main`), portable builds compare with the latest GitHub release.
 
